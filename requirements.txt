@@ -1,3 +1,0 @@
-streamlit>=1.36
-firebase-admin==6.*
-pandas>=2.0
