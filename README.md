@@ -2,6 +2,8 @@
 
 Stack: **Scheduler (เวลา) → Cloud Function (engine) → RTDB (data) → Streamlit (dashboard)**
 
+> ต้องการคู่มือเริ่มต้นแบบ Cloud Shell + GitHub auto deploy + Streamlit? ดู [QUICKSTART_TH.md](QUICKSTART_TH.md)
+
 ```
 PROJECT=your-gcp-project
 REGION=asia-southeast1
