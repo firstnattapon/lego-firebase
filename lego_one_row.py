@@ -55,6 +55,7 @@ class Anchor:
     p0: float
     prev_price: float
     prev_actual: float
+    prev_holdings: float | None = None   # holdings ล่าสุด (fallback เมื่อ positions endpoint ล้ม); state เก่า = None
 
 
 @dataclass(frozen=True)

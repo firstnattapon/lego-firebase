@@ -59,7 +59,8 @@ gcloud scheduler jobs create http lego-tick \
   --oidc-service-account-email="$SA" --oidc-token-audience="$URL" \
   --project=$PROJECT
 ```
-> cron ยิงเผื่อไว้ 13:00–20:xx UTC; `is_us_market_open()` ตัดนอกเวลา/สุดสัปดาห์ (PASS_MARKET_CLOSED)
+> cron ยิงเผื่อไว้ 13:00–20:30 UTC (ครอบทั้ง EDT 13:30–20:00 และ EST 14:30–21:00);
+> `is_us_market_open()` ตัดนอกเวลาด้วยกรอบ **9:30–16:00 America/New_York (DST-aware)** /สุดสัปดาห์ (PASS_MARKET_CLOSED)
 > `--max-retry-attempts=0` + `LEGO_SLOT_SECONDS=1800` = สองชั้นกัน retry สร้าง 2 แถวใน slot เดียว (กิน DNA step ซ้ำ)
 
 ## 5. Streamlit (streamlit.app)
