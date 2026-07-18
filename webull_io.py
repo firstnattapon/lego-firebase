@@ -95,11 +95,24 @@ def _endpoint() -> str:
 
 
 def is_us_market_open(now: datetime | None = None) -> bool:
-    """guard: จันทร์–ศุกร์ 13:30–20:00 UTC (regular hours)
+    """guard: จันทร์–ศุกร์ 9:30–16:00 America/New_York (DST-aware regular hours)
 
+    กรอบ UTC คงที่ 13:30–20:00 ถูกเฉพาะฤดูร้อน (EDT) — ฤดูหนาว (EST) ตลาดจริงคือ
+    14:30–21:00 UTC จึงต้องเทียบเวลา New York ตรง ๆ; ถ้าเครื่องไม่มี tz database
+    ให้ fallback กรอบ UTC เดิม (ยอมกว้าง/แคบผิดฤดู ดีกว่า crash ทั้งรอบ)
     ไม่รวมวันหยุด/half-day NYSE — production ต่อปฏิทิน (pandas_market_calendars)
     """
     now = now or datetime.now(timezone.utc)
+    try:
+        from zoneinfo import ZoneInfo
+        et = now.astimezone(ZoneInfo("America/New_York"))
+    except Exception:
+        et = None
+    if et is not None:
+        if et.weekday() >= 5:
+            return False
+        minutes = et.hour * 60 + et.minute
+        return 9 * 60 + 30 <= minutes < 16 * 60
     if now.weekday() >= 5:
         return False
     minutes = now.hour * 60 + now.minute
@@ -173,11 +186,16 @@ def _log_positions_fallback(symbol: str, holdings: float, exc: Exception) -> Non
 
 
 def build_order_payload(cfg: Config, side: str, qty: float, client_order_id: str) -> list[dict]:
+    # format ตาม cfg.decimal_precision (ฮาร์ดโค้ด 5 จะตัดทศนิยมเมื่อ dp > 5);
+    # strip ศูนย์ท้ายเฉพาะเมื่อมีจุดทศนิยม (dp=0 เช่น "20" ห้ามโดน strip เหลือ "2")
+    qty_str = f"{qty:.{cfg.decimal_precision}f}"
+    if "." in qty_str:
+        qty_str = qty_str.rstrip("0").rstrip(".")
     return [{
         "combo_type": "NORMAL", "client_order_id": client_order_id,
         "symbol": cfg.symbol.upper(), "instrument_type": "EQUITY", "market": "US",
         "order_type": "MARKET",
-        "quantity": f"{qty:.5f}".rstrip("0").rstrip("."),
+        "quantity": qty_str,
         "side": side, "time_in_force": "DAY", "entrust_type": "QTY",
         "support_trading_session": "CORE",
     }]

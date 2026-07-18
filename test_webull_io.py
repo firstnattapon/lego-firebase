@@ -163,6 +163,45 @@ def test_fetch_positions_fresh_when_ok():
     assert snap["holdings"] == 4.61492   # ดึงของสด ไม่ใช้ fallback
 
 
+# ---- is_us_market_open (DST-aware 9:30–16:00 ET) ---------------------------
+def _has_tzdata() -> bool:
+    try:
+        from zoneinfo import ZoneInfo
+        ZoneInfo("America/New_York")
+        return True
+    except Exception:
+        return False
+
+
+def test_market_open_dst():
+    from datetime import datetime, timezone
+    if not _has_tzdata():
+        print("SKIP test_market_open_dst (no tz database)")
+        return
+    utc = timezone.utc
+    # ฤดูร้อน (EDT, UTC-4): ตลาด = 13:30–20:00 UTC
+    assert W.is_us_market_open(datetime(2026, 7, 15, 13, 29, tzinfo=utc)) is False
+    assert W.is_us_market_open(datetime(2026, 7, 15, 13, 30, tzinfo=utc)) is True
+    assert W.is_us_market_open(datetime(2026, 7, 15, 19, 59, tzinfo=utc)) is True
+    assert W.is_us_market_open(datetime(2026, 7, 15, 20, 0, tzinfo=utc)) is False
+    # ฤดูหนาว (EST, UTC-5): ตลาด = 14:30–21:00 UTC
+    assert W.is_us_market_open(datetime(2026, 1, 14, 14, 0, tzinfo=utc)) is False   # 09:00 ET
+    assert W.is_us_market_open(datetime(2026, 1, 14, 14, 30, tzinfo=utc)) is True   # 09:30 ET
+    assert W.is_us_market_open(datetime(2026, 1, 14, 20, 30, tzinfo=utc)) is True   # 15:30 ET
+    assert W.is_us_market_open(datetime(2026, 1, 14, 21, 0, tzinfo=utc)) is False   # 16:00 ET
+    # สุดสัปดาห์ (เทียบวันตามเวลา New York)
+    assert W.is_us_market_open(datetime(2026, 7, 18, 15, 0, tzinfo=utc)) is False   # เสาร์
+
+
+# ---- build_order_payload: quantity ตาม decimal_precision --------------------
+def test_order_payload_quantity_precision():
+    q = lambda cfg, qty: W.build_order_payload(cfg, "BUY", qty, "cid")[0]["quantity"]  # noqa: E731
+    assert q(Config("AAPL", 1500.0, decimal_precision=5), 4.61492) == "4.61492"
+    assert q(Config("AAPL", 1500.0, decimal_precision=5), 2.0) == "2"
+    assert q(Config("AAPL", 1500.0, decimal_precision=6), 0.123456) == "0.123456"  # dp>5 ห้ามโดนตัด
+    assert q(Config("AAPL", 1500.0, decimal_precision=0), 20.0) == "20"            # ห้าม strip เหลือ "2"
+
+
 if __name__ == "__main__":
     fns = [v for k, v in sorted(globals().items()) if k.startswith("test_") and callable(v)]
     failed = 0
