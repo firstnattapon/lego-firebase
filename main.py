@@ -25,8 +25,8 @@ from firebase_admin import credentials, db
 from lego_one_row import READY_BUY, READY_SELL, compute_row
 from lego_state import (SlotAlreadyConsumed, StaleAnchorError,
                         commit_final_row, read_anchor, write_order_audit)
-from lego_orders import (UAT, SubmitGateError, evaluate_submit_gate,
-                         order_confirmation_phrase, summarize_order_result)
+from lego_orders import (evaluate_submit_gate, order_confirmation_phrase,
+                         summarize_order_result)
 from webull_io import (build_clients, build_order_payload, environment_label,
                        fetch_snapshot, is_us_market_open, load_config,
                        place_market_order, preview_market_order)
@@ -38,17 +38,6 @@ def _init_firebase():
             credentials.ApplicationDefault(),
             {"databaseURL": os.environ["FIREBASE_DB_URL"]},
         )
-
-
-def _log_error(exc: Exception) -> None:
-    """best-effort log ทุก path (trade อย่าล้มเพราะ log ล้ม)"""
-    try:
-        db.reference("webull_lego_errors").push({
-            "error": str(exc), "type": type(exc).__name__,
-            "trace": traceback.format_exc()[:2000],
-        })
-    except Exception:
-        pass
 
 
 @functions_framework.http
@@ -66,9 +55,7 @@ def lego_one_row(request):
 
         # Step 1–17: snapshot -> engine (validate 17 คอลัมน์ในตัว)
         trade_client, data_client = build_clients()
-        snapshot = fetch_snapshot(
-            trade_client, data_client, cfg,
-            fallback_holdings=(anchor.prev_holdings if anchor else None))
+        snapshot = fetch_snapshot(trade_client, data_client, cfg)
         row = compute_row(cfg, snapshot, anchor)
 
         # Step 18: commit (idempotent + stale-anchor + monotonic + slot guard)
@@ -82,18 +69,13 @@ def lego_one_row(request):
         }
 
         # ---- order path: preview -> gate -> place (ลำดับนี้เท่านั้น) ----------
-        # แถว commit สำเร็จแล้ว = deliverable หลักของรอบนี้ — order ล้ม/ถูก block
-        # ต้องตอบ 200 เสมอ มิฉะนั้น scheduler เห็น 5xx แล้ว retry จะสร้างแถวใหม่
-        # กิน DNA slot เกิน (ขัดเจตนา slot ละ 1 แถว); gap ที่พลาดรอบนี้
-        # รอบถัดไปคำนวณใหม่เองอยู่แล้ว (self-correcting)
         env = environment_label()
         auto = os.environ.get("AUTO_SUBMIT", "false").lower() == "true"
         if (auto and result["committed"]
                 and row["สถานะ"] in (READY_BUY, READY_SELL)):
+            # order ล้ม/gate ไม่ผ่าน ห้ามทำให้ทั้งรอบเป็น 500 — แถว commit ไปแล้ว
+            # (500 -> Scheduler retry -> สร้างแถวใหม่ = กิน DNA slot เกิน 1 ต่อรอบ)
             try:
-                if env != UAT:   # กันยิง preview ใส่ Production (invariant #9: read-only)
-                    raise SubmitGateError(
-                        f"ส่ง order ได้เฉพาะ {UAT}; ปัจจุบัน={env} (Production read-only)")
                 m = row["_meta"]
                 client_order_id = uuid.uuid4().hex
                 order = build_order_payload(cfg, m["side"], m["quantity"], client_order_id)
@@ -110,11 +92,15 @@ def lego_one_row(request):
                     "environment": env, **summary,
                 })
                 out["order"] = {"client_order_id": client_order_id, **summary}
-            except SubmitGateError as exc:
-                out["order"] = {"blocked": True, "note": str(exc)}
-            except Exception as exc:  # noqa: BLE001 — order ล้มห้ามพารอบทั้งรอบล้ม
-                _log_error(exc)
-                out["order"] = {"error": str(exc), "type": type(exc).__name__}
+            except Exception as order_exc:
+                try:
+                    db.reference("webull_lego_errors").push({
+                        "error": str(order_exc), "type": type(order_exc).__name__,
+                        "phase": "order_path", "run_id": result["run_id"],
+                    })
+                except Exception:
+                    pass
+                out["order_error"] = f"{type(order_exc).__name__}: {order_exc}"
 
         return out, 200
 
@@ -124,6 +110,12 @@ def lego_one_row(request):
     except StaleAnchorError as exc:
         return {"status": "STALE_ANCHOR", "committed": False,
                 "note": f"{exc} — restart Step 0 รอบถัดไป"}, 409
-    except Exception as exc:  # noqa: BLE001
-        _log_error(exc)
+    except Exception as exc:  # best-effort log ทุก path (trade อย่าล้มเพราะ log ล้ม)
+        try:
+            db.reference("webull_lego_errors").push({
+                "error": str(exc), "type": type(exc).__name__,
+                "trace": traceback.format_exc()[:2000],
+            })
+        except Exception:
+            pass
         return {"status": "ERROR", "error": str(exc), "type": type(exc).__name__}, 500
