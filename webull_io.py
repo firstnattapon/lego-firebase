@@ -8,12 +8,71 @@
 from __future__ import annotations
 
 import os
+import time
 from datetime import datetime, timezone
 
 from lego_one_row import Config
 
 UAT_ENDPOINT = "th-api.uat.webullbroker.com"
 PROD_ENDPOINT = "api.webull.co.th"
+
+
+# ---- retry เฉพาะ error ชั่วคราว (5xx/timeout) — budget-aware ใต้ Cloud Run 120s ----
+def _retry_attempts() -> int:
+    return max(1, int(os.environ.get("WEBULL_RETRY_ATTEMPTS", "2")))
+
+
+def _retry_base_sleep() -> float:
+    return max(0.0, float(os.environ.get("WEBULL_RETRY_BASE_SLEEP", "0.5")))
+
+
+def _retry_deadline() -> float:
+    return max(0.0, float(os.environ.get("WEBULL_RETRY_DEADLINE", "60")))
+
+
+def _is_transient(exc: Exception) -> bool:
+    """True เฉพาะ 5xx / gateway-timeout / timeout / connection (retry แล้วมีโอกาสหาย).
+
+    4xx / INVALID_TOKEN / 403 = ไม่ transient -> raise ทันที (retry ไม่ช่วย, fail closed)
+    ตรวจทั้ง attribute (SDK บางตัวมี) และ str(exc) (Webull ServerException ฝัง status ในข้อความ)
+    """
+    for attr in ("status_code", "http_status", "status", "code"):
+        val = getattr(exc, attr, None)
+        try:
+            if val is not None and 500 <= int(val) < 600:
+                return True
+        except (TypeError, ValueError):
+            pass
+    msg = str(exc)
+    if "INVALID_TOKEN" in msg or "HTTP Status: 4" in msg:
+        return False
+    markers = ("HTTP Status: 5", "GATEWAY_TIMEOUT", "timed out", "Timeout",
+               "Connection", "Read timed out", "Max retries")
+    return any(m in msg for m in markers)
+
+
+def _call_with_retry(fn, *args, deadline_start: float | None = None, **kwargs):
+    """เรียก fn พร้อม retry แบบ exponential backoff เฉพาะ transient; ปิดที่ deadline กัน timeout ชน"""
+    deadline_start = time.monotonic() if deadline_start is None else deadline_start
+    attempts = _retry_attempts()
+    base = _retry_base_sleep()
+    deadline = _retry_deadline()
+    last: Exception | None = None
+    for attempt in range(1, attempts + 1):
+        try:
+            return fn(*args, **kwargs)
+        except Exception as exc:  # noqa: BLE001 — จำแนกด้วย _is_transient
+            last = exc
+            elapsed = time.monotonic() - deadline_start
+            if (attempt >= attempts or not _is_transient(exc)
+                    or elapsed >= deadline):
+                raise
+            sleep_s = base * (2 ** (attempt - 1))
+            if elapsed + sleep_s >= deadline:   # จะเลย deadline หลัง sleep -> เลิก
+                raise
+            time.sleep(sleep_s)
+    if last is not None:                        # unreachable (กันเหนียว)
+        raise last
 
 
 def load_config() -> Config:
@@ -59,25 +118,58 @@ def build_clients():
     return TradeClient(api), DataClient(api)
 
 
-def fetch_snapshot(trade_client, data_client, cfg: Config) -> dict:
-    """คืน {captured_at, price, holdings}; fail closed ถ้า price <= 0"""
+def fetch_snapshot(trade_client, data_client, cfg: Config,
+                   fallback_holdings: float | None = None) -> dict:
+    """คืน {captured_at, price, holdings}; fail closed ถ้า price <= 0
+
+    - ดึงราคา (market-data) ก่อน แล้วค่อย positions (trade endpoint) — decouple
+      ให้ trade endpoint ที่ flaky ไม่บล็อก market-data path
+    - ทั้งสอง call หุ้มด้วย retry เฉพาะ transient (504/timeout)
+    - positions ล้ม transient หลังครบ retry + มี fallback_holdings -> ใช้ค่า holdings
+      ล่าสุด (จาก state) แทน ให้รอบไม่ตายเพราะ trade endpoint outage ชั่วคราว
+    """
     account_id = os.environ["WEBULL_ACCOUNT_ID"]
+    start = time.monotonic()
 
-    positions = trade_client.account_v2.get_account_position(account_id).json()
-    holdings = _extract_qty(positions, cfg.symbol)
-
-    snap = data_client.market_data.get_snapshot(
-        cfg.symbol.upper(), "US_STOCK",
-        extend_hour_required=False, overnight_required=False).json()
+    # 1) ราคา (market-data) — จำเป็น, ล้ม = fail closed
+    snap = _call_with_retry(
+        lambda: data_client.market_data.get_snapshot(
+            cfg.symbol.upper(), "US_STOCK",
+            extend_hour_required=False, overnight_required=False).json(),
+        deadline_start=start)
     price = _extract_price(snap, cfg.symbol)
     if not (price and price > 0):
         raise ValueError(f"snapshot price ไม่ถูกต้อง ({price}) — fail closed")
+
+    # 2) positions (trade endpoint) — transient outage + มี fallback -> ใช้ค่าเก่า
+    try:
+        positions = _call_with_retry(
+            lambda: trade_client.account_v2.get_account_position(account_id).json(),
+            deadline_start=start)
+        holdings = _extract_qty(positions, cfg.symbol)
+    except Exception as exc:  # noqa: BLE001
+        if not (_is_transient(exc) and fallback_holdings is not None):
+            raise
+        _log_positions_fallback(cfg.symbol, fallback_holdings, exc)
+        holdings = float(fallback_holdings)
 
     return {
         "captured_at": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
         "price": float(price),
         "holdings": float(holdings),
     }
+
+
+def _log_positions_fallback(symbol: str, holdings: float, exc: Exception) -> None:
+    """best-effort log ว่าใช้ holdings fallback (trade อย่าล้มเพราะ log ล้ม)"""
+    try:
+        from firebase_admin import db
+        db.reference("webull_lego_errors").push({
+            "error": f"get_account_position transient — ใช้ fallback_holdings={holdings}: {exc}",
+            "type": "PositionsFallback", "symbol": symbol,
+        })
+    except Exception:
+        pass
 
 
 def build_order_payload(cfg: Config, side: str, qty: float, client_order_id: str) -> list[dict]:
