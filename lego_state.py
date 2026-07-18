@@ -168,7 +168,11 @@ def commit_final_row(cfg: Config, snapshot: dict, anchor: Anchor | None, row: di
     try:
         state_ref.transaction(txn)
     except _Idempotent:
-        row_ref.delete()      # row ที่เพิ่งเขียนซ้ำ ไม่ผูก state — เก็บกวาด
+        # state.last_run_id == run_id -> commit นี้เคยสำเร็จแล้ว และ row เนื้อหาเดียวกัน
+        # (run_id เดิม = derive จาก chain/anchor/snapshot เดิม -> doc deterministic เหมือนกัน)
+        # ห้าม delete: อาจลบ row ที่ attempt คู่ขนาน commit ไปแล้ว -> data loss
+        # เขียน doc ฉบับ committed=True ทับ = ซ่อมทั้ง flag และเนื้อหาให้ครบ (idempotent)
+        row_ref.set({**doc, "committed": True})
         return {"committed": False, "idempotent": True, "run_id": run_id}
     except (StaleAnchorError, SlotAlreadyConsumed):
         row_ref.delete()      # orphan จาก attempt ที่แพ้ race — ลบก่อน raise
