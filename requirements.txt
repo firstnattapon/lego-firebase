@@ -2,3 +2,4 @@ functions-framework==3.*
 firebase-admin==6.*
 numpy>=1.26
 webull-openapi-python-sdk
+tzdata>=2024.1

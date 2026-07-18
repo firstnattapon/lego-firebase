@@ -164,7 +164,10 @@ def commit_final_row(cfg: Config, snapshot: dict, anchor: Anchor | None, row: di
     try:
         state_ref.transaction(txn)
     except _Idempotent:
-        row_ref.delete()      # row ที่เพิ่งเขียนซ้ำ ไม่ผูก state — เก็บกวาด
+        # state.last_run_id == run_id = commit นี้สำเร็จไปแล้ว (replay หรือ duplicate
+        # ที่แข่งกัน) — row นี้คือแถวที่ state อ้างถึง ห้าม delete เด็ดขาด
+        # mark committed ให้จบ: replay ได้ผลเดิม, duplicate สองตัว converge ที่ True
+        row_ref.update({"committed": True})
         return {"committed": False, "idempotent": True, "run_id": run_id}
     except (StaleAnchorError, SlotAlreadyConsumed):
         row_ref.delete()      # orphan จาก attempt ที่แพ้ race — ลบก่อน raise

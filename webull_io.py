@@ -36,15 +36,28 @@ def _endpoint() -> str:
 
 
 def is_us_market_open(now: datetime | None = None) -> bool:
-    """guard: จันทร์–ศุกร์ 13:30–20:00 UTC (regular hours)
+    """guard: จันทร์–ศุกร์ 09:30–16:00 America/New_York (DST-aware)
 
+    หน้าต่าง UTC ตายตัวใช้ไม่ได้: ฤดูหนาว (EST) ตลาดคือ 14:30–21:00 UTC —
+    เปิดเร็วไป = กิน DNA slot ด้วยราคา pre-market, ปิดเร็วไป = พลาดชั่วโมงสุดท้าย
     ไม่รวมวันหยุด/half-day NYSE — production ต่อปฏิทิน (pandas_market_calendars)
     """
     now = now or datetime.now(timezone.utc)
-    if now.weekday() >= 5:
+    try:
+        from zoneinfo import ZoneInfo
+        ny = now.astimezone(ZoneInfo("America/New_York"))
+    except Exception:
+        # ไม่มี tzdata -> fallback หน้าต่าง EDT (ฝั่งกว้าง: ไม่พลาดชั่วโมงเทรดจริง)
+        ny = None
+    if ny is None:
+        if now.weekday() >= 5:
+            return False
+        minutes = now.hour * 60 + now.minute
+        return 13 * 60 + 30 <= minutes < 21 * 60
+    if ny.weekday() >= 5:
         return False
-    minutes = now.hour * 60 + now.minute
-    return 13 * 60 + 30 <= minutes < 20 * 60
+    minutes = ny.hour * 60 + ny.minute
+    return 9 * 60 + 30 <= minutes < 16 * 60
 
 
 # ---- Webull clients (lazy import) -----------------------------------------

@@ -73,22 +73,34 @@ def lego_one_row(request):
         auto = os.environ.get("AUTO_SUBMIT", "false").lower() == "true"
         if (auto and result["committed"]
                 and row["สถานะ"] in (READY_BUY, READY_SELL)):
-            m = row["_meta"]
-            client_order_id = uuid.uuid4().hex
-            order = build_order_payload(cfg, m["side"], m["quantity"], client_order_id)
+            # order ล้ม/gate ไม่ผ่าน ห้ามทำให้ทั้งรอบเป็น 500 — แถว commit ไปแล้ว
+            # (500 -> Scheduler retry -> สร้างแถวใหม่ = กิน DNA slot เกิน 1 ต่อรอบ)
+            try:
+                m = row["_meta"]
+                client_order_id = uuid.uuid4().hex
+                order = build_order_payload(cfg, m["side"], m["quantity"], client_order_id)
 
-            preview_ok = preview_market_order(trade_client, order)   # 1) preview
-            evaluate_submit_gate(env, row, preview_ok,               # 2) gate (raise = จบ)
-                                 order_confirmation_phrase(row), committed=True)
-            res = place_market_order(trade_client, order)            # 3) place
+                preview_ok = preview_market_order(trade_client, order)   # 1) preview
+                evaluate_submit_gate(env, row, preview_ok,               # 2) gate (raise = จบ)
+                                     order_confirmation_phrase(row), committed=True)
+                res = place_market_order(trade_client, order)            # 3) place
 
-            summary = summarize_order_result(res)
-            write_order_audit(client_order_id, {
-                "run_id": result["run_id"], "side": m["side"],
-                "quantity": m["quantity"], "symbol": cfg.symbol,
-                "environment": env, **summary,
-            })
-            out["order"] = {"client_order_id": client_order_id, **summary}
+                summary = summarize_order_result(res)
+                write_order_audit(client_order_id, {
+                    "run_id": result["run_id"], "side": m["side"],
+                    "quantity": m["quantity"], "symbol": cfg.symbol,
+                    "environment": env, **summary,
+                })
+                out["order"] = {"client_order_id": client_order_id, **summary}
+            except Exception as order_exc:
+                try:
+                    db.reference("webull_lego_errors").push({
+                        "error": str(order_exc), "type": type(order_exc).__name__,
+                        "phase": "order_path", "run_id": result["run_id"],
+                    })
+                except Exception:
+                    pass
+                out["order_error"] = f"{type(order_exc).__name__}: {order_exc}"
 
         return out, 200
 
