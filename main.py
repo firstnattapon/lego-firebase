@@ -55,7 +55,9 @@ def lego_one_row(request):
 
         # Step 1–17: snapshot -> engine (validate 17 คอลัมน์ในตัว)
         trade_client, data_client = build_clients()
-        snapshot = fetch_snapshot(trade_client, data_client, cfg)
+        snapshot = fetch_snapshot(
+            trade_client, data_client, cfg,
+            fallback_holdings=(anchor.prev_holdings if anchor else None))
         row = compute_row(cfg, snapshot, anchor)
 
         # Step 18: commit (idempotent + stale-anchor + monotonic + slot guard)

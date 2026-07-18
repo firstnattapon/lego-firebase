@@ -90,6 +90,9 @@ def read_anchor(cfg: Config) -> Anchor | None:
         p0=float(state["p0"]),
         prev_price=float(state["prev_price"]),
         prev_actual=float(state["prev_actual"]),
+        # state เก่าไม่มี prev_holdings -> None -> fallback ปิดเอง (fail closed) จนรอบใหม่เขียนค่า
+        prev_holdings=(float(state["prev_holdings"])
+                       if state.get("prev_holdings") is not None else None),
     )
 
 
@@ -154,6 +157,7 @@ def commit_final_row(cfg: Config, snapshot: dict, anchor: Anchor | None, row: di
             "p0": float(snapshot["price"]) if anchor is None else float(anchor.p0),
             "prev_price": float(snapshot["price"]),    # Pₙ
             "prev_actual": float(meta["actual_next"]), # Aₙ
+            "prev_holdings": float(snapshot["holdings"]),  # holdings ล่าสุด (fallback รอบหน้า)
             "last_run_id": run_id,
             "slot": slot,
             "updated_at": snapshot["captured_at"],
