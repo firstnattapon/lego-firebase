@@ -42,12 +42,54 @@ def evaluate_submit_gate(environment: str, row: dict, preview_ok: bool,
         raise SubmitGateError("confirmation phrase ไม่ตรง — ไม่ส่ง")
 
 
-def summarize_order_result(place_response: dict) -> dict:
-    """ไม่โม้ fill — FILLED เฉพาะ status ที่ยืนยัน filled จริง"""
-    status = str(place_response.get("status", "")).upper()
-    realized = status in {"FILLED", "PARTIALLY_FILLED"}
-    return {
+# status terminal = จบแล้ว ไม่ต้องตามต่อ; realized = มีของเข้าพอร์ตจริง (invariant #10)
+REALIZED_STATUSES = {"FILLED", "PARTIAL_FILLED", "PARTIALLY_FILLED"}
+TERMINAL_STATUSES = REALIZED_STATUSES | {"CANCELLED", "FAILED", "REJECTED", "EXPIRED"}
+
+
+def _normalize_status(raw) -> str:
+    # SDK enum ใช้ "PARTIAL FILLED" (มีช่องว่าง) — normalize เป็น underscore
+    return str(raw or "").strip().upper().replace(" ", "_")
+
+
+def _order_fields(detail) -> dict:
+    """ดึง order fields จาก get_order_detail ทุก shape: dict ตรง / nest ใน items/orders"""
+    if isinstance(detail, list):
+        detail = detail[0] if detail else {}
+    if not isinstance(detail, dict):
+        return {}
+    for key in ("items", "orders", "data"):
+        inner = detail.get(key)
+        if isinstance(inner, list) and inner and isinstance(inner[0], dict):
+            merged = dict(detail)
+            merged.update(inner[0])
+            return merged
+        if isinstance(inner, dict):
+            merged = dict(detail)
+            merged.update(inner)
+            return merged
+    return detail
+
+
+def summarize_order_result(place_response: dict, detail: dict | None = None) -> dict:
+    """ไม่โม้ fill — FILLED เฉพาะ status ที่ยืนยัน filled จริง
+    detail (จาก get_order_detail) เป็นแหล่งสถานะหลัก — place response v3 ไม่มี status"""
+    fields = _order_fields(detail) if detail else {}
+    status = _normalize_status(
+        fields.get("order_status") or fields.get("status")
+        or (place_response or {}).get("order_status")
+        or (place_response or {}).get("status"))
+    realized = status in REALIZED_STATUSES
+    out = {
         "status": status or "UNKNOWN",
         "realized": realized,
-        "note": "SUBMITTED/PENDING ไม่นับ realized — ยืนยัน FILLED จาก Trade Events (gRPC)",
+        "note": "SUBMITTED/PENDING ไม่นับ realized — ยืนยันจาก get_order_detail",
     }
+    filled = fields.get("filled_quantity") or fields.get("filled_qty")
+    if filled is not None:
+        out["filled_quantity"] = filled
+    reason = (fields.get("reason") or fields.get("message")
+              or fields.get("error_msg") or fields.get("reject_reason"))
+    if reason:
+        out["reject_reason"] = str(reason)
+    return out

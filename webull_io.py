@@ -8,12 +8,34 @@
 from __future__ import annotations
 
 import os
+import time
 from datetime import datetime, timezone
 
 from lego_one_row import Config
 
 UAT_ENDPOINT = "th-api.uat.webullbroker.com"
 PROD_ENDPOINT = "api.webull.co.th"
+
+_TRANSIENT_HTTP = {500, 502, 503, 504}
+
+
+def _retry_transient(fn, attempts: int = 3, base_delay: float = 2.0):
+    """เรียก fn(); retry เฉพาะ 5xx ชั่วคราวจากฝั่ง Webull (backoff 2s/4s)
+    error อื่น (signature, 403, ValueError) raise ทันที — fail closed เหมือนเดิม"""
+    last = None
+    for i in range(attempts):
+        try:
+            return fn()
+        except Exception as exc:
+            status = getattr(exc, "http_status", None) or getattr(exc, "status_code", None)
+            transient = (status in _TRANSIENT_HTTP
+                         or getattr(exc, "error_code", "") == "GATEWAY_TIMEOUT")
+            if not transient:
+                raise
+            last = exc
+            if i < attempts - 1:
+                time.sleep(base_delay * (2 ** i))
+    raise last
 
 
 def load_config() -> Config:
@@ -76,12 +98,14 @@ def fetch_snapshot(trade_client, data_client, cfg: Config) -> dict:
     """คืน {captured_at, price, holdings}; fail closed ถ้า price <= 0"""
     account_id = os.environ["WEBULL_ACCOUNT_ID"]
 
-    positions = trade_client.account_v2.get_account_position(account_id).json()
+    positions = _retry_transient(
+        lambda: trade_client.account_v2.get_account_position(account_id).json())
     holdings = _extract_qty(positions, cfg.symbol)
 
-    snap = data_client.market_data.get_snapshot(
-        cfg.symbol.upper(), "US_STOCK",
-        extend_hour_required=False, overnight_required=False).json()
+    snap = _retry_transient(
+        lambda: data_client.market_data.get_snapshot(
+            cfg.symbol.upper(), "US_STOCK",
+            extend_hour_required=False, overnight_required=False).json())
     price = _extract_price(snap, cfg.symbol)
     if not (price and price > 0):
         raise ValueError(f"snapshot price ไม่ถูกต้อง ({price}) — fail closed")
@@ -115,6 +139,33 @@ def place_market_order(trade_client, order: list[dict]) -> dict:
     """ส่ง order จริง — เรียกได้เฉพาะหลัง evaluate_submit_gate ผ่านแล้วเท่านั้น"""
     account_id = os.environ["WEBULL_ACCOUNT_ID"]
     return trade_client.order_v3.place_order(account_id, order).json()
+
+
+def fetch_order_detail(trade_client, client_order_id: str) -> dict:
+    """สถานะจริงของ order หลัง place (invariant #10: FILLED ต้องยืนยัน ไม่เดา)"""
+    account_id = os.environ["WEBULL_ACCOUNT_ID"]
+    return _retry_transient(
+        lambda: trade_client.order_v3.get_order_detail(account_id, client_order_id).json())
+
+
+def fetch_open_orders(trade_client, symbol: str) -> list[dict]:
+    """open orders ของ symbol — guard กัน order ซ้อนก่อน place รอบใหม่"""
+    account_id = os.environ["WEBULL_ACCOUNT_ID"]
+    res = _retry_transient(
+        lambda: trade_client.order_v3.get_order_open(account_id).json())
+    if isinstance(res, list):
+        items = res
+    else:
+        items = ((res or {}).get("orders") or (res or {}).get("items") or
+                 (res or {}).get("data") or [])
+    out = []
+    for o in items:
+        inner = o.get("items") if isinstance(o, dict) else None
+        cands = inner if isinstance(inner, list) else [o]
+        for c in cands:
+            if str(c.get("symbol", "")).upper() == symbol.upper():
+                out.append(c)
+    return out
 
 
 # ---- helpers (ปรับ path ให้ตรง schema จริงของ SDK response) ----------------

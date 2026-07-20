@@ -15,6 +15,7 @@ ENV (map จาก Secret Manager):
 from __future__ import annotations
 
 import os
+import time
 import traceback
 import uuid
 
@@ -24,12 +25,43 @@ from firebase_admin import credentials, db
 
 from lego_one_row import READY_BUY, READY_SELL, compute_row
 from lego_state import (SlotAlreadyConsumed, StaleAnchorError,
-                        commit_final_row, read_anchor, write_order_audit)
-from lego_orders import (evaluate_submit_gate, order_confirmation_phrase,
-                         summarize_order_result)
+                        commit_final_row, pending_audits, read_anchor,
+                        update_order_audit, write_order_audit)
+from lego_orders import (TERMINAL_STATUSES, evaluate_submit_gate,
+                         order_confirmation_phrase, summarize_order_result)
 from webull_io import (build_clients, build_order_payload, environment_label,
-                       fetch_snapshot, is_us_market_open, load_config,
-                       place_market_order, preview_market_order)
+                       fetch_open_orders, fetch_order_detail, fetch_snapshot,
+                       is_us_market_open, load_config, place_market_order,
+                       preview_market_order)
+
+ORDER_POLL_ATTEMPTS = 3
+ORDER_POLL_DELAY_S = 2.0
+
+
+def _poll_order_status(trade_client, client_order_id: str, place_res: dict) -> dict:
+    """poll get_order_detail จน status terminal หรือครบโควตา — สถานะจริง ไม่เดา"""
+    detail = None
+    for i in range(ORDER_POLL_ATTEMPTS):
+        if i:
+            time.sleep(ORDER_POLL_DELAY_S)
+        detail = fetch_order_detail(trade_client, client_order_id)
+        summary = summarize_order_result(place_res, detail)
+        if summary["status"] in TERMINAL_STATUSES:
+            return summary
+    return summarize_order_result(place_res, detail)
+
+
+def _reconcile_pending_orders(trade_client) -> None:
+    """audit ค้าง (UNKNOWN/SUBMITTED) จากรอบก่อน -> เช็คสถานะจริงแล้ว update
+    best-effort: ห้ามทำให้รอบล้ม"""
+    for event_id, payload in pending_audits(TERMINAL_STATUSES).items():
+        try:
+            detail = fetch_order_detail(trade_client, event_id)
+            summary = summarize_order_result({}, detail)
+            if summary["status"] != "UNKNOWN":
+                update_order_audit(event_id, summary)
+        except Exception:
+            continue
 
 
 def _init_firebase():
@@ -68,6 +100,12 @@ def lego_one_row(request):
             "step": row["DNA step"], "signal": row["DNA signal"],
         }
 
+        # reconcile order ค้างจากรอบก่อนให้รู้ผลจริง — ทำทุกรอบ (รวมรอบ PASS)
+        try:
+            _reconcile_pending_orders(trade_client)
+        except Exception:
+            pass
+
         # ---- order path: preview -> gate -> place (ลำดับนี้เท่านั้น) ----------
         env = environment_label()
         auto = os.environ.get("AUTO_SUBMIT", "false").lower() == "true"
@@ -76,6 +114,13 @@ def lego_one_row(request):
             # order ล้ม/gate ไม่ผ่าน ห้ามทำให้ทั้งรอบเป็น 500 — แถว commit ไปแล้ว
             # (500 -> Scheduler retry -> สร้างแถวใหม่ = กิน DNA slot เกิน 1 ต่อรอบ)
             try:
+                # guard กัน order ซ้อน: ตัวเก่ายังค้างอยู่ -> ไม่ยิงเพิ่มรอบนี้
+                open_orders = fetch_open_orders(trade_client, cfg.symbol)
+                if open_orders:
+                    out["order_skipped"] = (
+                        f"open order ค้าง {len(open_orders)} ตัว — ข้ามการส่งรอบนี้ (กันซ้อน)")
+                    return out, 200
+
                 m = row["_meta"]
                 client_order_id = uuid.uuid4().hex
                 order = build_order_payload(cfg, m["side"], m["quantity"], client_order_id)
@@ -85,7 +130,8 @@ def lego_one_row(request):
                                      order_confirmation_phrase(row), committed=True)
                 res = place_market_order(trade_client, order)            # 3) place
 
-                summary = summarize_order_result(res)
+                # 4) ตามสถานะจริง — place v3 response ไม่มี status
+                summary = _poll_order_status(trade_client, client_order_id, res)
                 write_order_audit(client_order_id, {
                     "run_id": result["run_id"], "side": m["side"],
                     "quantity": m["quantity"], "symbol": cfg.symbol,

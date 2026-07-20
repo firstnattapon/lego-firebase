@@ -84,12 +84,14 @@ def read_anchor(cfg: Config) -> Anchor | None:
     state = db.reference(f"{STATE_PATH}/{chain_key(cfg)}").get()
     if not state:
         return None
+    ph = state.get("prev_holdings")
     return Anchor(
         version=int(state["version"]),
         dna_step=int(state["dna_step"]),
         p0=float(state["p0"]),
         prev_price=float(state["prev_price"]),
         prev_actual=float(state["prev_actual"]),
+        prev_holdings=None if ph is None else float(ph),
     )
 
 
@@ -154,6 +156,7 @@ def commit_final_row(cfg: Config, snapshot: dict, anchor: Anchor | None, row: di
             "p0": float(snapshot["price"]) if anchor is None else float(anchor.p0),
             "prev_price": float(snapshot["price"]),    # Pₙ
             "prev_actual": float(meta["actual_next"]), # Aₙ
+            "prev_holdings": float(snapshot.get("holdings", 0.0) or 0.0),  # observability
             "last_run_id": run_id,
             "slot": slot,
             "updated_at": snapshot["captured_at"],
@@ -183,3 +186,25 @@ def write_order_audit(event_id: str, payload: dict) -> None:
     redacted = {k: v for k, v in payload.items()
                 if k not in {"app_key", "app_secret", "access_token"}}
     db.reference(f"{AUDIT_PATH}/{event_id}").set(redacted)
+
+
+def update_order_audit(event_id: str, fields: dict) -> None:
+    db.reference(f"{AUDIT_PATH}/{event_id}").update(fields)
+
+
+def pending_audits(terminal_statuses: set[str], limit: int = 5) -> dict:
+    """audit ที่ยังไม่รู้ผลจริง (realized=false และ status ไม่ terminal)
+    คืน {event_id(client_order_id): payload} — node เล็ก อ่านทั้งก้อนแล้วกรอง"""
+    all_audits = db.reference(AUDIT_PATH).get() or {}
+    out = {}
+    for event_id, payload in all_audits.items():
+        if not isinstance(payload, dict):
+            continue
+        if payload.get("realized"):
+            continue
+        if str(payload.get("status", "")).upper() in terminal_statuses:
+            continue
+        out[event_id] = payload
+        if len(out) >= limit:
+            break
+    return out
