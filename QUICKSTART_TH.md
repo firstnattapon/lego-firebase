@@ -27,10 +27,10 @@ Streamlit Community Cloud / streamlit.app (Dashboard)
 กำหนดตัวแปรใน Cloud Shell:
 
 ```bash
-export PROJECT="your-gcp-project"
+export PROJECT="lego-firebase"
 export REGION="asia-southeast1"
-export DB_URL="https://your-project-default-rtdb.asia-southeast1.firebasedatabase.app"
-export REPO_URL="https://github.com/<org-or-user>/<repo>.git"
+export DB_URL="https://lego-firebase-default-rtdb.asia-southeast1.firebasedatabase.app"
+export REPO_URL="https://github.com/firstnattapon/lego-firebase.git"
 ```
 
 ตั้งค่า project:
@@ -63,9 +63,11 @@ gcloud services enable \
 ## 2) Clone repository จาก GitHub ใน Cloud Shell
 
 ```bash
-git clone "$REPO_URL"
-cd "$(basename "$REPO_URL" .git)"
+git clone https://github.com/firstnattapon/lego-firebase.git
+cd lego-firebase
 ```
+
+> พร้อมใช้: ไม่ต้องพิมพ์ `git clone "$REPO_URL"` ถ้ายังไม่ได้กำหนดตัวแปร `REPO_URL` เพราะจะเจอ error ว่า repository ว่างหรือไม่มีอยู่
 
 ตรวจ branch ที่จะใช้ deploy เช่น `main`:
 
@@ -223,7 +225,7 @@ steps:
       - --set-env-vars=FIREBASE_DB_URL=${_DB_URL},WEBULL_ENV=UAT,LEGO_SYMBOL=APLS,LEGO_FIX_C=1500,LEGO_DIFF=60,LEGO_DNA_CODE=bypass:100,LEGO_DECIMAL_PRECISION=5,LEGO_SLOT_SECONDS=1800,AUTO_SUBMIT=false
       - --set-secrets=WEBULL_APP_KEY=webull-app-key:latest,WEBULL_APP_SECRET=webull-app-secret:latest,WEBULL_ACCOUNT_ID=webull-account-id:latest
 substitutions:
-  _DB_URL: https://your-project-default-rtdb.asia-southeast1.firebasedatabase.app
+  _DB_URL: https://lego-firebase-default-rtdb.asia-southeast1.firebasedatabase.app
 options:
   logging: CLOUD_LOGGING_ONLY
 ```
@@ -277,8 +279,8 @@ done
 6. กด **Advanced settings → Secrets** แล้วใส่:
 
 ```toml
-FIREBASE_DB_URL = "https://your-project-default-rtdb.asia-southeast1.firebasedatabase.app"
-FIREBASE_SA_JSON = '{"type":"service_account", "project_id":"your-gcp-project", "private_key_id":"...", "private_key":"-----BEGIN PRIVATE KEY-----\\n...\\n-----END PRIVATE KEY-----\\n", "client_email":"...", "client_id":"...", "auth_uri":"https://accounts.google.com/o/oauth2/auth", "token_uri":"https://oauth2.googleapis.com/token", "auth_provider_x509_cert_url":"https://www.googleapis.com/oauth2/v1/certs", "client_x509_cert_url":"..."}'
+FIREBASE_DB_URL = "https://lego-firebase-default-rtdb.asia-southeast1.firebasedatabase.app"
+FIREBASE_SA_JSON = '{"type":"service_account", "project_id":"lego-firebase", "private_key_id":"...", "private_key":"-----BEGIN PRIVATE KEY-----\\n...\\n-----END PRIVATE KEY-----\\n", "client_email":"...", "client_id":"...", "auth_uri":"https://accounts.google.com/o/oauth2/auth", "token_uri":"https://oauth2.googleapis.com/token", "auth_provider_x509_cert_url":"https://www.googleapis.com/oauth2/v1/certs", "client_x509_cert_url":"..."}'
 ```
 
 7. กด **Deploy**
