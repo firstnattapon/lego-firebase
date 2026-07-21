@@ -70,16 +70,10 @@ class Config:
     def __post_init__(self):
         if not (math.isfinite(self.fix_c) and self.fix_c > 0):
             raise ValueError("fix_c ต้อง finite และ > 0")
-        if not (self.diff >= 0):
-            raise ValueError("diff ต้อง >= 0")
-        if self.decimal_precision < 0:
-            raise ValueError("decimal_precision ต้อง >= 0")
-
-
-def _floor_dp(x: float, dp: int) -> float:
-    """floor ที่ dp ตำแหน่ง — ใช้ clamp SELL ห้ามปัดขึ้น"""
-    scale = 10 ** dp
-    return math.floor(x * scale) / scale
+        if not (math.isfinite(self.diff) and self.diff >= 0):
+            raise ValueError("diff ต้อง finite และ >= 0")
+        if not (0 <= self.decimal_precision <= 5):
+            raise ValueError("decimal_precision ต้อง 0..5 (Webull รองรับเศษหุ้นสูงสุด 5 ตำแหน่ง)")
 
 
 # ---- Step 4 ----------------------------------------------------------------
@@ -113,8 +107,10 @@ def build_decision(cfg: Config, price: float, holdings: float, signal: int) -> D
     """Step 8: Vₙ, gap, action, side, reason, quantity จาก object เดียว ครั้งเดียว"""
     if not (math.isfinite(price) and price > 0):
         raise ValueError("price (Pₙ) ต้อง finite และ > 0")   # invariant #6
-    if holdings < 0:
-        raise ValueError("holdings ต้อง >= 0")
+    if not (math.isfinite(holdings) and holdings >= 0):
+        raise ValueError("holdings ต้อง finite และ >= 0")
+    if signal not in (0, 1):
+        raise ValueError("signal ต้อง ∈ {0,1}")
 
     value = holdings * price
     gap = cfg.fix_c - value
@@ -125,13 +121,11 @@ def build_decision(cfg: Config, price: float, holdings: float, signal: int) -> D
     if abs(gap) <= cfg.diff:                       # band (invariant #5)
         return Decision(PASS_THRESHOLD, "PASS", "", PASS_THRESHOLD, 0.0, value, gap)
 
+    # qty ตามสัญญาคอลัมน์ 11 เท่านั้น — ไม่มี clamp ใน engine (broker safety อยู่ชั้น order)
+    # SELL เกินที่ถือเป็นไปไม่ได้เชิงคณิต: gap < −diff ⟹ qty = holdings − FIX_C/Pₙ < holdings
     qty = round(abs(gap) / price, cfg.decimal_precision)
     if gap > cfg.diff:
         return Decision(READY_BUY, "TRIGGER_ACTION", "BUY", READY_BUY, qty, value, gap)
-    # gap < −diff -> SELL ; clamp ด้วย floor(holdings) ห้ามปัดขึ้นแล้วขายเกินที่ถือ
-    qty = min(qty, _floor_dp(holdings, cfg.decimal_precision))
-    if qty <= 0:
-        return Decision(PASS_THRESHOLD, "PASS", "", PASS_THRESHOLD, 0.0, value, gap)
     return Decision(READY_SELL, "TRIGGER_ACTION", "SELL", READY_SELL, qty, value, gap)
 
 

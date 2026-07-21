@@ -122,7 +122,7 @@ def build_order_payload(cfg: Config, side: str, qty: float, client_order_id: str
         "combo_type": "NORMAL", "client_order_id": client_order_id,
         "symbol": cfg.symbol.upper(), "instrument_type": "EQUITY", "market": "US",
         "order_type": "MARKET",
-        "quantity": f"{qty:.5f}".rstrip("0").rstrip("."),
+        "quantity": f"{qty:.{cfg.decimal_precision}f}".rstrip("0").rstrip(".") or "0",
         "side": side, "time_in_force": "DAY", "entrust_type": "QTY",
         "support_trading_session": "CORE",
     }]
@@ -170,12 +170,21 @@ def fetch_open_orders(trade_client, symbol: str) -> list[dict]:
 
 # ---- helpers (ปรับ path ให้ตรง schema จริงของ SDK response) ----------------
 def _extract_qty(positions, symbol: str) -> float:
+    """fail closed เมื่อ response shape ไม่รู้จัก — holdings=0 ปลอมทำให้ gap เต็ม FIX_C
+    แล้ว READY_BUY ซ้ำทั้งก้อน; "ไม่มีหุ้น" ที่ถูกต้องคือ list ว่างใน key ที่รู้จัก"""
     if isinstance(positions, list):
         items = positions
+    elif isinstance(positions, dict):
+        for key in ("positions", "items", "data"):
+            if key in positions:
+                items = positions.get(key) or []
+                break
+        else:
+            raise ValueError("positions response shape ไม่รู้จัก — fail closed")
     else:
-        items = (positions or {}).get("positions", []) or []
+        raise ValueError("positions response shape ไม่รู้จัก — fail closed")
     for p in items:
-        if str(p.get("symbol", "")).upper() == symbol.upper():
+        if isinstance(p, dict) and str(p.get("symbol", "")).upper() == symbol.upper():
             return float(p.get("quantity", 0) or 0)
     return 0.0
 

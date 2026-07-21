@@ -43,8 +43,10 @@ def evaluate_submit_gate(environment: str, row: dict, preview_ok: bool,
 
 
 # status terminal = จบแล้ว ไม่ต้องตามต่อ; realized = มีของเข้าพอร์ตจริง (invariant #10)
+# PARTIAL_FILLED = realized แต่ "ไม่ terminal" — ส่วนที่เหลือยัง fill/cancel ต่อได้
+# ต้อง reconcile ตามต่อจนได้ FILLED/CANCELLED/EXPIRED จริง
 REALIZED_STATUSES = {"FILLED", "PARTIAL_FILLED", "PARTIALLY_FILLED"}
-TERMINAL_STATUSES = REALIZED_STATUSES | {"CANCELLED", "FAILED", "REJECTED", "EXPIRED"}
+TERMINAL_STATUSES = {"FILLED", "CANCELLED", "FAILED", "REJECTED", "EXPIRED"}
 
 
 def _normalize_status(raw) -> str:

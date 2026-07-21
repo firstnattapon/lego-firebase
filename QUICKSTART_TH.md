@@ -80,11 +80,7 @@ git status
 
 ## 3) เตรียมไฟล์ requirements สำหรับ Cloud Functions
 
-Cloud Functions for Python จะหาไฟล์ชื่อ `requirements.txt` ที่ root ของ source ที่ deploy ดังนั้นถ้า deploy จาก root repository ให้ copy dependency ของ function เป็นชื่อนี้:
-
-```bash
-cp functions_requirements.txt requirements.txt
-```
+Cloud Functions for Python จะหาไฟล์ชื่อ `requirements.txt` ที่ root ของ source ที่ deploy — repo นี้มี `requirements.txt` ที่ root อยู่แล้ว deploy จาก root ได้เลย ไม่ต้อง copy อะไรเพิ่ม
 
 > ถ้าในอนาคตแยก folder `functions/` ให้ย้าย `main.py`, module ที่เกี่ยวข้อง และ `requirements.txt` เข้า folder นั้น แล้วปรับ `--source` ให้ตรง
 
@@ -354,11 +350,7 @@ gcloud scheduler jobs describe lego-tick --location="$REGION"
 
 ### Function deploy ไม่เจอ dependency
 
-ตรวจว่ามี `requirements.txt` ที่ root source ที่ deploy หรือ copy จาก `functions_requirements.txt` อีกครั้ง:
-
-```bash
-cp functions_requirements.txt requirements.txt
-```
+ตรวจว่ามี `requirements.txt` ที่ root ของ source ที่ deploy (repo นี้มีที่ root อยู่แล้ว) และ `--source` ชี้ตำแหน่งถูก
 
 ---
 

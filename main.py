@@ -17,7 +17,6 @@ from __future__ import annotations
 import os
 import time
 import traceback
-import uuid
 
 import firebase_admin
 import functions_framework
@@ -27,7 +26,7 @@ from lego_one_row import READY_BUY, READY_SELL, compute_row
 from lego_state import (SlotAlreadyConsumed, StaleAnchorError,
                         commit_final_row, pending_audits, read_anchor,
                         update_order_audit, write_order_audit)
-from lego_orders import (TERMINAL_STATUSES, evaluate_submit_gate,
+from lego_orders import (TERMINAL_STATUSES, UAT, evaluate_submit_gate,
                          order_confirmation_phrase, summarize_order_result)
 from webull_io import (build_clients, build_order_payload, environment_label,
                        fetch_open_orders, fetch_order_detail, fetch_snapshot,
@@ -52,9 +51,9 @@ def _poll_order_status(trade_client, client_order_id: str, place_res: dict) -> d
 
 
 def _reconcile_pending_orders(trade_client) -> None:
-    """audit ค้าง (UNKNOWN/SUBMITTED) จากรอบก่อน -> เช็คสถานะจริงแล้ว update
-    best-effort: ห้ามทำให้รอบล้ม"""
-    for event_id, payload in pending_audits(TERMINAL_STATUSES).items():
+    """audit ค้าง (PLACING/UNKNOWN/SUBMITTED/PARTIAL_FILLED) -> เช็คสถานะจริงแล้ว update
+    best-effort: ห้ามทำให้รอบล้ม; NOT_PLACED = จบแบบ local (gate ปัดตกก่อน place)"""
+    for event_id, payload in pending_audits(TERMINAL_STATUSES | {"NOT_PLACED"}).items():
         try:
             detail = fetch_order_detail(trade_client, event_id)
             summary = summarize_order_result({}, detail)
@@ -106,13 +105,21 @@ def lego_one_row(request):
         except Exception:
             pass
 
-        # ---- order path: preview -> gate -> place (ลำดับนี้เท่านั้น) ----------
+        # ---- order path: env-gate -> preview -> gate -> place (ลำดับนี้เท่านั้น) ----
         env = environment_label()
         auto = os.environ.get("AUTO_SUBMIT", "false").lower() == "true"
         if (auto and result["committed"]
                 and row["สถานะ"] in (READY_BUY, READY_SELL)):
+            # invariant #9: Preview/Submit = UAT เท่านั้น — Production ห้ามแม้แต่ preview
+            if env != UAT:
+                out["order_skipped"] = f"environment={env} — read-only, ไม่ preview/place"
+                return out, 200
             # order ล้ม/gate ไม่ผ่าน ห้ามทำให้ทั้งรอบเป็น 500 — แถว commit ไปแล้ว
             # (500 -> Scheduler retry -> สร้างแถวใหม่ = กิน DNA slot เกิน 1 ต่อรอบ)
+            # client_order_id = run_id: deterministic 1 order/แถว — broker ปัดซ้ำเองถ้า retry
+            client_order_id = result["run_id"]
+            audit_written = False
+            place_attempted = False
             try:
                 # guard กัน order ซ้อน: ตัวเก่ายังค้างอยู่ -> ไม่ยิงเพิ่มรอบนี้
                 open_orders = fetch_open_orders(trade_client, cfg.symbol)
@@ -122,23 +129,38 @@ def lego_one_row(request):
                     return out, 200
 
                 m = row["_meta"]
-                client_order_id = uuid.uuid4().hex
                 order = build_order_payload(cfg, m["side"], m["quantity"], client_order_id)
+
+                # write-ahead audit ก่อน place — crash หลัง place แล้ว order ต้องไม่ล่องหน
+                write_order_audit(client_order_id, {
+                    "run_id": result["run_id"], "side": m["side"],
+                    "quantity": m["quantity"], "symbol": cfg.symbol,
+                    "environment": env, "status": "PLACING", "realized": False,
+                })
+                audit_written = True
 
                 preview_ok = preview_market_order(trade_client, order)   # 1) preview
                 evaluate_submit_gate(env, row, preview_ok,               # 2) gate (raise = จบ)
                                      order_confirmation_phrase(row), committed=True)
+                place_attempted = True
                 res = place_market_order(trade_client, order)            # 3) place
 
                 # 4) ตามสถานะจริง — place v3 response ไม่มี status
                 summary = _poll_order_status(trade_client, client_order_id, res)
-                write_order_audit(client_order_id, {
-                    "run_id": result["run_id"], "side": m["side"],
-                    "quantity": m["quantity"], "symbol": cfg.symbol,
-                    "environment": env, **summary,
-                })
+                update_order_audit(client_order_id, summary)
                 out["order"] = {"client_order_id": client_order_id, **summary}
             except Exception as order_exc:
+                err = f"{type(order_exc).__name__}: {order_exc}"
+                try:
+                    if audit_written and not place_attempted:
+                        # ยังไม่ได้ยิง place แน่นอน -> ปิด audit แบบ local
+                        update_order_audit(client_order_id, {
+                            "status": "NOT_PLACED", "realized": False, "error": err[:500]})
+                    elif audit_written:
+                        # ยิงไปแล้ว/ก้ำกึ่ง -> คง PLACING ให้ reconcile รอบถัดไปตามผลจริง
+                        update_order_audit(client_order_id, {"error": err[:500]})
+                except Exception:
+                    pass
                 try:
                     db.reference("webull_lego_errors").push({
                         "error": str(order_exc), "type": type(order_exc).__name__,
@@ -146,7 +168,7 @@ def lego_one_row(request):
                     })
                 except Exception:
                     pass
-                out["order_error"] = f"{type(order_exc).__name__}: {order_exc}"
+                out["order_error"] = err
 
         return out, 200
 
