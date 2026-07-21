@@ -30,7 +30,7 @@ from datetime import datetime, timezone
 
 from firebase_admin import db
 
-from lego_one_row import Anchor, Config
+from lego_one_row import Anchor, Config, validate_row_columns
 
 ROWS_PATH = "webull_lego_rows"
 STATE_PATH = "webull_lego_state"
@@ -110,6 +110,7 @@ def _repair_pending(state: dict | None) -> None:
 
 # ---- Step 18: commit ------------------------------------------------------
 def commit_final_row(cfg: Config, snapshot: dict, anchor: Anchor | None, row: dict) -> dict:
+    validate_row_columns(row)   # defensive boundary: ห้าม persist row ที่ผิดสัญญา 17 คอลัมน์
     ck = chain_key(cfg)
     anchor_version = None if anchor is None else anchor.version
     run_id = make_run_id(ck, anchor_version, snapshot)
@@ -193,14 +194,12 @@ def update_order_audit(event_id: str, fields: dict) -> None:
 
 
 def pending_audits(terminal_statuses: set[str], limit: int = 5) -> dict:
-    """audit ที่ยังไม่รู้ผลจริง (realized=false และ status ไม่ terminal)
-    คืน {event_id(client_order_id): payload} — node เล็ก อ่านทั้งก้อนแล้วกรอง"""
+    """audit ที่ยังไม่จบจริง (status ไม่ terminal) — รวม PARTIAL_FILLED ที่ realized แล้ว
+    แต่ส่วนที่เหลือยังค้าง; คืน {event_id(client_order_id): payload}"""
     all_audits = db.reference(AUDIT_PATH).get() or {}
     out = {}
     for event_id, payload in all_audits.items():
         if not isinstance(payload, dict):
-            continue
-        if payload.get("realized"):
             continue
         if str(payload.get("status", "")).upper() in terminal_statuses:
             continue

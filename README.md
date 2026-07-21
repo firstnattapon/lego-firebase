@@ -65,7 +65,7 @@ gcloud scheduler jobs create http lego-tick \
 
 ## 5. Streamlit (streamlit.app)
 
-- ชี้ที่ `dashboard/streamlit_app.py`
+- dashboard อยู่คนละ repo: `firstnattapon/lego-firebase-streamlit` — ชี้ Main file path ที่ `streamlit_app.py` (root ของ repo นั้น)
 - ใน **Secrets** ของ streamlit.app ใส่:
   ```toml
   FIREBASE_DB_URL = "https://your-project-default-rtdb.asia-southeast1.firebasedatabase.app"
