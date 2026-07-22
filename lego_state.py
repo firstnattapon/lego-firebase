@@ -10,6 +10,12 @@ invariant:
   #8 stale-anchor + monotonic : anchor.version ต้อง == state.version มิฉะนั้น StaleAnchorError;
      commit -> version+1 + เลื่อน pointer (dna_step, p0, prev_price=Pₙ, prev_actual=Aₙ)
 
+cashflow semantics (บทที่ 4 — กำไรนับเฉพาะรอบที่จับคู่ปิด):
+  state เก็บ open_legs (ขาที่ยังจับคู่ไม่ครบ) + applied_fills (cumulative ต่อ order กันนับซ้ำ)
+  atomic ใน transaction เดียวกับ version -> restart/replay ไม่นับซ้ำ
+  state เก่าที่ไม่มี flag = prev_actual เป็นค่าทฤษฎี (สูตรราคา) ห้ามลากมาต่อกับกำไรจริง
+  -> read_anchor รีเซ็ต baseline realized เป็น 0 โดยคง dna_step/p0/version เดิม (chain ไม่ restart)
+
 ลำดับเขียน (ปิดช่อง crash กลางคัน โดยไม่ต้องมี multi-doc transaction):
   1) เขียน row ก่อน (committed=False)
   2) transaction บน state node เดียว (compare-and-set version)
@@ -30,11 +36,14 @@ from datetime import datetime, timezone
 
 from firebase_admin import db
 
-from lego_one_row import Anchor, Config, validate_row_columns
+from lego_one_row import Anchor, Config, _normalize_legs, validate_row_columns
 
 ROWS_PATH = "webull_lego_rows"
 STATE_PATH = "webull_lego_state"
 AUDIT_PATH = "webull_lego_order_audit"
+
+# ความหมายของ ΔAₙ/Aₙ ใน chain: กำไร realized เฉพาะรอบ Buy↔Sell ที่จับคู่ปิดแล้ว
+CASHFLOW_SEMANTICS = "cycle_realized_v1"
 
 
 class StaleAnchorError(RuntimeError):
@@ -85,13 +94,19 @@ def read_anchor(cfg: Config) -> Anchor | None:
     if not state:
         return None
     ph = state.get("prev_holdings")
+    # state เก่า (ก่อน cycle_realized_v1): prev_actual คือค่าโมเดลทฤษฎีจากสูตรราคา
+    # — ห้ามลากมาต่อกับกำไรจริง (ปะปน) -> รีเซ็ต baseline realized เป็น 0
+    #   ledger เริ่มว่าง; dna_step/p0/prev_price/version คงเดิม (chain เดินต่อ ไม่ restart DNA)
+    realized_semantics = state.get("cashflow_semantics") == CASHFLOW_SEMANTICS
     return Anchor(
         version=int(state["version"]),
         dna_step=int(state["dna_step"]),
         p0=float(state["p0"]),
         prev_price=float(state["prev_price"]),
-        prev_actual=float(state["prev_actual"]),
+        prev_actual=float(state["prev_actual"]) if realized_semantics else 0.0,
         prev_holdings=None if ph is None else float(ph),
+        open_legs=_normalize_legs(state.get("open_legs")) if realized_semantics else None,
+        applied_fills=dict(state.get("applied_fills") or {}) if realized_semantics else None,
     )
 
 
@@ -109,8 +124,16 @@ def _repair_pending(state: dict | None) -> None:
 
 
 # ---- Step 18: commit ------------------------------------------------------
-def commit_final_row(cfg: Config, snapshot: dict, anchor: Anchor | None, row: dict) -> dict:
+def commit_final_row(cfg: Config, snapshot: dict, anchor: Anchor | None, row: dict,
+                     ledger: dict | None = None) -> dict:
+    """ledger = {"open_legs": ..., "applied_fills": ...} หลัง apply fill ใหม่แล้ว
+    None = ไม่มี fill ใหม่/อ่าน audit ไม่ได้ -> คงค่าจาก anchor (ไม่นับ, รอนับรอบหน้า)"""
     validate_row_columns(row)   # defensive boundary: ห้าม persist row ที่ผิดสัญญา 17 คอลัมน์
+    if ledger is None:
+        ledger = {
+            "open_legs": _normalize_legs(anchor.open_legs if anchor else None),
+            "applied_fills": dict((anchor.applied_fills if anchor else None) or {}),
+        }
     ck = chain_key(cfg)
     anchor_version = None if anchor is None else anchor.version
     run_id = make_run_id(ck, anchor_version, snapshot)
@@ -132,7 +155,8 @@ def commit_final_row(cfg: Config, snapshot: dict, anchor: Anchor | None, row: di
     # 1) เขียน row ก่อน (committed=False) — orphan ปลอดภัย: dashboard กรอง committed
     doc = {k: v for k, v in row.items() if k != "_meta"}
     doc.update({"run_id": run_id, "chain_key": ck,
-                "version": expected_version, "committed": False})
+                "version": expected_version, "committed": False,
+                "semantics": CASHFLOW_SEMANTICS})   # metadata: ΔAₙ/Aₙ = realized รอบปิด
     row_ref.set(doc)
 
     # 2) transaction บน state node เดียว (atomic compare-and-set)
@@ -156,13 +180,17 @@ def commit_final_row(cfg: Config, snapshot: dict, anchor: Anchor | None, row: di
             "dna_step": int(meta["step"]),
             "p0": float(snapshot["price"]) if anchor is None else float(anchor.p0),
             "prev_price": float(snapshot["price"]),    # Pₙ
-            "prev_actual": float(meta["actual_next"]), # Aₙ
+            "prev_actual": float(meta["actual_next"]), # Aₙ = กำไรสะสมรอบที่ปิดแล้ว
             "prev_holdings": float(snapshot.get("holdings", 0.0) or 0.0),  # observability
             "last_run_id": run_id,
             "slot": slot,
             "updated_at": snapshot["captured_at"],
             "config_hash": config_hash(cfg),
             "symbol": cfg.symbol,
+            # realized ledger — atomic กับ version: restart/replay ไม่นับซ้ำ (invariant #7/#8)
+            "cashflow_semantics": CASHFLOW_SEMANTICS,
+            "open_legs": ledger["open_legs"],
+            "applied_fills": ledger["applied_fills"],
         }
 
     try:
@@ -183,6 +211,11 @@ def commit_final_row(cfg: Config, snapshot: dict, anchor: Anchor | None, row: di
 
 
 # ---- audit (redacted) -----------------------------------------------------
+def read_audits() -> dict:
+    """audit ทั้งหมด (สำหรับ unapplied_fill_increments — กรอง chain_key ที่ปลายทาง)"""
+    return db.reference(AUDIT_PATH).get() or {}
+
+
 def write_order_audit(event_id: str, payload: dict) -> None:
     redacted = {k: v for k, v in payload.items()
                 if k not in {"app_key", "app_secret", "access_token"}}

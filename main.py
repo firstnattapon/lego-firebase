@@ -22,12 +22,14 @@ import firebase_admin
 import functions_framework
 from firebase_admin import credentials, db
 
-from lego_one_row import READY_BUY, READY_SELL, compute_row
-from lego_state import (SlotAlreadyConsumed, StaleAnchorError,
+from lego_one_row import (READY_BUY, READY_SELL, apply_fill, compute_row,
+                          empty_open_legs)
+from lego_state import (SlotAlreadyConsumed, StaleAnchorError, chain_key,
                         commit_final_row, pending_audits, read_anchor,
-                        update_order_audit, write_order_audit)
+                        read_audits, update_order_audit, write_order_audit)
 from lego_orders import (TERMINAL_STATUSES, UAT, evaluate_submit_gate,
-                         order_confirmation_phrase, summarize_order_result)
+                         order_confirmation_phrase, summarize_order_result,
+                         unapplied_fill_increments)
 from webull_io import (build_clients, build_order_payload, environment_label,
                        fetch_open_orders, fetch_order_detail, fetch_snapshot,
                        is_us_market_open, load_config, place_market_order,
@@ -63,6 +65,25 @@ def _reconcile_pending_orders(trade_client) -> None:
             continue
 
 
+def _realized_from_new_fills(cfg, anchor) -> tuple[float, dict | None]:
+    """กำไรจากรอบที่จับคู่ปิดด้วย fill ใหม่ตั้งแต่แถวก่อนหน้า (บทที่ 4: ขาเดียวไม่นับ)
+
+    คืน (realized_delta, ledger ใหม่สำหรับ persist) — fail closed เป็น (0.0, None):
+    ไม่นับมั่วเมื่ออ่าน audit ไม่ได้; increment ที่ยังไม่ apply จะถูกนับรอบถัดไป
+    (applied_fills เป็น cumulative -> ไม่มีทางนับซ้ำ)"""
+    if anchor is None:
+        return 0.0, None            # genesis: ยังไม่มี order ของ chain นี้
+    open_legs = anchor.open_legs if anchor.open_legs is not None else empty_open_legs()
+    applied = dict(anchor.applied_fills or {})
+    realized_delta = 0.0
+    for inc in unapplied_fill_increments(read_audits(), applied, chain_key(cfg)):
+        open_legs, realized = apply_fill(
+            open_legs, inc["side"], inc["qty"], inc["price"], inc["fee"])
+        realized_delta += realized
+        applied[inc["client_order_id"]] = inc["applied"]
+    return realized_delta, {"open_legs": open_legs, "applied_fills": applied}
+
+
 def _init_firebase():
     if not firebase_admin._apps:
         firebase_admin.initialize_app(
@@ -84,13 +105,35 @@ def lego_one_row(request):
         # Step 0: อ่าน anchor ล่าสุด (1 แถวเท่านั้น — invariant #1)
         anchor = read_anchor(cfg)
 
-        # Step 1–17: snapshot -> engine (validate 17 คอลัมน์ในตัว)
         trade_client, data_client = build_clients()
+
+        # reconcile order ค้างจากรอบก่อน "ก่อน" สร้างแถว — fill ที่ยืนยันแล้ว
+        # จะถูกจับคู่เข้า ledger และนับใน ΔAₙ ของแถวนี้ (แถวที่ commit ไปแล้ว immutable)
+        try:
+            _reconcile_pending_orders(trade_client)
+        except Exception:
+            pass
+
+        # กำไรเฉพาะรอบที่จับคู่ปิดจาก fill ใหม่ — PASS/ขาเดียว/ไม่มี fill -> 0
+        try:
+            realized_delta, ledger = _realized_from_new_fills(cfg, anchor)
+        except Exception as ledger_exc:
+            realized_delta, ledger = 0.0, None    # fail closed: นับรอบหน้า ไม่นับมั่ว
+            try:
+                db.reference("webull_lego_errors").push({
+                    "error": str(ledger_exc), "type": type(ledger_exc).__name__,
+                    "phase": "realized_ledger",
+                })
+            except Exception:
+                pass
+
+        # Step 1–17: snapshot -> engine (validate 17 คอลัมน์ในตัว)
         snapshot = fetch_snapshot(trade_client, data_client, cfg)
-        row = compute_row(cfg, snapshot, anchor)
+        row = compute_row(cfg, snapshot, anchor, realized_delta=realized_delta)
 
         # Step 18: commit (idempotent + stale-anchor + monotonic + slot guard)
-        result = commit_final_row(cfg, snapshot, anchor, row)
+        # ledger persist atomic กับ version -> restart แล้วไม่นับซ้ำ
+        result = commit_final_row(cfg, snapshot, anchor, row, ledger=ledger)
 
         out = {
             "status": row["สถานะ"], "committed": result["committed"],
@@ -98,12 +141,6 @@ def lego_one_row(request):
             "run_id": result["run_id"], "version": result.get("version"),
             "step": row["DNA step"], "signal": row["DNA signal"],
         }
-
-        # reconcile order ค้างจากรอบก่อนให้รู้ผลจริง — ทำทุกรอบ (รวมรอบ PASS)
-        try:
-            _reconcile_pending_orders(trade_client)
-        except Exception:
-            pass
 
         # ---- order path: env-gate -> preview -> gate -> place (ลำดับนี้เท่านั้น) ----
         env = environment_label()
@@ -132,10 +169,13 @@ def lego_one_row(request):
                 order = build_order_payload(cfg, m["side"], m["quantity"], client_order_id)
 
                 # write-ahead audit ก่อน place — crash หลัง place แล้ว order ต้องไม่ล่องหน
+                # chain_key/placed_at: ผูก fill เข้า realized ledger ของ chain นี้เท่านั้น
                 write_order_audit(client_order_id, {
                     "run_id": result["run_id"], "side": m["side"],
                     "quantity": m["quantity"], "symbol": cfg.symbol,
                     "environment": env, "status": "PLACING", "realized": False,
+                    "chain_key": chain_key(cfg),
+                    "placed_at": snapshot["captured_at"],
                 })
                 audit_written = True
 

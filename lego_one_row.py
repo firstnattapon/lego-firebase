@@ -2,6 +2,13 @@
 
 ยึด LEGO invariant: DNA step +1 ทุกแถว, gate, decision band, recurrence คิดทุกแถว,
 17 คอลัมน์ลำดับตายตัว (validate_row_columns fail closed).
+
+หลักบัญชี (Webull_Dashboard · Rebalancing 101 บทที่ 4 — "กำไรเกิดเมื่อรอบปิด"):
+  - Rₙ (คอลัมน์ 14) = Reference เชิงทฤษฎีจากราคา: FIX_C·ln(Pₙ/P₀) — สูตรเดิม
+  - ΔAₙ/Aₙ (คอลัมน์ 15–16) = Realized Profit เฉพาะรอบซื้อขายที่จับคู่ปิดสมบูรณ์
+    (Buy↔Sell หรือ Sell↔Buy จาก fill จริงของ broker) — ขาเดียว/PASS/ไม่มี fill = 0
+    ห้ามใช้สูตรราคา FIX_C·(Pₙ/Pₙ₋₁−1) เป็นเงินจริง (นั่นคือโมเดลทฤษฎีที่สมมติว่า
+    rebalance สำเร็จทุกสเต็ป — ปะปนกับเงินจริงไม่ได้)
 """
 from __future__ import annotations
 
@@ -54,8 +61,10 @@ class Anchor:
     dna_step: int
     p0: float
     prev_price: float
-    prev_actual: float
+    prev_actual: float                   # Aₙ₋₁ = กำไรสะสมจากรอบที่จับคู่ปิดแล้ว (realized)
     prev_holdings: float | None = None   # holdings ล่าสุด (fallback เมื่อ positions endpoint ล้ม); state เก่า = None
+    open_legs: dict | None = None        # ขาเทรดที่ยังจับคู่ไม่ครบ {"buys": [[qty,price,fee_ps]], "sells": [...]}
+    applied_fills: dict | None = None    # cumulative fill ที่นับเข้า ledger แล้ว ต่อ client_order_id (กันนับซ้ำ)
 
 
 @dataclass(frozen=True)
@@ -129,38 +138,109 @@ def build_decision(cfg: Config, price: float, holdings: float, signal: int) -> D
     return Decision(READY_SELL, "TRIGGER_ACTION", "SELL", READY_SELL, qty, value, gap)
 
 
+# ---- Realized cycle ledger: จับคู่ Buy↔Sell แบบ FIFO (บทที่ 4) --------------
+_LEG_EPS = 1e-9   # กันเศษ float ค้างเป็นขาเปิดปลอม
+
+
+def empty_open_legs() -> dict:
+    return {"buys": [], "sells": []}
+
+
+def _normalize_legs(raw) -> dict:
+    """state จาก RTDB อาจไม่มี key (RTDB ตัด list ว่างทิ้ง) -> เติมโครงให้ครบ"""
+    raw = raw or {}
+    out = empty_open_legs()
+    for side in ("buys", "sells"):
+        for leg in raw.get(side) or []:
+            q, p, f = float(leg[0]), float(leg[1]), float(leg[2])
+            if q > _LEG_EPS:
+                out[side].append([q, p, f])
+    return out
+
+
+def apply_fill(open_legs: dict | None, side: str, qty: float, price: float,
+               fee: float = 0.0) -> tuple[dict, float]:
+    """นำ fill จริงหนึ่งก้อนเข้า ledger -> (open_legs ใหม่, realized profit)
+
+    กำไรเกิดเฉพาะส่วนที่จับคู่กับขาฝั่งตรงข้ามที่เปิดค้าง (FIFO — เก่าสุดก่อน):
+      Buy→Sell: realized = (P_sell − P_buy) × qty_matched
+      Sell→Buy: realized = (P_sell − P_buy) × qty_matched   (ขายแพงก่อน ซื้อคืนถูก)
+    fee เก็บเป็น fee/หุ้น ติดขาไว้ หักตอนจับคู่เฉพาะส่วนที่ matched ทั้งสองขา
+    ขาเดียวที่ยังไม่มีคู่ -> เข้าคิวฝั่งตัวเอง, realized = 0.0 เป๊ะ (ห้ามนับเป็นกำไร)
+    """
+    side = str(side).upper()
+    if side not in ("BUY", "SELL"):
+        raise ValueError("side ต้อง BUY หรือ SELL")
+    if not (math.isfinite(qty) and qty > 0):
+        raise ValueError("fill qty ต้อง finite และ > 0")
+    if not (math.isfinite(price) and price > 0):
+        raise ValueError("fill price ต้อง finite และ > 0")
+    if not (math.isfinite(fee) and fee >= 0):
+        raise ValueError("fill fee ต้อง finite และ >= 0")
+
+    legs = _normalize_legs(open_legs)
+    fee_ps = fee / qty
+    remaining = qty
+    realized = 0.0
+    opposite = legs["sells"] if side == "BUY" else legs["buys"]
+    while remaining > _LEG_EPS and opposite:
+        oq, op, ofps = opposite[0]
+        m = min(remaining, oq)
+        # (P_sell − P_buy) × matched — ทิศไหนก่อนก็สูตรเดียวกัน
+        realized += ((op - price) if side == "BUY" else (price - op)) * m
+        realized -= (ofps + fee_ps) * m
+        remaining -= m
+        if oq - m <= _LEG_EPS:
+            opposite.pop(0)
+        else:
+            opposite[0][0] = oq - m
+    if remaining > _LEG_EPS:
+        (legs["buys"] if side == "BUY" else legs["sells"]).append(
+            [remaining, price, fee_ps])
+    return legs, realized
+
+
 # ---- Step 14–17: recurrence (คิดทุกแถว ไม่ขึ้นกับ decision) ----------------
 @dataclass(frozen=True)
 class Recurrence:
-    R: float    # Rₙ = FIX_C·ln(Pₙ/P₀)
-    dA: float   # ΔAₙ = FIX_C·(Pₙ/Pₙ₋₁ − 1)
-    A: float    # Aₙ = Aₙ₋₁ + ΔAₙ
+    R: float    # Rₙ = FIX_C·ln(Pₙ/P₀) — Reference เชิงทฤษฎี (จากราคา)
+    dA: float   # ΔAₙ = realized profit จากรอบที่จับคู่ปิดตั้งแต่แถวก่อนหน้า (0 ถ้าไม่มี)
+    A: float    # Aₙ = Aₙ₋₁ + ΔAₙ — กำไรสะสมเฉพาะรอบที่ปิดแล้ว
     E: float    # Eₙ = Aₙ − Rₙ
 
 
-def compute_recurrence(cfg: Config, price: float, anchor: Anchor | None) -> Recurrence:
-    """แถวแรก: P₀=Pₙ, R=ΔA=A=E=0 ; อื่น ๆ ตามสูตร (price/p0/prev_price ≤ 0 -> fail closed)"""
+def compute_recurrence(cfg: Config, price: float, anchor: Anchor | None,
+                       realized_delta: float = 0.0) -> Recurrence:
+    """แถวแรก: P₀=Pₙ, R=ΔA=A=E=0 ; อื่น ๆ: R จากสูตรราคา (Reference),
+    ΔAₙ = realized_delta (กำไรจากรอบที่จับคู่ปิดเท่านั้น — ผ่าน apply_fill),
+    price/p0/prev_price ≤ 0 หรือ realized_delta ไม่ finite -> fail closed"""
+    if not math.isfinite(realized_delta):
+        raise ValueError("realized_delta ต้อง finite")
     if anchor is None:
+        if realized_delta != 0.0:
+            raise ValueError("แถว genesis ยังไม่มี order -> realized_delta ต้อง 0")
         return Recurrence(0.0, 0.0, 0.0, 0.0)
     if not (price > 0 and anchor.p0 > 0 and anchor.prev_price > 0):
         raise ValueError("price / p0 / prev_price ต้อง > 0")   # invariant #6
     R = cfg.fix_c * math.log(price / anchor.p0)
-    dA = cfg.fix_c * (price / anchor.prev_price - 1.0)
+    dA = float(realized_delta)
     A = anchor.prev_actual + dA
     E = A - R
     return Recurrence(R, dA, A, E)
 
 
 # ---- ประกอบ 17 คอลัมน์ -----------------------------------------------------
-def compute_row(cfg: Config, snapshot: dict, anchor: Anchor | None) -> dict:
-    """snapshot = {captured_at, price, holdings}; คืน row dict 17 คอลัมน์ตามลำดับ"""
+def compute_row(cfg: Config, snapshot: dict, anchor: Anchor | None,
+                realized_delta: float = 0.0) -> dict:
+    """snapshot = {captured_at, price, holdings}; คืน row dict 17 คอลัมน์ตามลำดับ
+    realized_delta = กำไรจากรอบที่จับคู่ปิดตั้งแต่แถวก่อนหน้า (default 0 = ไม่มี fill ใหม่)"""
     step = dna_step_for(anchor)
     signal = dna_signal_for(cfg.dna_code, step)
     price = float(snapshot["price"])
     holdings = float(snapshot.get("holdings", 0.0) or 0.0)
 
     dec = build_decision(cfg, price, holdings, signal)
-    rec = compute_recurrence(cfg, price, anchor)
+    rec = compute_recurrence(cfg, price, anchor, realized_delta)
 
     row = {
         "เวลา (UTC)": snapshot["captured_at"],
