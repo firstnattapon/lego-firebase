@@ -6,8 +6,8 @@
   + ไม่ใช่ Production
 - summarize_order_result: เรียก FILLED เฉพาะ filled ชัดเจน — SUBMITTED/PENDING ไม่นับ realized
   พร้อมดึง execution facts (filled_price/filled_fee) เมื่อ broker ส่งมา — ห้ามใช้ราคา quote แทน
-- unapplied_fill_increments: ส่วนเพิ่มของ fill (cumulative − applied) ที่ยังไม่เคยนับเข้า
-  realized ledger — กันนับซ้ำจาก partial fill / duplicate snapshot / restart
+  (facts เก็บลง audit เพื่อ observability; ledger ΔAₙ/Aₙ เป็นทฤษฎีแบบ gated
+  ใน lego_one_row ไม่ได้ใช้ fill — ดู gated_theoretical_v2)
 """
 from __future__ import annotations
 
@@ -137,69 +137,4 @@ def summarize_order_result(place_response: dict, detail: dict | None = None) -> 
               or fields.get("error_msg") or fields.get("reject_reason"))
     if reason:
         out["reject_reason"] = str(reason)
-    return out
-
-
-# ---- realized ledger input: ส่วนเพิ่มของ fill ที่ยังไม่เคยนับ ---------------
-def _safe_float(value) -> float | None:
-    try:
-        number = float(value)
-    except (TypeError, ValueError):
-        return None
-    return number if math.isfinite(number) else None
-
-
-def unapplied_fill_increments(audits: dict | None, applied: dict | None,
-                              chain_key: str) -> list[dict]:
-    """คืนรายการ fill ส่วนเพิ่ม (cumulative − applied) ต่อ client_order_id เรียง placed_at
-
-    fail closed ทุกทาง — ข้ามรายการ (รอ reconcile รอบหน้า ไม่นับมั่ว) เมื่อ:
-      - audit ไม่ใช่ของ chain นี้ (chain_key ไม่ตรง / payload เก่าไม่มี chain_key)
-      - status ไม่อยู่ใน REALIZED_STATUSES (SUBMITTED/PENDING/REJECTED/... ไม่นับ)
-      - ไม่มี filled_quantity > 0 หรือไม่มี execution price > 0 (quote ใช้แทนไม่ได้)
-      - cumulative ไม่เพิ่มจากที่ applied แล้ว (duplicate/stale snapshot -> กันนับซ้ำ)
-    ผลลัพธ์แต่ละรายการ: {client_order_id, side, qty, price, fee, applied}
-    โดย applied = cumulative ใหม่ที่ต้อง persist หลังนำเข้า ledger สำเร็จ"""
-    out = []
-    ordered = sorted(
-        (audits or {}).items(),
-        key=lambda kv: (str((kv[1] or {}).get("placed_at", "")
-                            if isinstance(kv[1], dict) else ""), kv[0]))
-    for cid, payload in ordered:
-        if not isinstance(payload, dict):
-            continue
-        if payload.get("chain_key") != chain_key:
-            continue
-        side = str(payload.get("side", "")).upper()
-        if side not in ("BUY", "SELL"):
-            continue
-        if _normalize_status(payload.get("status")) not in REALIZED_STATUSES:
-            continue
-        cum_qty = _safe_float(payload.get("filled_quantity"))
-        price = _safe_float(payload.get("filled_price"))
-        fee = _safe_float(payload.get("filled_fee"))
-        cum_fee = fee if (fee is not None and fee >= 0) else 0.0
-        if cum_qty is None or cum_qty <= 0:
-            continue
-        if price is None or price <= 0:
-            continue
-        prev = (applied or {}).get(cid) or {}
-        prev_qty = float(prev.get("qty", 0.0) or 0.0)
-        prev_notional = float(prev.get("notional", 0.0) or 0.0)
-        prev_fee = float(prev.get("fee", 0.0) or 0.0)
-        inc_qty = cum_qty - prev_qty
-        if inc_qty <= 1e-9:
-            continue
-        inc_notional = cum_qty * price - prev_notional
-        if inc_notional <= 0:
-            continue        # ข้อมูล cumulative ถอยหลัง — ไม่น่าเชื่อถือ ไม่นับ
-        out.append({
-            "client_order_id": cid,
-            "side": side,
-            "qty": inc_qty,
-            "price": inc_notional / inc_qty,
-            "fee": max(0.0, cum_fee - prev_fee),
-            "applied": {"qty": cum_qty, "notional": cum_qty * price,
-                        "fee": max(cum_fee, prev_fee)},
-        })
     return out
