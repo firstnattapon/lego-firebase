@@ -167,7 +167,7 @@ gcloud functions deploy lego-one-row \
   --no-allow-unauthenticated \
   --memory=512Mi \
   --timeout=120s \
-  --set-env-vars="FIREBASE_DB_URL=$DB_URL,WEBULL_ENV=UAT,LEGO_SYMBOL=APLS,LEGO_FIX_C=1500,LEGO_DIFF=60,LEGO_DNA_CODE=bypass:100,LEGO_DECIMAL_PRECISION=5,LEGO_SLOT_SECONDS=1800,AUTO_SUBMIT=false" \
+  --set-env-vars="FIREBASE_DB_URL=$DB_URL,WEBULL_ENV=UAT,LEGO_SYMBOL=APLS,LEGO_FIX_C=1500,LEGO_DIFF=60,LEGO_DNA_CODE=bypass:100,LEGO_DECIMAL_PRECISION=5,LEGO_SLOT_SECONDS=1800,LEGO_DNA_CLOCK_MODE=shadow,AUTO_SUBMIT=false" \
   --set-secrets="WEBULL_APP_KEY=webull-app-key:latest,WEBULL_APP_SECRET=webull-app-secret:latest,WEBULL_ACCOUNT_ID=webull-account-id:latest"
 ```
 
@@ -177,6 +177,31 @@ gcloud functions deploy lego-one-row \
 - `AUTO_SUBMIT=false` — ยังไม่ส่ง order จริงอัตโนมัติ
 
 เมื่อระบบนิ่งและมั่นใจแล้ว ค่อยพิจารณาเปิด production / auto submit ทีหลัง
+
+⏱️ **`LEGO_SLOT_SECONDS` ต้องเท่ากับ timeframe ที่เทรน DNA มา** — รับเฉพาะ `900` (15m) `1800` (30m) `3600` (1h) `14400` (4h) `86400` (1d) ค่าอื่น (เช่น `600`) function จะตอบ `CONFIG_ERROR` ทันที และ scheduler ต้องยิงถี่เท่ากับค่านี้
+
+🧭 **`LEGO_DNA_CLOCK_MODE=shadow`** = ยังเดิน DNA แบบเดิม (step +1) แต่คำนวณเวลาตลาดคู่ขนานให้ดู เมื่ออยากให้ DNA ยึดเวลาตลาดจริงค่อยเปลี่ยนเป็น `market` (ต้องตั้ง `LEGO_DNA_ORIGIN_UTC` ก่อน — ดูหัวข้อ 7.5)
+
+### 6.1) Deploy function ตัวที่สอง — คนส่ง order
+
+`lego-one-row` แค่บันทึกแถวและสร้าง "ใบสั่ง" ไว้ใน outbox **ไม่ได้ส่ง order เอง** ต้อง deploy ตัวนี้ด้วยถึงจะมีคนหยิบใบสั่งไปยิง:
+
+```bash
+gcloud functions deploy lego-order-worker \
+  --gen2 \
+  --runtime=python312 \
+  --region="$REGION" \
+  --source=. \
+  --entry-point=lego_order_worker \
+  --trigger-http \
+  --no-allow-unauthenticated \
+  --memory=512Mi \
+  --timeout=120s \
+  --set-env-vars="FIREBASE_DB_URL=$DB_URL,WEBULL_ENV=UAT,LEGO_SYMBOL=APLS,LEGO_FIX_C=1500,LEGO_DIFF=60,LEGO_DNA_CODE=bypass:100,LEGO_DECIMAL_PRECISION=5,LEGO_SLOT_SECONDS=1800" \
+  --set-secrets="WEBULL_APP_KEY=webull-app-key:latest,WEBULL_APP_SECRET=webull-app-secret:latest,WEBULL_ACCOUNT_ID=webull-account-id:latest"
+```
+
+> 🧩 **ทำไมต้องแยกสองตัว?** เพื่อให้ broker ล่ม/ค้าง ไม่ลากให้ DNA หยุดเดิน แถวถูกบันทึกก่อนเสมอ แล้วเรื่อง order ค่อยว่ากันต่างหาก
 
 ---
 
@@ -192,12 +217,12 @@ echo "$FUNCTION_URL"
 echo "$FUNCTION_SA"
 ```
 
-สร้าง scheduler ให้เรียก function **ทุก 10 นาที จันทร์–ศุกร์** ในช่วงเวลา UTC ที่ครอบคลุมตลาดสหรัฐฯ:
+สร้าง scheduler ให้เรียก function **ทุก 30 นาที จันทร์–ศุกร์** ในช่วงเวลา UTC ที่ครอบคลุมตลาดสหรัฐฯ (ต้องตรงกับ `LEGO_SLOT_SECONDS=1800`):
 
 ```bash
 gcloud scheduler jobs create http lego-tick \
   --location="$REGION" \
-  --schedule="*/10 13-20 * * 1-5" \
+  --schedule="*/30 13-20 * * 1-5" \
   --time-zone="UTC" \
   --max-retry-attempts=0 \
   --uri="$FUNCTION_URL" \
@@ -206,7 +231,25 @@ gcloud scheduler jobs create http lego-tick \
   --oidc-token-audience="$FUNCTION_URL"
 ```
 
-> 📖 **อ่าน schedule ยังไง?** `*/10 13-20 * * 1-5` = ทุก ๆ 10 นาที ในชั่วโมง 13–20 UTC วันจันทร์ถึงศุกร์ (ครอบคลุมเวลาเปิด–ปิดตลาดหุ้นสหรัฐฯ)
+> 📖 **อ่าน schedule ยังไง?** `*/30 13-20 * * 1-5` = ทุก ๆ 30 นาที ในชั่วโมง 13–20 UTC วันจันทร์ถึงศุกร์ (ครอบคลุมเวลาเปิด–ปิดตลาดหุ้นสหรัฐฯ)
+> ยิงถี่กว่า slot ได้ ไม่พัง — รอบเกินจะตอบ `SLOT_CONSUMED` แล้วไม่บันทึกซ้ำ
+
+สร้าง scheduler ของคนส่ง order ด้วย (ทุก 5 นาที พอ):
+
+```bash
+export WORKER_URL="$(gcloud functions describe lego-order-worker --gen2 --region="$REGION" --format='value(serviceConfig.uri)')"
+export WORKER_SA="$(gcloud functions describe lego-order-worker --gen2 --region="$REGION" --format='value(serviceConfig.serviceAccountEmail)')"
+
+gcloud scheduler jobs create http lego-order-tick \
+  --location="$REGION" \
+  --schedule="*/5 13-20 * * 1-5" \
+  --time-zone="UTC" \
+  --max-retry-attempts=0 \
+  --uri="$WORKER_URL" \
+  --http-method=POST \
+  --oidc-service-account-email="$WORKER_SA" \
+  --oidc-token-audience="$WORKER_URL"
+```
 
 ลองทดสอบยิง scheduler ด้วยมือ (ไม่ต้องรอถึงเวลา):
 
@@ -219,6 +262,41 @@ gcloud scheduler jobs run lego-tick --location="$REGION"
 ```bash
 gcloud functions logs read lego-one-row --gen2 --region="$REGION" --limit=50
 ```
+
+---
+
+## 7.5) 🧭 (ทำทีหลังได้) ให้ DNA เดินตามเวลาตลาดจริง
+
+ค่าเริ่มต้น `shadow` = DNA เดินทีละ +1 ต่อการบันทึกหนึ่งครั้ง ถ้า scheduler พลาดรอบ DNA ก็ช้าตามไปด้วย
+
+โหมด `market` = DNA ยึด "ช่องเวลาตลาด" เป็นหลัก พลาดรอบก็ข้ามช่องไปเลย ตรงกับตอนเทรน DNA มากกว่า
+
+**ขั้นตอน:**
+
+1. เปิด Firebase ดู `/webull_lego_state/{chain_key}` จด `dna_step` ไว้ (สมมติได้ `16`)
+2. หา origin — เวลาของช่องที่นับเป็น step 0:
+
+```bash
+LEGO_SLOT_SECONDS=1800 python find_origin.py 17     # 16 + 1
+# LEGO_DNA_ORIGIN_UTC = 2026-07-23T19:30:00Z
+```
+
+3. ใส่ค่าเพิ่มลง function แล้วรอดูสัก 3–4 รอบ:
+
+```bash
+gcloud functions deploy lego-one-row --gen2 --region="$REGION" \
+  --update-env-vars="LEGO_DNA_ORIGIN_UTC=2026-07-23T19:30:00Z"
+```
+
+response จะมี `"alignment_error": 0` — ถ้าเป็น 0 นิ่งแล้วค่อยสลับ:
+
+```bash
+gcloud functions deploy lego-one-row --gen2 --region="$REGION" \
+  --update-env-vars="LEGO_DNA_CLOCK_MODE=market"
+```
+
+> ⚠️ **origin แก้ทีหลังไม่ได้** — ระบบจำปฏิทินที่ใช้ตอนเริ่มไว้ ถ้าเปลี่ยนภายหลังจะตอบ `CALENDAR_DRIFT` (409) ทุกรอบเพื่อกัน DNA เลื่อนช่องแบบเงียบ ๆ ต้องล้าง state หรือเริ่ม chain ใหม่
+> อยากกลับ? เปลี่ยน `LEGO_DNA_CLOCK_MODE` กลับเป็น `shadow` ได้ทันที ไม่กระทบข้อมูล
 
 ---
 
@@ -287,6 +365,23 @@ gcloud functions describe lego-one-row --gen2 --region="$REGION" --format='value
 ---
 
 ## 🆘 Troubleshooting แบบเร็ว
+
+### อ่านคำตอบของ function ให้เป็น
+
+| ที่เห็นใน response | แปลว่า | ต้องทำอะไร |
+|---|---|---|
+| `ROW_COMMITTED` | บันทึกแถวสำเร็จ | 🎉 ไม่ต้องทำอะไร |
+| `MARKET_CLOSED` | ตลาดปิด | ปกติ ไม่ใช่ error |
+| `SLOT_CONSUMED` | ช่องเวลานี้บันทึกไปแล้ว | ปกติ (scheduler ยิงถี่กว่า slot) |
+| `CONFIG_ERROR` | `LEGO_SLOT_SECONDS` ไม่ได้ตั้ง หรือใช้ค่าที่ไม่รองรับ | ตั้งเป็น `900/1800/3600/14400/86400` |
+| `CALENDAR_DRIFT` | ปฏิทิน/slot/origin เปลี่ยนหลังเริ่ม chain | คืนค่าเดิม หรือเริ่ม chain ใหม่ |
+| `STALE_ANCHOR` | มีคนบันทึกแซงไปแล้ว | ปกติเมื่อยิงซ้อน รอบถัดไปหายเอง |
+
+### สั่ง order แล้วไม่มีอะไรเกิดขึ้น
+
+เช็กว่า deploy `lego-order-worker` และสร้าง scheduler `lego-order-tick` แล้วหรือยัง (หัวข้อ 6.1 และ 7) — `lego-one-row` แค่บันทึกใบสั่งไว้ใน `webull_lego_order_outbox` เท่านั้น
+
+ถ้าใบสั่งขึ้น `EXPIRED_UNSENT` = worker มาช้าเกินช่วงเวลาของ slot นั้น (ตั้งใจให้หมดอายุ ดีกว่าส่งราคาที่เก่าไปแล้ว) ให้ยิง worker ถี่ขึ้น
 
 ### Streamlit ขึ้น error เรื่อง Firebase secret
 
