@@ -3,21 +3,19 @@ from __future__ import annotations
 
 import hashlib
 import json
-import os
 from datetime import datetime, timezone
 
 from firebase_admin import db
 
 from lego_one_row import Anchor, Config, validate_row_columns
 from lego_orders import apply_fill, normalize_status
+from market_clock import calendar_fingerprint, market_ordinal_for_slot_id
 
 ROWS_PATH = "webull_lego_rows"
 STATE_PATH = "webull_lego_state"
 AUDIT_PATH = "webull_lego_order_audit"
 REALIZED_PATH = "webull_lego_realized"
 CASHFLOW_SEMANTICS = "gated_theoretical_v2"
-
-ORDER_TERMINAL = {"FILLED", "CANCELLED", "FAILED", "REJECTED", "EXPIRED", "NOT_PLACED"}
 
 
 class StaleAnchorError(RuntimeError):
@@ -28,8 +26,8 @@ class SlotAlreadyConsumed(RuntimeError):
     pass
 
 
-class PendingOrderExists(RuntimeError):
-    pass
+class CalendarDriftError(RuntimeError):
+    """The market calendar no longer reproduces this chain's committed slots."""
 
 
 class _Idempotent(Exception):
@@ -55,12 +53,27 @@ def make_run_id(ck: str, anchor_version: int | None, snapshot: dict) -> str:
     return hashlib.sha256(raw.encode()).hexdigest()[:32]
 
 
-def _slot_of(captured_at: str) -> int | None:
-    sec = int(os.environ.get("LEGO_SLOT_SECONDS", "0"))
-    if sec <= 0:
-        return None
-    dt = datetime.strptime(captured_at, "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=timezone.utc)
-    return int(dt.timestamp()) // sec
+def verify_calendar_continuity(state: dict | None) -> None:
+    """Fail closed when the calendar would re-phase an existing chain.
+
+    Two independent checks: the stored fingerprint (slot size, origin, declared
+    holidays, rules version) and a recompute of the last committed slot id.
+    """
+    if not state:
+        return
+    stored = state.get("calendar_fingerprint")
+    if stored and stored != calendar_fingerprint():
+        raise CalendarDriftError(
+            f"calendar/slot config เปลี่ยน: fingerprint {stored} -> {calendar_fingerprint()} "
+            "(DNA จะเลื่อน phase ถาวร) ต้องเริ่ม chain ใหม่หรือคืนค่าเดิม")
+    slot_id = state.get("slot_id")
+    ordinal = state.get("market_ordinal")
+    if not slot_id or ordinal is None or str(slot_id).startswith("epoch:"):
+        return
+    recomputed = market_ordinal_for_slot_id(str(slot_id))
+    if recomputed != int(ordinal):
+        raise CalendarDriftError(
+            f"slot {slot_id} เคย commit เป็น ordinal {int(ordinal)} แต่คำนวณใหม่ได้ {recomputed}")
 
 
 def read_anchor(cfg: Config) -> Anchor | None:
@@ -91,30 +104,28 @@ def _repair_pending_row(state: dict | None) -> None:
         ref.update({"committed": True})
 
 
-def _is_pending_order(order: dict | None) -> bool:
-    if not isinstance(order, dict):
-        return False
-    return normalize_status(order.get("status")) not in ORDER_TERMINAL
+def commit_final_row(cfg: Config, snapshot: dict, anchor: Anchor | None, row: dict,
+                     *, slot_id: str | None = None, market_ordinal: int | None = None,
+                     clock_mode: str | None = None) -> dict:
+    """Commit one row and advance the DNA pointer.
 
-
-def commit_final_row(cfg: Config, snapshot: dict, anchor: Anchor | None,
-                     row: dict, order_intent: dict | None = None) -> dict:
-    """Commit row and state pointer.
-
-    The pending order intent is stored inside the same state transaction that
-    advances the DNA pointer. Therefore a crash after commit cannot lose the
-    order intent. The row remains exactly the original 17 columns plus metadata.
+    Order execution is not part of this transaction: intents live in the
+    outbox, so a broker failure can never roll back a committed slot. The row
+    keeps exactly the original 17 columns; slot provenance is stored alongside
+    run_id/version as metadata, never as a new column.
     """
     validate_row_columns(row)
     ck = chain_key(cfg)
     anchor_version = None if anchor is None else anchor.version
     run_id = make_run_id(ck, anchor_version, snapshot)
     expected_version = 1 if anchor is None else anchor.version + 1
-    slot = _slot_of(snapshot["captured_at"])
     row_ref = db.reference(f"{ROWS_PATH}/{run_id}")
     state_ref = db.reference(f"{STATE_PATH}/{ck}")
     meta = row["_meta"]
-    _repair_pending_row(state_ref.get())
+    state_before = state_ref.get()
+    if slot_id is not None:
+        verify_calendar_continuity(state_before)
+    _repair_pending_row(state_before)
 
     existing = row_ref.get()
     if existing is not None and existing.get("committed"):
@@ -129,24 +140,19 @@ def commit_final_row(cfg: Config, snapshot: dict, anchor: Anchor | None,
         "committed": False,
         "semantics": CASHFLOW_SEMANTICS,
     })
+    if slot_id is not None:
+        doc["market_slot_id"] = slot_id
+    if market_ordinal is not None:
+        doc["market_ordinal"] = int(market_ordinal)
+    if clock_mode is not None:
+        doc["clock_mode"] = clock_mode
     row_ref.set(doc)
-
-    if order_intent is not None:
-        order_intent = dict(order_intent)
-        order_intent.update({
-            "run_id": run_id,
-            "client_order_id": run_id,
-            "chain_key": ck,
-            "status": normalize_status(order_intent.get("status") or "PENDING"),
-            "created_at": snapshot["captured_at"],
-        })
 
     def txn(current):
         current = current or None
         if current is None:
             if anchor_version is not None:
                 raise StaleAnchorError("state ว่างแต่ anchor ไม่ใช่ genesis")
-            existing_pending = None
         else:
             if current.get("last_run_id") == run_id:
                 raise _Idempotent()
@@ -154,13 +160,8 @@ def commit_final_row(cfg: Config, snapshot: dict, anchor: Anchor | None,
                 raise StaleAnchorError(
                     f"stale anchor: anchor.version={anchor_version} "
                     f"state.version={current.get('version')}")
-            if slot is not None and current.get("slot") == slot:
-                raise SlotAlreadyConsumed(f"slot {slot} commit ไปแล้ว")
-            existing_pending = current.get("pending_order")
-
-        if order_intent is not None and _is_pending_order(existing_pending):
-            raise PendingOrderExists(
-                f"pending order {existing_pending.get('run_id')} ยังไม่จบ")
+            if slot_id is not None and current.get("slot_id") == slot_id:
+                raise SlotAlreadyConsumed(f"slot {slot_id} commit ไปแล้ว")
 
         next_state = {
             "version": expected_version,
@@ -170,16 +171,21 @@ def commit_final_row(cfg: Config, snapshot: dict, anchor: Anchor | None,
             "prev_actual": float(meta["actual_next"]),
             "prev_holdings": float(snapshot.get("holdings", 0.0) or 0.0),
             "last_run_id": run_id,
-            "slot": slot,
             "updated_at": snapshot["captured_at"],
             "config_hash": config_hash(cfg),
             "symbol": cfg.symbol,
             "cashflow_semantics": CASHFLOW_SEMANTICS,
         }
-        if order_intent is not None:
-            next_state["pending_order"] = order_intent
-        elif _is_pending_order(existing_pending):
-            next_state["pending_order"] = existing_pending
+        if slot_id is not None:
+            next_state["slot_id"] = slot_id
+            if not slot_id.startswith("epoch:"):
+                # A degraded (clock-less) commit makes no claim about the
+                # calendar, so it must not pin one onto the chain.
+                next_state["calendar_fingerprint"] = calendar_fingerprint()
+        if market_ordinal is not None:
+            next_state["market_ordinal"] = int(market_ordinal)
+        if clock_mode is not None:
+            next_state["clock_mode"] = clock_mode
         return next_state
 
     try:
@@ -188,51 +194,13 @@ def commit_final_row(cfg: Config, snapshot: dict, anchor: Anchor | None,
         row_ref.update({"committed": True})
         return {"committed": False, "idempotent": True,
                 "run_id": run_id, "version": expected_version}
-    except (StaleAnchorError, SlotAlreadyConsumed, PendingOrderExists):
+    except (StaleAnchorError, SlotAlreadyConsumed):
         row_ref.delete()
         raise
 
     row_ref.update({"committed": True})
     return {"committed": True, "run_id": run_id, "version": expected_version,
-            "order_intent": order_intent}
-
-
-def get_pending_order(cfg: Config) -> dict | None:
-    state = db.reference(f"{STATE_PATH}/{chain_key(cfg)}").get() or {}
-    pending = state.get("pending_order")
-    return pending if _is_pending_order(pending) else None
-
-
-def update_pending_order(cfg: Config, run_id: str, fields: dict) -> dict | None:
-    ref = db.reference(f"{STATE_PATH}/{chain_key(cfg)}")
-    def txn(current):
-        if not current:
-            return current
-        pending = current.get("pending_order")
-        if not isinstance(pending, dict) or pending.get("run_id") != run_id:
-            return current
-        updated = dict(pending)
-        updated.update(fields)
-        updated["status"] = normalize_status(updated.get("status"))
-        current = dict(current)
-        current["pending_order"] = updated
-        return current
-    result = ref.transaction(txn)
-    return (result or {}).get("pending_order") if isinstance(result, dict) else None
-
-
-def clear_pending_order(cfg: Config, run_id: str) -> None:
-    ref = db.reference(f"{STATE_PATH}/{chain_key(cfg)}")
-    def txn(current):
-        if not current:
-            return current
-        pending = current.get("pending_order")
-        if not isinstance(pending, dict) or pending.get("run_id") != run_id:
-            return current
-        current = dict(current)
-        current.pop("pending_order", None)
-        return current
-    ref.transaction(txn)
+            "market_slot_id": slot_id, "market_ordinal": market_ordinal}
 
 
 def write_order_audit(event_id: str, payload: dict) -> None:

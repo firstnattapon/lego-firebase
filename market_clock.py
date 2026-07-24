@@ -6,6 +6,8 @@ origin. Production must use the same calendar/session rules as DNA training.
 """
 from __future__ import annotations
 
+import hashlib
+import math
 import os
 from dataclasses import dataclass
 from datetime import date, datetime, time, timedelta, timezone
@@ -14,6 +16,14 @@ from zoneinfo import ZoneInfo
 
 NY = ZoneInfo("America/New_York")
 UTC = timezone.utc
+
+# DNA is trained on yfinance bars (index-to-index), so production slots must use
+# a timeframe the trainer can emit. 10m has no counterpart and is rejected.
+ALLOWED_SLOT_SECONDS = {900: "15m", 1800: "30m", 3600: "1h",
+                        14400: "4h", 86400: "1d"}
+# Bump when the built-in holiday/early-close rules change; it re-keys the
+# calendar fingerprint so an existing chain fails closed instead of re-phasing.
+CALENDAR_RULES_VERSION = "2026-07-nyse-v1"
 
 
 class MarketClockError(RuntimeError):
@@ -125,19 +135,33 @@ def _parse_origin() -> datetime:
     return datetime.fromisoformat(raw.replace("Z", "+00:00")).astimezone(UTC)
 
 
-def _slot_seconds() -> int:
-    sec = int(os.environ.get("LEGO_SLOT_SECONDS", "600"))
-    if sec <= 0:
-        raise MarketClockError("LEGO_SLOT_SECONDS ต้อง > 0")
+def slot_seconds() -> int:
+    """Mandatory and validated: the grid must match the trained yfinance bars."""
+    raw = os.environ.get("LEGO_SLOT_SECONDS", "").strip()
+    if not raw:
+        allowed = ", ".join(f"{s} ({n})" for s, n in sorted(ALLOWED_SLOT_SECONDS.items()))
+        raise MarketClockError(f"ต้องตั้ง LEGO_SLOT_SECONDS ให้ตรง timeframe ที่เทรน DNA: {allowed}")
+    try:
+        sec = int(raw)
+    except ValueError as exc:
+        raise MarketClockError(f"LEGO_SLOT_SECONDS ไม่ใช่จำนวนเต็ม: {raw!r}") from exc
+    if sec not in ALLOWED_SLOT_SECONDS:
+        allowed = ", ".join(f"{s} ({n})" for s, n in sorted(ALLOWED_SLOT_SECONDS.items()))
+        raise MarketClockError(f"LEGO_SLOT_SECONDS={sec} ไม่รองรับ ต้องเป็น {allowed}")
     return sec
 
 
 def _session_slots(d: date, sec: int) -> int:
+    """Count bars the way yfinance emits them: a partial trailing bar counts.
+
+    Floor division silently dropped the 15:30-16:00 half bar on 1h and made 1d
+    zero, which drifts the ordinal against the trained bar index every session.
+    """
     bounds = session_bounds(d)
     if not bounds:
         return 0
     start, end = bounds
-    return int((end - start).total_seconds()) // sec
+    return math.ceil((end - start).total_seconds() / sec)
 
 
 def _ordinal_from_origin(origin: datetime, slot_start: datetime, sec: int) -> int:
@@ -161,10 +185,71 @@ def _ordinal_from_origin(origin: datetime, slot_start: datetime, sec: int) -> in
     return total
 
 
+def dna_origin_utc() -> datetime:
+    return _parse_origin()
+
+
+def calendar_fingerprint() -> str:
+    """Digest of every input that can shift a market ordinal.
+
+    Stored on the chain at genesis. A changed slot size, a newly declared
+    holiday, or a rules bump changes this digest, so the chain fails closed
+    instead of silently trading a re-phased gate array.
+    """
+    raw_origin = os.environ.get("LEGO_DNA_ORIGIN_UTC", "").strip()
+    try:
+        # Compare the instant, not the spelling: '...T18:00:00Z' and
+        # '...T18:00:00+00:00' are the same origin and must not re-key a chain.
+        origin_key = _parse_origin().strftime("%Y-%m-%dT%H:%M:%SZ")
+    except (MarketClockError, ValueError):
+        origin_key = raw_origin
+    payload = "|".join([
+        CALENDAR_RULES_VERSION,
+        str(slot_seconds()),
+        origin_key,
+        ",".join(sorted(x.strip() for x in os.environ.get("LEGO_MARKET_HOLIDAYS", "").split(",") if x.strip())),
+        ",".join(sorted(x.strip() for x in os.environ.get("LEGO_MARKET_EARLY_CLOSES", "").split(",") if x.strip())),
+    ])
+    return hashlib.sha256(payload.encode()).hexdigest()[:16]
+
+
+def market_ordinal_for_slot_id(slot_id: str) -> int:
+    """Recompute the ordinal of an already-committed slot id.
+
+    Used to detect calendar drift: if a past slot no longer resolves to the
+    ordinal it was committed with, the calendar changed underneath the chain.
+    """
+    raw = str(slot_id)
+    session_raw, _, index_raw = raw.rpartition(":")
+    if not session_raw or not index_raw.lstrip("-").isdigit():
+        raise MarketClockError(f"slot_id ไม่ถูกรูปแบบ: {slot_id!r}")
+    sec = slot_seconds()
+    try:
+        session_date = date.fromisoformat(session_raw)
+    except ValueError as exc:
+        raise MarketClockError(f"slot_id ไม่ถูกรูปแบบ: {slot_id!r}") from exc
+    bounds = session_bounds(session_date)
+    if not bounds:
+        raise MarketClockError(f"slot_id {slot_id!r} ไม่ตรงกับวันทำการของปฏิทินปัจจุบัน")
+    session_open, _ = bounds
+    slot_start = session_open + timedelta(seconds=int(index_raw) * sec)
+    return _ordinal_from_origin(_parse_origin(), slot_start, sec)
+
+
+def fallback_slot_id(captured_at: str) -> str:
+    """Degraded slot key used only when the market clock is unavailable.
+
+    Namespaced with 'epoch:' so it can never collide with a canonical
+    '<session-date>:<index>' id, while still keeping one-commit-per-slot.
+    """
+    dt = datetime.strptime(str(captured_at), "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=UTC)
+    return f"epoch:{int(dt.timestamp()) // slot_seconds()}"
+
+
 def resolve_market_slot(at: datetime | None = None) -> MarketSlot | None:
     """Return the canonical slot containing *at*, or None outside regular hours."""
     at = (at or datetime.now(UTC)).astimezone(UTC)
-    sec = _slot_seconds()
+    sec = slot_seconds()
     session_date = at.astimezone(NY).date()
     bounds = session_bounds(session_date)
     if not bounds:

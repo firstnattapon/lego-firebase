@@ -4,7 +4,9 @@ on:
   pull_request:
   push:
     branches:
-      - agent/time-aligned-dna-outbox
+      - main
+      - 'claude/**'
+      - 'agent/**'
 
 jobs:
   test:
