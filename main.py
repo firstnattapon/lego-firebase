@@ -20,15 +20,17 @@ from lego_orders import (REALIZED_STATUSES, TERMINAL_STATUSES, UAT,
                          order_confirmation_phrase, summarize_order_result)
 from lego_outbox import (expire_unsent_before, list_actionable, put_intent,
                          row_is_committed, update_intent)
-from lego_state import (CalendarDriftError, SlotAlreadyConsumed, StaleAnchorError,
-                        apply_realized_fill, chain_key, commit_final_row, make_run_id,
-                        read_anchor, update_order_audit, write_order_audit)
-from market_clock import (MarketClockError, fallback_slot_id, resolve_dna_step,
-                          resolve_market_slot, slot_seconds)
+from lego_state import (CalendarDriftError, OrdinalRegression, SlotAlreadyConsumed,
+                        StaleAnchorError, apply_realized_fill, chain_key,
+                        commit_final_row, read_anchor, update_order_audit,
+                        write_order_audit)
+from market_clock import (MarketClockError, clock_mode, fallback_slot_id,
+                          is_regular_session, resolve_dna_step, resolve_market_slot,
+                          slot_seconds)
 from webull_io import (build_clients, build_order_payload, environment_label,
                        fetch_open_orders, fetch_order_detail, fetch_snapshot,
-                       is_transient_exception, is_us_market_open, load_config,
-                       place_market_order, preview_market_order)
+                       is_transient_exception, load_config, place_market_order,
+                       preview_market_order)
 
 ORDER_POLL_ATTEMPTS = 3
 ORDER_POLL_DELAY_S = 2.0
@@ -79,12 +81,22 @@ def _apply_realized_if_available(intent: dict, summary: dict) -> dict:
     return out
 
 
-def _persist_summary(intent: dict, summary: dict) -> None:
-    run_id = intent["run_id"]
-    status = normalize_status(summary.get("status"))
-    fields = {**summary, "status": status}
-    update_intent(intent["chain_key"], run_id, fields)
+def _persist(chain_key_: str, run_id: str, fields: dict) -> dict:
+    """Outbox and audit always move together; never write only one of them."""
+    update_intent(chain_key_, run_id, fields)
     update_order_audit(run_id, fields)
+    return {"run_id": run_id, **fields}
+
+
+def _persist_summary(intent: dict, summary: dict) -> None:
+    _persist(intent["chain_key"], intent["run_id"],
+             {**summary, "status": normalize_status(summary.get("status"))})
+
+
+def _persist_error(chain_key_: str, run_id: str, status: str, exc: Exception) -> dict:
+    err = f"{type(exc).__name__}: {exc}"
+    _persist(chain_key_, run_id, {"status": status, "last_error": err[:500]})
+    return {"run_id": run_id, "status": status, "error": err}
 
 
 def _pending_row_shape(intent: dict) -> dict:
@@ -99,17 +111,21 @@ def _pending_row_shape(intent: dict) -> dict:
     }
 
 
+def _stop(chain_key_: str, run_id: str, status: str, extra: dict | None = None,
+          **reported) -> dict:
+    """Close an intent in the outbox without touching the audit trail."""
+    update_intent(chain_key_, run_id, {"status": status, **(extra or {})})
+    return {"run_id": run_id, "status": status, **reported}
+
+
 def _dispatch_or_reconcile_one(trade_client, data_client, cfg, intent: dict) -> dict:
     run_id = intent["run_id"]
     ck = intent["chain_key"]
     status = normalize_status(intent.get("status"))
 
     if not row_is_committed(run_id):
-        update_intent(ck, run_id, {
-            "status": "NOT_PLACED",
-            "terminal_reason": "source row was not committed",
-        })
-        return {"run_id": run_id, "status": "NOT_PLACED"}
+        return _stop(ck, run_id, "NOT_PLACED",
+                     {"terminal_reason": "source row was not committed"})
 
     if status in {"PLACING_UNKNOWN", "PLACING", "SUBMITTED", "UNKNOWN",
                   "PARTIAL_FILLED", "PARTIALLY_FILLED"}:
@@ -121,45 +137,32 @@ def _dispatch_or_reconcile_one(trade_client, data_client, cfg, intent: dict) -> 
             _persist_summary(intent, summary)
             return {"run_id": run_id, **summary}
         except Exception as exc:
-            err = f"{type(exc).__name__}: {exc}"
-            update_intent(ck, run_id, {"status": "PLACING_UNKNOWN", "last_error": err[:500]})
-            update_order_audit(run_id, {"status": "PLACING_UNKNOWN", "last_error": err[:500]})
-            return {"run_id": run_id, "status": "PLACING_UNKNOWN", "error": err}
+            return _persist_error(ck, run_id, "PLACING_UNKNOWN", exc)
 
     if status != "PENDING_DISPATCH":
         return {"run_id": run_id, "status": status}
 
-    now = datetime.now(UTC)
     expiry = datetime.fromisoformat(str(intent["expires_at"]).replace("Z", "+00:00"))
-    if now >= expiry:
-        update_intent(ck, run_id, {"status": "EXPIRED_UNSENT"})
-        return {"run_id": run_id, "status": "EXPIRED_UNSENT"}
+    if datetime.now(UTC) >= expiry:
+        return _stop(ck, run_id, "EXPIRED_UNSENT")
 
     open_orders = fetch_open_orders(trade_client, cfg.symbol)
     if open_orders:
-        update_intent(ck, run_id, {
-            "status": "SUPPRESSED_ACTIVE_ORDER",
-            "terminal_reason": f"{len(open_orders)} active broker order(s)",
-        })
-        return {"run_id": run_id, "status": "SUPPRESSED_ACTIVE_ORDER"}
+        return _stop(ck, run_id, "SUPPRESSED_ACTIVE_ORDER",
+                     {"terminal_reason": f"{len(open_orders)} active broker order(s)"})
 
     fresh = fetch_snapshot(trade_client, data_client, cfg)
     decision_holdings = float(intent.get("decision_holdings", 0.0) or 0.0)
     tolerance = float(os.environ.get("LEGO_HOLDINGS_DRIFT_TOLERANCE", "0.000001"))
     drift = abs(float(fresh["holdings"]) - decision_holdings)
     if drift > tolerance:
-        update_intent(ck, run_id, {
-            "status": "SUPPRESSED_STATE_CHANGED",
-            "holdings_drift": drift,
-            "dispatch_holdings": fresh["holdings"],
-        })
-        return {"run_id": run_id, "status": "SUPPRESSED_STATE_CHANGED",
-                "holdings_drift": drift}
+        return _stop(ck, run_id, "SUPPRESSED_STATE_CHANGED",
+                     {"holdings_drift": drift, "dispatch_holdings": fresh["holdings"]},
+                     holdings_drift=drift)
 
     env = environment_label()
     if env != UAT:
-        update_intent(ck, run_id, {"status": "NOT_PLACED", "terminal_reason": f"environment={env}"})
-        return {"run_id": run_id, "status": "NOT_PLACED"}
+        return _stop(ck, run_id, "NOT_PLACED", {"terminal_reason": f"environment={env}"})
 
     row = _pending_row_shape(intent)
     order = build_order_payload(cfg, intent["side"], float(intent["quantity"]), run_id)
@@ -174,13 +177,9 @@ def _dispatch_or_reconcile_one(trade_client, data_client, cfg, intent: dict) -> 
         evaluate_submit_gate(env, row, preview_ok,
                              order_confirmation_phrase(row), committed=True)
     except Exception as exc:
-        err = f"{type(exc).__name__}: {exc}"
-        update_intent(ck, run_id, {"status": "NOT_PLACED", "last_error": err[:500]})
-        update_order_audit(run_id, {"status": "NOT_PLACED", "last_error": err[:500]})
-        return {"run_id": run_id, "status": "NOT_PLACED", "error": err}
+        return _persist_error(ck, run_id, "NOT_PLACED", exc)
 
-    update_intent(ck, run_id, {"status": "PLACING_UNKNOWN", "place_attempted": True})
-    update_order_audit(run_id, {"status": "PLACING_UNKNOWN", "place_attempted": True})
+    _persist(ck, run_id, {"status": "PLACING_UNKNOWN", "place_attempted": True})
     try:
         place_res = place_market_order(trade_client, order)
         summary = _poll_order_status(trade_client, run_id, place_res)
@@ -188,10 +187,26 @@ def _dispatch_or_reconcile_one(trade_client, data_client, cfg, intent: dict) -> 
         _persist_summary(intent, summary)
         return {"run_id": run_id, **summary}
     except Exception as exc:
-        err = f"{type(exc).__name__}: {exc}"
-        update_intent(ck, run_id, {"status": "PLACING_UNKNOWN", "last_error": err[:500]})
-        update_order_audit(run_id, {"status": "PLACING_UNKNOWN", "last_error": err[:500]})
-        return {"run_id": run_id, "status": "PLACING_UNKNOWN", "error": err}
+        return _persist_error(ck, run_id, "PLACING_UNKNOWN", exc)
+
+
+def _outbox_intent(cfg, row: dict, snapshot: dict, slot, decision_time: datetime) -> dict:
+    margin = int(os.environ.get("LEGO_ORDER_EXPIRY_MARGIN_SECONDS", "15"))
+    expires_at = max(slot.slot_start_utc, slot.slot_end_utc - timedelta(seconds=margin))
+    return {
+        "status": "PENDING_DISPATCH",
+        "row_status": row["สถานะ"], "side": row["_meta"]["side"],
+        "quantity": row["_meta"]["quantity"], "symbol": cfg.symbol,
+        "step": row["DNA step"], "signal": row["DNA signal"],
+        "decision_price": snapshot["price"],
+        "decision_holdings": snapshot["holdings"],
+        "decision_time": _iso(decision_time),
+        "created_at": snapshot["captured_at"],
+        "slot_id": slot.slot_id,
+        "slot_start_utc": _iso(slot.slot_start_utc),
+        "slot_end_utc": _iso(slot.slot_end_utc),
+        "expires_at": _iso(expires_at),
+    }
 
 
 def _run_order_worker(cfg, limit: int = 3) -> dict:
@@ -219,13 +234,16 @@ def lego_one_row(request):
         return {"status": "CONFIG_ERROR", "committed": False,
                 "pipeline_status": "CONFIG_ERROR", "error": str(exc)}, 500
 
-    if not is_us_market_open(decision_time):
+    # One calendar for every path: the same session rules the ordinal uses, so a
+    # holiday or early close also blocks a degraded (clock-less) commit.
+    if not is_regular_session(decision_time):
         return {"status": "PASS_MARKET_CLOSED", "committed": False,
                 "pipeline_status": "MARKET_CLOSED"}, 200
 
     try:
         anchor = read_anchor(cfg)
         legacy_step = dna_step_for(anchor)
+        mode = clock_mode()
         slot = None
         clock_error = None
         try:
@@ -235,50 +253,36 @@ def lego_one_row(request):
                         "pipeline_status": "MARKET_CLOSED"}, 200
             effective_step, alignment_error = resolve_dna_step(legacy_step, slot)
         except MarketClockError as exc:
-            if os.environ.get("LEGO_DNA_CLOCK_MODE", "shadow").lower() == "market":
+            if mode == "market":
                 raise
             effective_step, alignment_error = legacy_step, None
             clock_error = str(exc)
 
         trade_client, data_client = build_clients()
         snapshot = fetch_snapshot(trade_client, data_client, cfg)
-        clock_mode = os.environ.get("LEGO_DNA_CLOCK_MODE", "shadow").lower()
         if slot:
             slot_id = slot.slot_id
         else:
             # Degraded clock still gets a one-commit-per-slot key so a scheduler
             # retry cannot consume the same slot twice.
             slot_id = fallback_slot_id(snapshot["captured_at"])
-            clock_mode = f"{clock_mode}:degraded"
+            mode = f"{mode}:degraded"
         row = compute_row(cfg, snapshot, anchor, dna_step=effective_step)
+
+        # Invariant #10: commit the slot first, then touch the outbox. A rejected
+        # commit must not leave an intent behind, and the committed run_id is the
+        # only client_order_id the worker may use.
+        result = commit_final_row(
+            cfg, snapshot, anchor, row, slot_id=slot_id, clock_mode=mode,
+            market_ordinal=None if slot is None else slot.market_ordinal)
 
         env = environment_label()
         auto = os.environ.get("AUTO_SUBMIT", "false").lower() == "true"
         should_submit = auto and env == UAT and row["สถานะ"] in (READY_BUY, READY_SELL)
+        if should_submit and slot and (result["committed"] or result.get("idempotent")):
+            put_intent(chain_key(cfg), result["run_id"],
+                       _outbox_intent(cfg, row, snapshot, slot, decision_time))
 
-        # Current commit implementation derives the same deterministic run_id used below.
-        prospective_run_id = make_run_id(chain_key(cfg), None if anchor is None else anchor.version, snapshot)
-        if should_submit and slot:
-            margin = int(os.environ.get("LEGO_ORDER_EXPIRY_MARGIN_SECONDS", "15"))
-            expires_at = max(slot.slot_start_utc, slot.slot_end_utc - timedelta(seconds=margin))
-            put_intent(chain_key(cfg), prospective_run_id, {
-                "status": "PENDING_DISPATCH",
-                "row_status": row["สถานะ"], "side": row["_meta"]["side"],
-                "quantity": row["_meta"]["quantity"], "symbol": cfg.symbol,
-                "step": row["DNA step"], "signal": row["DNA signal"],
-                "decision_price": snapshot["price"],
-                "decision_holdings": snapshot["holdings"],
-                "decision_time": _iso(decision_time),
-                "created_at": snapshot["captured_at"],
-                "slot_id": slot.slot_id,
-                "slot_start_utc": _iso(slot.slot_start_utc),
-                "slot_end_utc": _iso(slot.slot_end_utc),
-                "expires_at": _iso(expires_at),
-            })
-
-        result = commit_final_row(
-            cfg, snapshot, anchor, row, slot_id=slot_id, clock_mode=clock_mode,
-            market_ordinal=None if slot is None else slot.market_ordinal)
         out = {
             "status": row["สถานะ"], "committed": result["committed"],
             "idempotent": result.get("idempotent", False),
@@ -286,7 +290,7 @@ def lego_one_row(request):
             "step": row["DNA step"], "signal": row["DNA signal"],
             "model_acted": row["_meta"]["acted"],
             "pipeline_status": "ROW_COMMITTED",
-            "clock_mode": clock_mode,
+            "clock_mode": mode,
             "legacy_step": legacy_step,
             "market_step": None if slot is None else slot.market_ordinal,
             "alignment_error": alignment_error,
@@ -313,6 +317,9 @@ def lego_one_row(request):
     except CalendarDriftError as exc:
         return {"status": "CALENDAR_DRIFT", "committed": False,
                 "pipeline_status": "CALENDAR_DRIFT", "note": str(exc)}, 409
+    except OrdinalRegression as exc:
+        return {"status": "ORDINAL_REGRESSION", "committed": False,
+                "pipeline_status": "ORDINAL_REGRESSION", "note": str(exc)}, 409
     except Exception as exc:
         try:
             db.reference("webull_lego_errors").push({

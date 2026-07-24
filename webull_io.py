@@ -6,10 +6,13 @@ import time
 from datetime import datetime, timezone
 
 from lego_one_row import Config
+from lego_orders import PROD, UAT
 
 UAT_ENDPOINT = "th-api.uat.webullbroker.com"
 PROD_ENDPOINT = "api.webull.co.th"
 _TRANSIENT_HTTP = {500, 502, 503, 504}
+# Any of these present-and-truthy means the broker rejected the preview.
+_PREVIEW_ERROR_KEYS = ("error", "error_code", "errorCode")
 
 
 def is_transient_exception(exc: Exception) -> bool:
@@ -44,27 +47,11 @@ def load_config() -> Config:
 
 
 def environment_label() -> str:
-    return "Test (UAT)" if os.environ.get("WEBULL_ENV", "UAT").upper() == "UAT" else "Production"
+    return UAT if os.environ.get("WEBULL_ENV", "UAT").upper() == "UAT" else PROD
 
 
 def _endpoint() -> str:
-    return UAT_ENDPOINT if environment_label() == "Test (UAT)" else PROD_ENDPOINT
-
-
-def is_us_market_open(now: datetime | None = None) -> bool:
-    now = now or datetime.now(timezone.utc)
-    try:
-        from zoneinfo import ZoneInfo
-        ny = now.astimezone(ZoneInfo("America/New_York"))
-    except Exception:
-        if now.weekday() >= 5:
-            return False
-        minutes = now.hour * 60 + now.minute
-        return 13 * 60 + 30 <= minutes < 21 * 60
-    if ny.weekday() >= 5:
-        return False
-    minutes = ny.hour * 60 + ny.minute
-    return 9 * 60 + 30 <= minutes < 16 * 60
+    return UAT_ENDPOINT if environment_label() == UAT else PROD_ENDPOINT
 
 
 def build_clients():
@@ -116,7 +103,13 @@ def build_order_payload(cfg: Config, side: str, qty: float, client_order_id: str
 def preview_market_order(trade_client, order: list[dict]) -> bool:
     account_id = os.environ["WEBULL_ACCOUNT_ID"]
     pr = _retry_transient(lambda: trade_client.order_v3.preview_order(account_id, order).json())
-    return bool(pr) and "error" not in pr
+    if not pr:
+        return False
+    if isinstance(pr, list):
+        pr = pr[0] if pr else {}
+    if not isinstance(pr, dict):
+        return False
+    return not any(pr.get(key) for key in _PREVIEW_ERROR_KEYS)
 
 
 def place_market_order(trade_client, order: list[dict]) -> dict:

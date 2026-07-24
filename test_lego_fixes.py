@@ -231,11 +231,21 @@ def test_dna_bypass_forms():
 
 
 def test_dna_bad_specs_fail_closed():
-    for bad in ("seed:425:60", "", "abc", "[2, 4]", "bypass:0"):
+    for bad in ("seed:425:60", "", "abc", "[2, 4]", "bypass:0", None, 42):
         with pytest.raises(DNAError):
             decode_dna(bad)
     with pytest.raises(DNAError):
         decode_dna("26033003425")      # rate 300 = 300% -> DNAError
+    with pytest.raises(DNAError):      # a rejected code must never be cached
+        decode_dna("abc")
+
+
+def test_decode_is_cached_but_callers_get_independent_lists():
+    first = decode_dna("bypass:4")
+    second = decode_dna("bypass:4")
+    assert first == second and first is not second
+    first[1] = 0                        # mutating one caller must not leak
+    assert decode_dna("bypass:4") == [1, 1, 1, 1]
 
 
 # ---- order payload: quantity ตาม decimal_precision -------------------------

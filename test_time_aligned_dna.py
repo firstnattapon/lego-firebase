@@ -7,11 +7,12 @@ import pytest
 from conftest import FAKE_DB
 from lego_one_row import Config, compute_row
 from lego_outbox import list_actionable, put_intent, row_is_committed, update_intent
-from lego_state import (STATE_PATH, CalendarDriftError, SlotAlreadyConsumed, chain_key,
-                        commit_final_row, read_anchor)
+from lego_state import (STATE_PATH, CalendarDriftError, OrdinalRegression,
+                        SlotAlreadyConsumed, chain_key, commit_final_row, read_anchor)
 from market_clock import (MarketClockError, _session_slots, calendar_fingerprint,
-                          fallback_slot_id, market_ordinal_for_slot_id,
-                          resolve_dna_step, resolve_market_slot, slot_seconds)
+                          clock_mode, fallback_slot_id, is_regular_session,
+                          market_ordinal_for_slot_id, resolve_dna_step,
+                          resolve_market_slot, slot_seconds)
 
 UTC = timezone.utc
 NORMAL_SESSION = date(2026, 7, 23)        # Thursday, 09:30-16:00 ET
@@ -155,6 +156,63 @@ def test_degraded_clock_still_guards_duplicate_slots():
     with pytest.raises(SlotAlreadyConsumed):
         commit_final_row(CFG, snap_retry, anchor, row_retry,
                          slot_id=slot_id, clock_mode="shadow:degraded")
+
+
+def test_ordinal_must_move_forward():
+    """A later commit may skip ahead but may never replay an older gate."""
+    snap0 = {"captured_at": "2026-07-23T18:00:05Z", "price": 320.0, "holdings": 9.0}
+    _commit(snap0, None, 2, "2026-07-23:11", 2)
+    anchor = read_anchor(CFG)
+    snap1 = {"captured_at": "2026-07-23T18:30:05Z", "price": 321.0, "holdings": 9.0}
+    with pytest.raises(OrdinalRegression):
+        _commit(snap1, anchor, 1, "2026-07-23:10", 1)     # backwards
+    with pytest.raises(OrdinalRegression):
+        _commit(snap1, anchor, 2, "2026-07-23:12", 2)     # sideways
+    state = FAKE_DB.reference(f"{STATE_PATH}/{chain_key(CFG)}").get()
+    assert (state["version"], state["market_ordinal"]) == (1, 2)
+    assert FAKE_DB.reference("webull_lego_rows").get().keys().__len__() == 1
+
+
+def test_ordinal_guard_allows_forward_jumps():
+    snap0 = {"captured_at": "2026-07-23T18:00:05Z", "price": 320.0, "holdings": 9.0}
+    _commit(snap0, None, 0, "2026-07-23:9", 0)
+    anchor = read_anchor(CFG)
+    snap1 = {"captured_at": "2026-07-23T19:30:05Z", "price": 321.0, "holdings": 9.0}
+    assert _commit(snap1, anchor, 3, "2026-07-23:12", 3)["committed"] is True
+
+
+def test_degraded_commit_carries_no_ordinal_so_the_guard_stays_out_of_the_way():
+    snap0 = {"captured_at": "2026-07-23T18:00:05Z", "price": 320.0, "holdings": 9.0}
+    _commit(snap0, None, 5, "2026-07-23:14", 5)
+    anchor = read_anchor(CFG)
+    snap1 = {"captured_at": "2026-07-23T18:30:05Z", "price": 321.0, "holdings": 9.0}
+    row = compute_row(CFG, snap1, anchor, dna_step=6)
+    result = commit_final_row(CFG, snap1, anchor, row,
+                              slot_id=fallback_slot_id(snap1["captured_at"]),
+                              clock_mode="shadow:degraded")
+    assert result["committed"] is True
+
+
+# --- one calendar for every path ---------------------------------------------
+
+def test_regular_session_predicate_knows_holidays_and_early_closes(monkeypatch):
+    assert is_regular_session(datetime(2026, 7, 23, 18, 0, tzinfo=UTC)) is True
+    assert is_regular_session(datetime(2026, 7, 23, 12, 0, tzinfo=UTC)) is False   # pre-open
+    assert is_regular_session(datetime(2026, 7, 25, 18, 0, tzinfo=UTC)) is False   # Saturday
+    # 13:00 ET close on the day after Thanksgiving: 18:30 UTC is already shut.
+    assert is_regular_session(datetime(2026, 11, 27, 18, 30, tzinfo=UTC)) is False
+    monkeypatch.setenv("LEGO_MARKET_HOLIDAYS", "2026-07-23")
+    assert is_regular_session(datetime(2026, 7, 23, 18, 0, tzinfo=UTC)) is False
+
+
+def test_clock_mode_is_validated_once(monkeypatch):
+    monkeypatch.setenv("LEGO_DNA_CLOCK_MODE", "  MARKET ")
+    assert clock_mode() == "market"
+    monkeypatch.delenv("LEGO_DNA_CLOCK_MODE")
+    assert clock_mode() == "shadow"
+    monkeypatch.setenv("LEGO_DNA_CLOCK_MODE", "turbo")
+    with pytest.raises(MarketClockError):
+        clock_mode()
 
 
 # --- calendar drift ----------------------------------------------------------
