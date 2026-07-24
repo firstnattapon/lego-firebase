@@ -1,16 +1,10 @@
-"""main.py — Google Cloud Function entrypoint (Gen2, Python)
+"""Google Cloud Function entrypoint for one LEGO row plus durable order outbox.
 
-Cloud Scheduler --(HTTP/OIDC)--> ฟังก์ชันนี้ = "one new row" หนึ่งรอบ (Step 0–18)
-order path ลำดับบังคับ (invariant #9): preview -> evaluate_submit_gate -> place
-gate ไม่ผ่าน = ไม่มี order หลุดออกไปเด็ดขาด (fail closed)
-
-หมายเหตุ AUTO_SUBMIT: ระบบ derive confirmation phrase เอง -> ชั้นป้องกัน phrase
-เป็น formality; ที่เหลือของ gate (UAT-only + READY_* + committed + preview) ยังคุมจริง
-
-ENV (map จาก Secret Manager):
-  FIREBASE_DB_URL, WEBULL_APP_KEY, WEBULL_APP_SECRET, WEBULL_ACCOUNT_ID,
-  WEBULL_ENV(UAT|PROD), LEGO_SYMBOL, LEGO_FIX_C, LEGO_DIFF, LEGO_DNA_CODE,
-  LEGO_STRATEGY_ID, LEGO_DECIMAL_PRECISION, LEGO_SLOT_SECONDS, AUTO_SUBMIT(false)
+Pipeline status is explicit:
+- ROW_COMMITTED: row persisted, no broker action required.
+- ROW_COMMITTED_ORDER_FILLED/TERMINAL: broker path reached a terminal state.
+- ORDER_PENDING: broker accepted/non-terminal; durable state will reconcile later.
+- ORDER_RETRY_REQUIRED: uncertain/transient failure; HTTP 503, intent remains durable.
 """
 from __future__ import annotations
 
@@ -23,22 +17,32 @@ import functions_framework
 from firebase_admin import credentials, db
 
 from lego_one_row import READY_BUY, READY_SELL, compute_row
-from lego_state import (SlotAlreadyConsumed, StaleAnchorError, chain_key,
-                        commit_final_row, pending_audits, read_anchor,
-                        update_order_audit, write_order_audit)
-from lego_orders import (TERMINAL_STATUSES, UAT, evaluate_submit_gate,
+from lego_orders import (REALIZED_STATUSES, TERMINAL_STATUSES, UAT,
+                         evaluate_submit_gate, normalize_status,
                          order_confirmation_phrase, summarize_order_result)
+from lego_state import (PendingOrderExists, SlotAlreadyConsumed, StaleAnchorError,
+                        apply_realized_fill, chain_key, clear_pending_order,
+                        commit_final_row, get_pending_order, read_anchor,
+                        update_order_audit, update_pending_order,
+                        write_order_audit)
 from webull_io import (build_clients, build_order_payload, environment_label,
                        fetch_open_orders, fetch_order_detail, fetch_snapshot,
-                       is_us_market_open, load_config, place_market_order,
-                       preview_market_order)
+                       is_transient_exception, is_us_market_open, load_config,
+                       place_market_order, preview_market_order)
 
 ORDER_POLL_ATTEMPTS = 3
 ORDER_POLL_DELAY_S = 2.0
 
 
+def _init_firebase():
+    if not firebase_admin._apps:
+        firebase_admin.initialize_app(
+            credentials.ApplicationDefault(),
+            {"databaseURL": os.environ["FIREBASE_DB_URL"]},
+        )
+
+
 def _poll_order_status(trade_client, client_order_id: str, place_res: dict) -> dict:
-    """poll get_order_detail จน status terminal หรือครบโควตา — สถานะจริง ไม่เดา"""
     detail = None
     for i in range(ORDER_POLL_ATTEMPTS):
         if i:
@@ -50,145 +54,227 @@ def _poll_order_status(trade_client, client_order_id: str, place_res: dict) -> d
     return summarize_order_result(place_res, detail)
 
 
-def _reconcile_pending_orders(trade_client) -> None:
-    """audit ค้าง (PLACING/UNKNOWN/SUBMITTED/PARTIAL_FILLED) -> เช็คสถานะจริงแล้ว update
-    best-effort: ห้ามทำให้รอบล้ม; NOT_PLACED = จบแบบ local (gate ปัดตกก่อน place)"""
-    for event_id, payload in pending_audits(TERMINAL_STATUSES | {"NOT_PLACED"}).items():
-        try:
-            detail = fetch_order_detail(trade_client, event_id)
-            summary = summarize_order_result({}, detail)
-            if summary["status"] != "UNKNOWN":
-                update_order_audit(event_id, summary)
-        except Exception:
-            continue
+def _pending_row_shape(pending: dict) -> dict:
+    return {
+        "สถานะ": pending["row_status"],
+        "สินทรัพย์": pending["symbol"],
+        "_meta": {
+            "side": pending["side"],
+            "quantity": float(pending["quantity"]),
+            "step": int(pending["step"]),
+        },
+    }
 
 
-def _init_firebase():
-    if not firebase_admin._apps:
-        firebase_admin.initialize_app(
-            credentials.ApplicationDefault(),
-            {"databaseURL": os.environ["FIREBASE_DB_URL"]},
-        )
+def _apply_realized_if_available(cfg, pending: dict, summary: dict) -> dict:
+    status = normalize_status(summary.get("status"))
+    if status not in REALIZED_STATUSES:
+        return summary
+    qty = summary.get("filled_quantity")
+    price = summary.get("filled_price")
+    if qty is None or price is None:
+        summary = dict(summary)
+        summary["realized_warning"] = (
+            "broker ยืนยัน fill แต่ยังไม่มี filled_quantity/filled_price — ยังไม่นับ realized")
+        return summary
+    realized = apply_realized_fill(
+        pending["chain_key"], pending["run_id"], pending["side"],
+        cumulative_qty=float(qty), price=float(price),
+        cumulative_fee=float(summary.get("filled_fee", 0.0) or 0.0),
+    )
+    summary = dict(summary)
+    summary.update(realized)
+    return summary
+
+
+def _persist_order_summary(cfg, pending: dict, summary: dict) -> None:
+    run_id = pending["run_id"]
+    update_order_audit(run_id, summary)
+    status = normalize_status(summary.get("status"))
+    update_pending_order(cfg, run_id, {**summary, "status": status})
+    if status in TERMINAL_STATUSES:
+        clear_pending_order(cfg, run_id)
+
+
+def _reconcile_existing_pending(trade_client, cfg, pending: dict) -> tuple[dict, int]:
+    run_id = pending["run_id"]
+    try:
+        detail = fetch_order_detail(trade_client, run_id)
+        summary = summarize_order_result({}, detail)
+        if summary["status"] == "UNKNOWN":
+            raise RuntimeError("broker order detail ยัง UNKNOWN")
+        summary = _apply_realized_if_available(cfg, pending, summary)
+        _persist_order_summary(cfg, pending, summary)
+        status = normalize_status(summary["status"])
+        if status in TERMINAL_STATUSES:
+            return {"pipeline_status": "ORDER_RECONCILED_TERMINAL", "order": summary}, 200
+        return {"pipeline_status": "ORDER_PENDING", "order": summary}, 202
+    except Exception as exc:
+        err = f"{type(exc).__name__}: {exc}"
+        update_pending_order(cfg, run_id, {"status": pending.get("status", "PLACING"),
+                                           "last_error": err[:500]})
+        update_order_audit(run_id, {"last_error": err[:500]})
+        return {"pipeline_status": "ORDER_RETRY_REQUIRED", "run_id": run_id,
+                "error": err}, 503
+
+
+def _dispatch_pending(trade_client, cfg, pending: dict) -> tuple[dict, int]:
+    run_id = pending["run_id"]
+    env = environment_label()
+    if env != UAT:
+        err = f"environment={env}; pending order ส่งได้เฉพาะ UAT"
+        update_pending_order(cfg, run_id, {"status": "PENDING", "last_error": err})
+        return {"pipeline_status": "ORDER_RETRY_REQUIRED", "run_id": run_id,
+                "error": err}, 503
+
+    try:
+        open_orders = fetch_open_orders(trade_client, cfg.symbol)
+        if open_orders:
+            update_pending_order(cfg, run_id, {
+                "status": "PENDING",
+                "last_error": f"open order ค้าง {len(open_orders)} ตัว",
+            })
+            return {"pipeline_status": "ORDER_BLOCKED_OPEN_ORDER", "run_id": run_id,
+                    "open_orders": len(open_orders)}, 202
+
+        row = _pending_row_shape(pending)
+        order = build_order_payload(cfg, pending["side"], float(pending["quantity"]), run_id)
+        write_order_audit(run_id, {
+            "run_id": run_id,
+            "chain_key": pending["chain_key"],
+            "side": pending["side"],
+            "quantity": float(pending["quantity"]),
+            "symbol": pending["symbol"],
+            "environment": env,
+            "status": "PENDING",
+            "realized": False,
+            "placed_at": pending["created_at"],
+        })
+
+        preview_ok = preview_market_order(trade_client, order)
+        evaluate_submit_gate(env, row, preview_ok,
+                             order_confirmation_phrase(row), committed=True)
+    except Exception as exc:
+        err = f"{type(exc).__name__}: {exc}"
+        update_pending_order(cfg, run_id, {"status": "PENDING", "last_error": err[:500]})
+        update_order_audit(run_id, {"status": "PENDING", "last_error": err[:500]})
+        return {"pipeline_status": "ORDER_RETRY_REQUIRED", "run_id": run_id,
+                "phase": "PRE_PLACE", "error": err}, 503
+
+    update_pending_order(cfg, run_id, {"status": "PLACING", "place_attempted": True})
+    update_order_audit(run_id, {"status": "PLACING", "place_attempted": True})
+    try:
+        place_res = place_market_order(trade_client, order)
+        summary = _poll_order_status(trade_client, run_id, place_res)
+        summary = _apply_realized_if_available(cfg, pending, summary)
+        _persist_order_summary(cfg, pending, summary)
+        status = normalize_status(summary["status"])
+        if status in TERMINAL_STATUSES:
+            return {"pipeline_status": "ROW_COMMITTED_ORDER_TERMINAL",
+                    "run_id": run_id, "order": summary}, 200
+        return {"pipeline_status": "ORDER_PENDING", "run_id": run_id,
+                "order": summary}, 202
+    except Exception as exc:
+        err = f"{type(exc).__name__}: {exc}"
+        update_pending_order(cfg, run_id, {"status": "PLACING", "last_error": err[:500]})
+        update_order_audit(run_id, {"status": "PLACING", "last_error": err[:500]})
+        return {"pipeline_status": "ORDER_RETRY_REQUIRED", "run_id": run_id,
+                "phase": "PLACE_OR_POLL", "error": err}, 503
+
+
+def _process_pending_order(trade_client, cfg, pending: dict) -> tuple[dict, int]:
+    status = normalize_status(pending.get("status"))
+    if status in {"PLACING", "SUBMITTED", "PENDING_SUBMIT", "UNKNOWN",
+                  "PARTIAL_FILLED", "PARTIALLY_FILLED"}:
+        return _reconcile_existing_pending(trade_client, cfg, pending)
+    return _dispatch_pending(trade_client, cfg, pending)
+
+
+def _build_order_intent(cfg, row: dict, captured_at: str) -> dict:
+    m = row["_meta"]
+    return {
+        "status": "PENDING",
+        "row_status": row["สถานะ"],
+        "side": m["side"],
+        "quantity": m["quantity"],
+        "symbol": cfg.symbol,
+        "step": m["step"],
+        "created_at": captured_at,
+    }
 
 
 @functions_framework.http
 def lego_one_row(request):
-    """entrypoint (HTTP). คืน JSON สรุปผลหนึ่งรอบ"""
     _init_firebase()
     cfg = load_config()
-
     if not is_us_market_open():
-        return {"status": "PASS_MARKET_CLOSED", "committed": False}, 200
+        return {"status": "PASS_MARKET_CLOSED", "committed": False,
+                "pipeline_status": "MARKET_CLOSED"}, 200
 
     try:
-        # Step 0: อ่าน anchor ล่าสุด (1 แถวเท่านั้น — invariant #1)
-        anchor = read_anchor(cfg)
-
         trade_client, data_client = build_clients()
 
-        # reconcile order ค้างจากรอบก่อน "ก่อน" สร้างแถว — audit ได้สถานะจริง
-        # (observability เท่านั้น: ledger ΔAₙ/Aₙ เป็นทฤษฎีแบบ gated ไม่ใช้ fill)
-        try:
-            _reconcile_pending_orders(trade_client)
-        except Exception:
-            pass
+        pending = get_pending_order(cfg)
+        if pending:
+            pending_out, pending_code = _process_pending_order(trade_client, cfg, pending)
+            if pending_code != 200:
+                return pending_out, pending_code
 
-        # Step 1–17: snapshot -> engine (validate 17 คอลัมน์ในตัว)
+        anchor = read_anchor(cfg)
         snapshot = fetch_snapshot(trade_client, data_client, cfg)
         row = compute_row(cfg, snapshot, anchor)
 
-        # Step 18: commit (idempotent + stale-anchor + monotonic + slot guard)
-        result = commit_final_row(cfg, snapshot, anchor, row)
-
-        out = {
-            "status": row["สถานะ"], "committed": result["committed"],
-            "idempotent": result.get("idempotent", False),
-            "run_id": result["run_id"], "version": result.get("version"),
-            "step": row["DNA step"], "signal": row["DNA signal"],
-        }
-
-        # ---- order path: env-gate -> preview -> gate -> place (ลำดับนี้เท่านั้น) ----
         env = environment_label()
         auto = os.environ.get("AUTO_SUBMIT", "false").lower() == "true"
-        if (auto and result["committed"]
-                and row["สถานะ"] in (READY_BUY, READY_SELL)):
-            # invariant #9: Preview/Submit = UAT เท่านั้น — Production ห้ามแม้แต่ preview
-            if env != UAT:
-                out["order_skipped"] = f"environment={env} — read-only, ไม่ preview/place"
-                return out, 200
-            # order ล้ม/gate ไม่ผ่าน ห้ามทำให้ทั้งรอบเป็น 500 — แถว commit ไปแล้ว
-            # (500 -> Scheduler retry -> สร้างแถวใหม่ = กิน DNA slot เกิน 1 ต่อรอบ)
-            # client_order_id = run_id: deterministic 1 order/แถว — broker ปัดซ้ำเองถ้า retry
-            client_order_id = result["run_id"]
-            audit_written = False
-            place_attempted = False
-            try:
-                # guard กัน order ซ้อน: ตัวเก่ายังค้างอยู่ -> ไม่ยิงเพิ่มรอบนี้
-                open_orders = fetch_open_orders(trade_client, cfg.symbol)
-                if open_orders:
-                    out["order_skipped"] = (
-                        f"open order ค้าง {len(open_orders)} ตัว — ข้ามการส่งรอบนี้ (กันซ้อน)")
-                    return out, 200
+        should_submit = auto and env == UAT and row["สถานะ"] in (READY_BUY, READY_SELL)
+        intent = _build_order_intent(cfg, row, snapshot["captured_at"]) if should_submit else None
 
-                m = row["_meta"]
-                order = build_order_payload(cfg, m["side"], m["quantity"], client_order_id)
+        result = commit_final_row(cfg, snapshot, anchor, row, order_intent=intent)
+        out = {
+            "status": row["สถานะ"],
+            "committed": result["committed"],
+            "idempotent": result.get("idempotent", False),
+            "run_id": result["run_id"],
+            "version": result.get("version"),
+            "step": row["DNA step"],
+            "signal": row["DNA signal"],
+            "model_acted": row["_meta"]["acted"],
+            "pipeline_status": "ROW_COMMITTED",
+        }
 
-                # write-ahead audit ก่อน place — crash หลัง place แล้ว order ต้องไม่ล่องหน
-                # chain_key/placed_at: ผูก fill เข้า realized ledger ของ chain นี้เท่านั้น
-                write_order_audit(client_order_id, {
-                    "run_id": result["run_id"], "side": m["side"],
-                    "quantity": m["quantity"], "symbol": cfg.symbol,
-                    "environment": env, "status": "PLACING", "realized": False,
-                    "chain_key": chain_key(cfg),
-                    "placed_at": snapshot["captured_at"],
-                })
-                audit_written = True
+        if auto and env != UAT and row["สถานะ"] in (READY_BUY, READY_SELL):
+            out["pipeline_status"] = "ROW_COMMITTED_ORDER_DISABLED_PRODUCTION"
+            out["order_skipped"] = f"environment={env} — read-only"
+            return out, 200
 
-                preview_ok = preview_market_order(trade_client, order)   # 1) preview
-                evaluate_submit_gate(env, row, preview_ok,               # 2) gate (raise = จบ)
-                                     order_confirmation_phrase(row), committed=True)
-                place_attempted = True
-                res = place_market_order(trade_client, order)            # 3) place
-
-                # 4) ตามสถานะจริง — place v3 response ไม่มี status
-                summary = _poll_order_status(trade_client, client_order_id, res)
-                update_order_audit(client_order_id, summary)
-                out["order"] = {"client_order_id": client_order_id, **summary}
-            except Exception as order_exc:
-                err = f"{type(order_exc).__name__}: {order_exc}"
-                try:
-                    if audit_written and not place_attempted:
-                        # ยังไม่ได้ยิง place แน่นอน -> ปิด audit แบบ local
-                        update_order_audit(client_order_id, {
-                            "status": "NOT_PLACED", "realized": False, "error": err[:500]})
-                    elif audit_written:
-                        # ยิงไปแล้ว/ก้ำกึ่ง -> คง PLACING ให้ reconcile รอบถัดไปตามผลจริง
-                        update_order_audit(client_order_id, {"error": err[:500]})
-                except Exception:
-                    pass
-                try:
-                    db.reference("webull_lego_errors").push({
-                        "error": str(order_exc), "type": type(order_exc).__name__,
-                        "phase": "order_path", "run_id": result["run_id"],
-                    })
-                except Exception:
-                    pass
-                out["order_error"] = err
+        if intent and result["committed"]:
+            pending = get_pending_order(cfg)
+            if not pending:
+                return {**out, "pipeline_status": "ORDER_OUTBOX_MISSING"}, 500
+            order_out, order_code = _dispatch_pending(trade_client, cfg, pending)
+            return {**out, **order_out}, order_code
 
         return out, 200
 
     except SlotAlreadyConsumed as exc:
-        # scheduler retry ใน slot เดิม — ไม่ใช่ error จริง
-        return {"status": "PASS_SLOT_CONSUMED", "committed": False, "note": str(exc)}, 200
+        return {"status": "PASS_SLOT_CONSUMED", "committed": False,
+                "pipeline_status": "SLOT_CONSUMED", "note": str(exc)}, 200
+    except PendingOrderExists as exc:
+        return {"status": "PENDING_ORDER_EXISTS", "committed": False,
+                "pipeline_status": "ORDER_PENDING", "note": str(exc)}, 202
     except StaleAnchorError as exc:
         return {"status": "STALE_ANCHOR", "committed": False,
-                "note": f"{exc} — restart Step 0 รอบถัดไป"}, 409
-    except Exception as exc:  # best-effort log ทุก path (trade อย่าล้มเพราะ log ล้ม)
+                "pipeline_status": "STALE_ANCHOR", "note": str(exc)}, 409
+    except Exception as exc:
         try:
             db.reference("webull_lego_errors").push({
-                "error": str(exc), "type": type(exc).__name__,
+                "error": str(exc),
+                "type": type(exc).__name__,
                 "trace": traceback.format_exc()[:2000],
             })
         except Exception:
             pass
-        return {"status": "ERROR", "error": str(exc), "type": type(exc).__name__}, 500
+        code = 503 if is_transient_exception(exc) else 500
+        return {"status": "ERROR", "committed": False,
+                "pipeline_status": "SNAPSHOT_OR_ENGINE_ERROR",
+                "error": str(exc), "type": type(exc).__name__}, code
