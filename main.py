@@ -20,10 +20,11 @@ from lego_orders import (REALIZED_STATUSES, TERMINAL_STATUSES, UAT,
                          order_confirmation_phrase, summarize_order_result)
 from lego_outbox import (expire_unsent_before, list_actionable, put_intent,
                          row_is_committed, update_intent)
-from lego_state import (SlotAlreadyConsumed, StaleAnchorError, apply_realized_fill,
-                        chain_key, commit_final_row, make_run_id, read_anchor,
-                        update_order_audit, write_order_audit)
-from market_clock import MarketClockError, resolve_dna_step, resolve_market_slot
+from lego_state import (CalendarDriftError, SlotAlreadyConsumed, StaleAnchorError,
+                        apply_realized_fill, chain_key, commit_final_row, make_run_id,
+                        read_anchor, update_order_audit, write_order_audit)
+from market_clock import (MarketClockError, fallback_slot_id, resolve_dna_step,
+                          resolve_market_slot, slot_seconds)
 from webull_io import (build_clients, build_order_payload, environment_label,
                        fetch_open_orders, fetch_order_detail, fetch_snapshot,
                        is_transient_exception, is_us_market_open, load_config,
@@ -210,6 +211,14 @@ def lego_one_row(request):
     cfg = load_config()
     decision_time = datetime.now(UTC)
 
+    try:
+        # Mandatory: the slot grid must match the timeframe the DNA was trained
+        # on, so a missing/unsupported value is a deploy error, not a runtime one.
+        slot_seconds()
+    except MarketClockError as exc:
+        return {"status": "CONFIG_ERROR", "committed": False,
+                "pipeline_status": "CONFIG_ERROR", "error": str(exc)}, 500
+
     if not is_us_market_open(decision_time):
         return {"status": "PASS_MARKET_CLOSED", "committed": False,
                 "pipeline_status": "MARKET_CLOSED"}, 200
@@ -233,8 +242,14 @@ def lego_one_row(request):
 
         trade_client, data_client = build_clients()
         snapshot = fetch_snapshot(trade_client, data_client, cfg)
+        clock_mode = os.environ.get("LEGO_DNA_CLOCK_MODE", "shadow").lower()
         if slot:
-            snapshot["market_slot_id"] = slot.slot_id
+            slot_id = slot.slot_id
+        else:
+            # Degraded clock still gets a one-commit-per-slot key so a scheduler
+            # retry cannot consume the same slot twice.
+            slot_id = fallback_slot_id(snapshot["captured_at"])
+            clock_mode = f"{clock_mode}:degraded"
         row = compute_row(cfg, snapshot, anchor, dna_step=effective_step)
 
         env = environment_label()
@@ -261,7 +276,9 @@ def lego_one_row(request):
                 "expires_at": _iso(expires_at),
             })
 
-        result = commit_final_row(cfg, snapshot, anchor, row)
+        result = commit_final_row(
+            cfg, snapshot, anchor, row, slot_id=slot_id, clock_mode=clock_mode,
+            market_ordinal=None if slot is None else slot.market_ordinal)
         out = {
             "status": row["สถานะ"], "committed": result["committed"],
             "idempotent": result.get("idempotent", False),
@@ -269,7 +286,7 @@ def lego_one_row(request):
             "step": row["DNA step"], "signal": row["DNA signal"],
             "model_acted": row["_meta"]["acted"],
             "pipeline_status": "ROW_COMMITTED",
-            "clock_mode": os.environ.get("LEGO_DNA_CLOCK_MODE", "shadow").lower(),
+            "clock_mode": clock_mode,
             "legacy_step": legacy_step,
             "market_step": None if slot is None else slot.market_ordinal,
             "alignment_error": alignment_error,
@@ -278,8 +295,9 @@ def lego_one_row(request):
         if clock_error:
             out["clock_warning"] = clock_error
 
-        # Compatibility: optional best-effort inline worker, never changes HTTP success.
-        if os.environ.get("LEGO_INLINE_ORDER_WORKER", "true").lower() == "true":
+        # Off by default: dispatching inline adds broker latency to the DNA
+        # invocation, which raises the odds of a scheduler timeout+retry.
+        if os.environ.get("LEGO_INLINE_ORDER_WORKER", "false").lower() == "true":
             try:
                 out["order_worker"] = _run_order_worker(cfg, limit=1)
             except Exception as exc:
@@ -292,6 +310,9 @@ def lego_one_row(request):
     except StaleAnchorError as exc:
         return {"status": "STALE_ANCHOR", "committed": False,
                 "pipeline_status": "STALE_ANCHOR", "note": str(exc)}, 409
+    except CalendarDriftError as exc:
+        return {"status": "CALENDAR_DRIFT", "committed": False,
+                "pipeline_status": "CALENDAR_DRIFT", "note": str(exc)}, 409
     except Exception as exc:
         try:
             db.reference("webull_lego_errors").push({
