@@ -11,6 +11,7 @@ import pytest
 
 import main
 from conftest import FAKE_DB
+from lego_outbox import OUTBOX_PATH, list_actionable, row_is_committed
 from lego_state import STATE_PATH, chain_key
 
 UTC = timezone.utc
@@ -38,7 +39,6 @@ def env(monkeypatch):
     monkeypatch.delenv("AUTO_SUBMIT", raising=False)
     monkeypatch.delenv("LEGO_INLINE_ORDER_WORKER", raising=False)
     monkeypatch.setattr(main, "build_clients", lambda: (object(), object()))
-    monkeypatch.setattr(main, "is_us_market_open", lambda now=None: True)
 
 
 def _run(monkeypatch, moment: datetime, price: float, holdings: float = 9.0):
@@ -95,6 +95,53 @@ def test_untrained_slot_size_is_a_config_error(monkeypatch):
     monkeypatch.setenv("LEGO_SLOT_SECONDS", "600")
     body, code = _run(monkeypatch, SESSION_OPEN_SLOT, 320.0)
     assert code == 500 and body["pipeline_status"] == "CONFIG_ERROR"
+
+
+def test_market_holiday_is_closed_even_before_the_clock_resolves(monkeypatch):
+    """One calendar: a declared holiday blocks the row, degraded clock or not."""
+    monkeypatch.setenv("LEGO_MARKET_HOLIDAYS", "2026-07-23")
+    monkeypatch.setenv("LEGO_DNA_CLOCK_MODE", "shadow")
+    monkeypatch.delenv("LEGO_DNA_ORIGIN_UTC")          # force the degraded path
+    body, code = _run(monkeypatch, SESSION_OPEN_SLOT, 320.0)
+    assert code == 200 and body["pipeline_status"] == "MARKET_CLOSED"
+    assert FAKE_DB.reference("webull_lego_rows").get() is None
+
+
+def test_ordinal_regression_fails_closed(monkeypatch):
+    _run(monkeypatch, datetime(2026, 7, 23, 19, 30, 5, tzinfo=UTC), 320.0)   # ordinal 3
+    state_ref = FAKE_DB.reference(f"{STATE_PATH}/{chain_key(main.load_config())}")
+    committed = state_ref.get()["version"]
+    body, code = _run(monkeypatch, SESSION_OPEN_SLOT, 321.0)                 # ordinal 0
+    assert code == 409 and body["pipeline_status"] == "ORDINAL_REGRESSION"
+    assert body["committed"] is False
+    assert state_ref.get()["version"] == committed                           # pointer intact
+
+
+# --- outbox is written only after the slot is safely committed ---------------
+
+@pytest.fixture
+def auto_submit(monkeypatch):
+    monkeypatch.setenv("AUTO_SUBMIT", "true")
+    monkeypatch.setenv("WEBULL_ENV", "UAT")
+
+
+def test_intent_uses_the_committed_run_id(monkeypatch, auto_submit):
+    body, code = _run(monkeypatch, SESSION_OPEN_SLOT, 320.0)
+    assert code == 200 and body["status"] == "READY_BUY"
+    ck = chain_key(main.load_config())
+    intents = list_actionable(ck)
+    assert [i["run_id"] for i in intents] == [body["run_id"]]
+    assert intents[0]["client_order_id"] == body["run_id"]
+    assert len(body["run_id"]) <= 32                 # Webull client_order_id limit
+    assert row_is_committed(body["run_id"]) is True
+
+
+def test_rejected_commit_leaves_no_intent_behind(monkeypatch, auto_submit):
+    first, _ = _run(monkeypatch, SESSION_OPEN_SLOT, 320.0)
+    body, code = _run(monkeypatch, datetime(2026, 7, 23, 18, 12, 41, tzinfo=UTC), 320.9)
+    assert code == 200 and body["pipeline_status"] == "SLOT_CONSUMED"
+    ck = chain_key(main.load_config())
+    assert list(FAKE_DB.reference(f"{OUTBOX_PATH}/{ck}").get()) == [first["run_id"]]
 
 
 def test_order_worker_failure_never_blocks_the_row(monkeypatch):

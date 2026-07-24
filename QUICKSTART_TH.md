@@ -178,6 +178,84 @@ gcloud functions deploy lego-one-row \
 
 เมื่อระบบนิ่งและมั่นใจแล้ว ค่อยพิจารณาเปิด production / auto submit ทีหลัง
 
+### ตาราง env ทั้งหมดที่โค้ดอ่านจริง
+
+**บังคับ** (ไม่มี = ระบบไม่ทำงาน):
+
+| env | ตัวอย่าง | ความหมาย |
+|---|---|---|
+| `FIREBASE_DB_URL` | `https://...firebasedatabase.app` | RTDB ที่จะเขียนแถว |
+| `LEGO_SYMBOL` | `APLS` | สินทรัพย์ที่เทรด |
+| `LEGO_FIX_C` | `1500` | มูลค่าพอร์ตเป้าหมาย (ต้อง > 0) |
+| `LEGO_SLOT_SECONDS` | `1800` | ขนาด slot ต้องตรง timeframe ที่เทรน DNA — รับเฉพาะ `900` (15m), `1800` (30m), `3600` (1h), `14400` (4h), `86400` (1d) · ค่าอื่น = `CONFIG_ERROR` 500 |
+| `WEBULL_APP_KEY` / `WEBULL_APP_SECRET` / `WEBULL_ACCOUNT_ID` | (secret) | credential ของ Webull OpenAPI |
+
+**ค่าเริ่มต้นมีให้แล้ว** (ตั้งเมื่ออยากเปลี่ยน):
+
+| env | default | ความหมาย |
+|---|---|---|
+| `LEGO_DIFF` | `0` | ครึ่งความกว้างแถบ no-trade · `|gap| ≤ DIFF` → `PASS_THRESHOLD` |
+| `LEGO_DNA_CODE` | `bypass:100` | โค้ด DNA (`bypass:N` / `[1, N]` / stream ตัวเลขล้วน) |
+| `LEGO_DECIMAL_PRECISION` | `5` | ทศนิยมของจำนวนสั่ง (0–5) |
+| `LEGO_STRATEGY_ID` | `shannon_demon_lego` | ป้ายกำกับกลยุทธ์ (อยู่ใน `config_hash`) |
+| `WEBULL_ENV` | `UAT` | `UAT` = ส่ง order ได้ · อย่างอื่น = Production (read-only) |
+| `AUTO_SUBMIT` | `false` | `true` = สร้าง order intent อัตโนมัติเมื่อแถวเป็น `READY_*` |
+| `WEBULL_TOKEN_DIR` | `/tmp/webull_token` | ที่เก็บ token ของ SDK |
+
+**นาฬิกา DNA** (ทุกตัวมีผลต่อ phase ของ gate array — ดูหัวข้อ 7.5):
+
+| env | default | ความหมาย |
+|---|---|---|
+| `LEGO_DNA_CLOCK_MODE` | `shadow` | `shadow` = เดิน step ตาม anchor+1 แล้วรายงานส่วนต่างเฉย ๆ · `market` = ใช้ market ordinal เป็นตัวจริง · `legacy` = ของเดิมไว้ rollback |
+| `LEGO_DNA_ORIGIN_UTC` | — | เวลาเริ่มนับ ordinal · หาได้จาก `find_origin.py` · ไม่ตั้ง = โหมด degraded (mode `market` จะ error) |
+| `LEGO_MARKET_HOLIDAYS` | — | CSV วันที่ ISO เพิ่มเข้าปฏิทินวันหยุด เช่น `2026-01-02` |
+| `LEGO_MARKET_EARLY_CLOSES` | — | CSV วันที่ ISO ที่ปิด 13:00 ET |
+
+**order worker**:
+
+| env | default | ความหมาย |
+|---|---|---|
+| `LEGO_INLINE_ORDER_WORKER` | `false` | `true` = ส่ง order ต่อท้ายการ commit เลย (เพิ่ม latency ให้ฟังก์ชัน DNA — ไม่แนะนำ) |
+| `LEGO_ORDER_WORKER_LIMIT` | `3` | จำนวน intent สูงสุดต่อการเรียก 1 ครั้ง |
+| `LEGO_ORDER_EXPIRY_MARGIN_SECONDS` | `15` | กันส่ง order คาบเกี่ยว slot ถัดไป |
+| `LEGO_HOLDINGS_DRIFT_TOLERANCE` | `0.000001` | holdings เปลี่ยนเกินนี้ระหว่างรอส่ง = `SUPPRESSED_STATE_CHANGED` |
+
+---
+
+## 6.1) 📮 Deploy function ตัวที่สอง — `lego-order-worker`
+
+> ⚠️ **ข้ามข้อนี้ไม่ได้ถ้าจะเปิด `AUTO_SUBMIT=true`**
+> `lego_one_row` แค่ **จด order intent** ลง outbox แล้วจบ (ตั้งใจ: ถ้าไปรอ broker
+> ฟังก์ชันจะช้าจน scheduler timeout แล้ว retry จนกิน DNA step) ตัวที่ส่ง order จริงคือ
+> `lego_order_worker` — **ไม่ deploy = intent ทุกใบหมดอายุเป็น `EXPIRED_UNSENT` ไม่มี order
+> ออกสักใบ**
+
+ใช้ env และ secret ชุดเดียวกับ `lego-one-row` เป๊ะ ๆ (คนละ entry point เท่านั้น):
+
+```bash
+gcloud functions deploy lego-order-worker \
+  --gen2 \
+  --runtime=python312 \
+  --region="$REGION" \
+  --source=. \
+  --entry-point=lego_order_worker \
+  --trigger-http \
+  --no-allow-unauthenticated \
+  --memory=512Mi \
+  --timeout=300s \
+  --set-env-vars="FIREBASE_DB_URL=$DB_URL,WEBULL_ENV=UAT,LEGO_SYMBOL=APLS,LEGO_FIX_C=1500,LEGO_DIFF=60,LEGO_DNA_CODE=bypass:100,LEGO_DECIMAL_PRECISION=5,LEGO_SLOT_SECONDS=1800,AUTO_SUBMIT=false" \
+  --set-secrets="WEBULL_APP_KEY=webull-app-key:latest,WEBULL_APP_SECRET=webull-app-secret:latest,WEBULL_ACCOUNT_ID=webull-account-id:latest"
+```
+
+📌 **สำคัญ:** `LEGO_SYMBOL`, `LEGO_FIX_C`, `LEGO_DIFF`, `LEGO_DNA_CODE`,
+`LEGO_DECIMAL_PRECISION`, `LEGO_STRATEGY_ID` ต้องเท่ากันทั้งสองฟังก์ชัน เพราะค่าพวกนี้
+ประกอบเป็น `chain_key` — ถ้าไม่ตรง worker จะมองไม่เห็น outbox ของ chain ที่ engine เขียน
+
+worker จะทำตามลำดับนี้ทุกครั้ง แล้วหยุดทันทีที่ข้อไหนไม่ผ่าน (fail closed):
+แถว committed แล้วหรือยัง → ตามผล order ที่ค้างอยู่ → หมดอายุ slot แล้วหรือยัง →
+มี order เปิดค้างไหม → holdings เปลี่ยนไปหรือยัง → เป็น UAT ไหม → preview + submit gate →
+place → poll สถานะ → มี fill จริงจึงบันทึก realized
+
 ---
 
 ## 7) ⏰ Deploy Google Cloud Scheduler — นาฬิกาปลุกของระบบ
@@ -219,6 +297,89 @@ gcloud scheduler jobs run lego-tick --location="$REGION"
 ```bash
 gcloud functions logs read lego-one-row --gen2 --region="$REGION" --limit=50
 ```
+
+> 🧭 **scheduler ยิงถี่กว่า slot ได้ ไม่เสียหาย** — `*/10` กับ `LEGO_SLOT_SECONDS=1800`
+> แปลว่า 3 tick ต่อ 1 slot: tick แรก commit แถว อีก 2 tick ได้ `SLOT_CONSUMED` (200)
+> เพราะ slot guard ตีตกให้ **ห้ามยิงห่างกว่า slot** เด็ดขาด เพราะ slot ที่พลาดไปจะถูกข้าม
+> ถาวร (DNA เดินตามเวลาตลาด ไม่ย้อนกลับไปใช้ signal เก่า)
+
+### 7.1) scheduler ของ order worker
+
+ถ้า deploy `lego-order-worker` ตามหัวข้อ 6.1 ให้มันมีนาฬิกาของตัวเองด้วย (ยิงถี่กว่าได้
+เพราะไม่แตะ DNA — มันแค่ไล่ intent ที่ค้างอยู่ในหน้าต่างของ slot ปัจจุบัน):
+
+```bash
+export WORKER_URL="$(gcloud functions describe lego-order-worker --gen2 --region="$REGION" --format='value(serviceConfig.uri)')"
+
+gcloud scheduler jobs create http lego-order-tick \
+  --location="$REGION" \
+  --schedule="*/5 13-20 * * 1-5" \
+  --time-zone="UTC" \
+  --max-retry-attempts=0 \
+  --uri="$WORKER_URL" \
+  --http-method=POST \
+  --oidc-service-account-email="$FUNCTION_SA" \
+  --oidc-token-audience="$WORKER_URL"
+```
+
+---
+
+## 7.5) 🧬 เปิด market mode — ให้ DNA เดินตามเวลาตลาดจริง
+
+ค่าเริ่มต้น `LEGO_DNA_CLOCK_MODE=shadow` คือ **ยังไม่เปลี่ยนพฤติกรรม**: step เดินแบบเดิม
+(`anchor + 1`) แต่ระบบจะรายงาน `alignment_error` ให้เห็นว่าห่างจากเวลาตลาดเท่าไร
+ใช้ดูสัก 1–2 วันก่อนได้
+
+**ทำไมต้องมี origin?** DNA ถูกเทรนจากลำดับแท่งเทียน (bar index) ไม่ใช่ timestamp
+production จึงต้องรักษาสมการนี้ตลอดอายุ chain:
+
+```
+market_ordinal(t)  ==  bar index ที่ DNA เทรนมา
+```
+
+`market_ordinal` นับ slot เดินหน้าจากจุดเริ่ม (`LEGO_DNA_ORIGIN_UTC`) ดังนั้น "จุดเริ่ม" คือ
+slot ที่อยู่ก่อนหน้า slot ปัจจุบันเท่ากับ step ที่เราอยากได้ — คำนวณด้วย `find_origin.py`
+(นับเฉพาะเวลาทำการจริง: ข้ามกลางคืน เสาร์อาทิตย์ วันหยุด และวันปิดครึ่งวันให้อัตโนมัติ):
+
+```bash
+# รันในเวลาตลาดเปิด · <N> = DNA step ที่อยากให้ "แถวถัดไป" เป็น
+# chain ใหม่ = 0 · chain เดิมที่ anchor.dna_step = 41 ให้ใส่ 42
+export LEGO_SLOT_SECONDS=1800
+python find_origin.py 0
+```
+
+ผลลัพธ์จะบอกค่าที่ต้อง set ตรง ๆ เช่น:
+
+```
+LEGO_SLOT_SECONDS = 1800
+slot ปัจจุบัน      = 2026-07-23:9 (เริ่ม 2026-07-23T18:00:00Z)
+ตั้งค่าเป็น:
+  LEGO_DNA_ORIGIN_UTC=2026-07-23T18:00:00Z
+  LEGO_DNA_CLOCK_MODE=market
+```
+
+เอาไป update ทั้งสองฟังก์ชัน (ค่าต้องตรงกัน):
+
+```bash
+for fn in lego-one-row lego-order-worker; do
+  gcloud functions deploy "$fn" --gen2 --region="$REGION" \
+    --update-env-vars="LEGO_DNA_ORIGIN_UTC=2026-07-23T18:00:00Z,LEGO_DNA_CLOCK_MODE=market"
+done
+```
+
+> 🚨 **แก้ได้ครั้งเดียวก่อน commit แถวแรกเท่านั้น**
+> `LEGO_DNA_ORIGIN_UTC`, `LEGO_SLOT_SECONDS`, `LEGO_MARKET_HOLIDAYS`,
+> `LEGO_MARKET_EARLY_CLOSES` ทุกตัวถูกผูกเป็น `calendar_fingerprint` ไว้กับ chain
+> เปลี่ยนทีหลัง = ระบบตอบ `CALENDAR_DRIFT` (409) และหยุดนิ่ง **โดยตั้งใจ** เพราะถ้าเดินต่อ
+> gate array จะเลื่อน phase ถาวร (บอทจะเทรดคนละ slot กับที่ backtest มา)
+> จะเปลี่ยนจริง ๆ ต้อง **เริ่ม chain ใหม่** หรือคืนค่าเดิม
+>
+> ส่วน `LEGO_SYMBOL`, `LEGO_FIX_C`, `LEGO_DIFF`, `LEGO_DECIMAL_PRECISION`,
+> `LEGO_DNA_CODE`, `LEGO_STRATEGY_ID` เปลี่ยนแล้ว `config_hash` เปลี่ยน = **chain ใหม่**
+> (ของเก่ายังอยู่ครบใน RTDB ไม่ถูกลบ)
+
+เช็คว่าเข้าโหมดแล้วจริงจาก response ของ function: `clock_mode` ต้องเป็น `market`
+และ `step` ต้องเท่ากับ `market_step`
 
 ---
 
@@ -275,8 +436,22 @@ gcloud functions describe lego-one-row --gen2 --region="$REGION" --format='value
 ตรวจใน **Firebase Console:**
 
 - ✅ มีข้อมูลใหม่ใน `webull_lego_rows`
-- ✅ `webull_lego_state` มี version ล่าสุด
+- ✅ `webull_lego_state` มี version ล่าสุด และ `market_ordinal` เดินหน้าเสมอ (ห้ามเท่าเดิม/ถอย)
 - ✅ ไม่มี error ผิดปกติใน `webull_lego_errors`
+- ✅ ถ้าเปิด `AUTO_SUBMIT=true`: `webull_lego_order_outbox` ต้องไม่ค้างเป็น `PENDING_DISPATCH`
+  ข้าม slot — ถ้าเห็น `EXPIRED_UNSENT` ทุกใบ แปลว่ายังไม่ได้ deploy `lego-order-worker` (ข้อ 6.1)
+
+ค่า `pipeline_status` ที่ต้องอ่านให้ออกจาก log:
+
+| เห็นแบบนี้ | แปลว่า | ต้องทำอะไร |
+|---|---|---|
+| `ROW_COMMITTED` | ปกติ | ไม่ต้องทำอะไร |
+| `MARKET_CLOSED` | นอกเวลา/วันหยุด | ปกติ ไม่ใช่ error |
+| `SLOT_CONSUMED` | slot นี้ commit ไปแล้ว | ปกติเมื่อ scheduler ยิงถี่กว่า slot |
+| `CONFIG_ERROR` | `LEGO_SLOT_SECONDS` ไม่ตั้ง/ไม่รองรับ | แก้ env แล้ว deploy ใหม่ |
+| `STALE_ANCHOR` | มี 2 instance เขียนชนกัน | ตั้ง `--max-retry-attempts=0` และอย่ายิงซ้อน |
+| `CALENDAR_DRIFT` | ปฏิทิน/slot/origin เปลี่ยนหลัง commit แรก | คืนค่าเดิม หรือเริ่ม chain ใหม่ (ข้อ 7.5) |
+| `ORDINAL_REGRESSION` | slot ให้ ordinal ที่ไม่เดินหน้า | ตรวจ origin/เวลาเครื่อง — DNA เดินถอยไม่ได้ |
 
 ตรวจใน **Streamlit:**
 
@@ -365,10 +540,13 @@ git pull origin main
 | อยากแก้อะไร | ไฟล์ที่มักเกี่ยวข้อง |
 | --- | --- |
 | Logic หลักของ Cloud Function | `main.py`, `lego_one_row.py`, `lego_orders.py`, `lego_state.py`, `dna_engine.py` |
+| เวลาตลาด / slot / ปฏิทิน / วันหยุด | `market_clock.py` (แหล่งเดียว — ห้ามเขียนกฎเวลาตลาดที่อื่น) |
+| คิว order ที่รอส่ง | `lego_outbox.py` |
 | การเชื่อมต่อ Webull / external API | `webull_io.py` |
+| หา `LEGO_DNA_ORIGIN_UTC` | `find_origin.py` (เครื่องมือ CLI ไม่ใช่ส่วนของ runtime) |
 | Dependency Python | `requirements.txt` |
 | เอกสารวิธีใช้งาน | `README.md`, `QUICKSTART_TH.md` |
-| ค่า config ตอน deploy | คำสั่ง `gcloud functions deploy` (ข้อ 6) |
+| ค่า config ตอน deploy | คำสั่ง `gcloud functions deploy` (ข้อ 6 และ 6.1) |
 
 > 🔐 ห้ามใส่ secret, API key, private key, service account JSON หรือรหัสผ่านลงใน code ให้ใช้ Secret Manager หรือ Streamlit Secrets เท่านั้น
 

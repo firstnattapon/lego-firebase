@@ -30,6 +30,15 @@ class CalendarDriftError(RuntimeError):
     """The market calendar no longer reproduces this chain's committed slots."""
 
 
+class OrdinalRegression(RuntimeError):
+    """A later commit resolved to an ordinal at or before the chain's last one.
+
+    market_ordinal(t) must reproduce the bar index the DNA was trained on, so it
+    may only move forward. Letting it move back would replay an older gate on a
+    newer slot, which is a corrupt chain, not a retry.
+    """
+
+
 class _Idempotent(Exception):
     pass
 
@@ -113,6 +122,10 @@ def commit_final_row(cfg: Config, snapshot: dict, anchor: Anchor | None, row: di
     outbox, so a broker failure can never roll back a committed slot. The row
     keeps exactly the original 17 columns; slot provenance is stored alongside
     run_id/version as metadata, never as a new column.
+
+    Guards, all fail closed: replayed run_id (idempotent no-op), stale anchor,
+    already-consumed slot, calendar drift, and an ordinal that does not move
+    forward. Degraded 'epoch:*' slots carry no ordinal, so they skip the last one.
     """
     validate_row_columns(row)
     ck = chain_key(cfg)
@@ -162,11 +175,17 @@ def commit_final_row(cfg: Config, snapshot: dict, anchor: Anchor | None, row: di
                     f"state.version={current.get('version')}")
             if slot_id is not None and current.get("slot_id") == slot_id:
                 raise SlotAlreadyConsumed(f"slot {slot_id} commit ไปแล้ว")
+            last_ordinal = current.get("market_ordinal")
+            if market_ordinal is not None and last_ordinal is not None \
+                    and int(market_ordinal) <= int(last_ordinal):
+                raise OrdinalRegression(
+                    f"market_ordinal ต้องเดินหน้า: chain อยู่ที่ {int(last_ordinal)} "
+                    f"แต่ slot นี้ได้ {int(market_ordinal)} — DNA เดินถอยไม่ได้")
 
         next_state = {
             "version": expected_version,
             "dna_step": int(meta["step"]),
-            "p0": float(snapshot["price"]) if anchor is None else float(anchor.p0),
+            "p0": float(meta["p0_next"]),
             "prev_price": float(meta["acted_price_next"]),
             "prev_actual": float(meta["actual_next"]),
             "prev_holdings": float(snapshot.get("holdings", 0.0) or 0.0),
@@ -194,7 +213,7 @@ def commit_final_row(cfg: Config, snapshot: dict, anchor: Anchor | None, row: di
         row_ref.update({"committed": True})
         return {"committed": False, "idempotent": True,
                 "run_id": run_id, "version": expected_version}
-    except (StaleAnchorError, SlotAlreadyConsumed):
+    except (StaleAnchorError, SlotAlreadyConsumed, OrdinalRegression):
         row_ref.delete()
         raise
 

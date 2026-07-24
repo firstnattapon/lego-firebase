@@ -24,6 +24,7 @@ ALLOWED_SLOT_SECONDS = {900: "15m", 1800: "30m", 3600: "1h",
 # Bump when the built-in holiday/early-close rules change; it re-keys the
 # calendar fingerprint so an existing chain fails closed instead of re-phasing.
 CALENDAR_RULES_VERSION = "2026-07-nyse-v1"
+CLOCK_MODES = ("shadow", "market", "legacy")
 
 
 class MarketClockError(RuntimeError):
@@ -80,7 +81,13 @@ def _easter_sunday(year: int) -> date:
 
 
 @lru_cache(maxsize=64)
-def us_market_holidays(year: int) -> frozenset[date]:
+def _holiday_set(year: int, declared: str) -> frozenset[date]:
+    """Cached per (year, declared holidays) so the cache can never go stale.
+
+    Keying on the year alone would keep serving the old calendar after
+    LEGO_MARKET_HOLIDAYS changes, which is exactly the silent re-phasing the
+    fingerprint guard exists to prevent.
+    """
     holidays = {
         _observed(date(year, 1, 1)),
         _nth_weekday(year, 1, 0, 3),       # MLK
@@ -96,12 +103,15 @@ def us_market_holidays(year: int) -> frozenset[date]:
         holidays.add(_observed(date(year, 6, 19)))  # Juneteenth
     # New Year's observed can fall in the previous year.
     holidays.add(_observed(date(year + 1, 1, 1)))
-    extra = os.environ.get("LEGO_MARKET_HOLIDAYS", "")
-    for raw in extra.split(","):
+    for raw in declared.split(","):
         raw = raw.strip()
         if raw:
             holidays.add(date.fromisoformat(raw))
     return frozenset(holidays)
+
+
+def us_market_holidays(year: int) -> frozenset[date]:
+    return _holiday_set(year, os.environ.get("LEGO_MARKET_HOLIDAYS", ""))
 
 
 def _early_close(d: date) -> bool:
@@ -126,6 +136,26 @@ def session_bounds(session_date: date) -> tuple[datetime, datetime] | None:
     open_ny = datetime.combine(session_date, time(9, 30), tzinfo=NY)
     close_ny = datetime.combine(session_date, time(13 if _early_close(session_date) else 16, 0), tzinfo=NY)
     return open_ny.astimezone(UTC), close_ny.astimezone(UTC)
+
+
+def is_regular_session(at: datetime | None = None) -> bool:
+    """One calendar for the whole pipeline: is *at* inside a regular session?
+
+    Same predicate resolve_market_slot applies, minus the slot/origin lookup, so
+    it never raises. Holidays and early closes therefore also hold on the
+    degraded path where no ordinal can be resolved.
+    """
+    at = (at or datetime.now(UTC)).astimezone(UTC)
+    bounds = session_bounds(at.astimezone(NY).date())
+    return bounds is not None and bounds[0] <= at < bounds[1]
+
+
+def clock_mode() -> str:
+    """Single reader for LEGO_DNA_CLOCK_MODE — every caller must go through it."""
+    mode = os.environ.get("LEGO_DNA_CLOCK_MODE", "shadow").strip().lower()
+    if mode not in CLOCK_MODES:
+        raise MarketClockError("LEGO_DNA_CLOCK_MODE ต้องเป็น shadow|market|legacy")
+    return mode
 
 
 def _parse_origin() -> datetime:
@@ -281,8 +311,6 @@ def resolve_dna_step(legacy_step: int, slot: MarketSlot) -> tuple[int, int]:
     market: market ordinal is authoritative.
     legacy: old behavior, provided only for rollback.
     """
-    mode = os.environ.get("LEGO_DNA_CLOCK_MODE", "shadow").strip().lower()
-    if mode not in {"shadow", "market", "legacy"}:
-        raise MarketClockError("LEGO_DNA_CLOCK_MODE ต้องเป็น shadow|market|legacy")
+    mode = clock_mode()
     error = legacy_step - slot.market_ordinal
     return (slot.market_ordinal if mode == "market" else legacy_step), error

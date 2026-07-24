@@ -4,8 +4,12 @@ from __future__ import annotations
 from datetime import datetime, timezone
 from firebase_admin import db
 
+from lego_orders import normalize_status as _normalize_status
+
 OUTBOX_PATH = "webull_lego_order_outbox"
 ROWS_PATH = "webull_lego_rows"
+# Terminal for the *outbox*: nothing more to dispatch. Wider than
+# lego_orders.TERMINAL_STATUSES, which only means the broker is done.
 TERMINAL = {
     "FILLED", "CANCELLED", "FAILED", "REJECTED", "EXPIRED_UNSENT",
     "SUPPRESSED_ACTIVE_ORDER", "SUPPRESSED_STATE_CHANGED", "NOT_PLACED",
@@ -13,7 +17,8 @@ TERMINAL = {
 
 
 def normalize_status(value) -> str:
-    return str(value or "UNKNOWN").strip().upper().replace(" ", "_")
+    """Same normalization as lego_orders; an empty status is UNKNOWN here."""
+    return _normalize_status(value) or "UNKNOWN"
 
 
 def put_intent(chain_key: str, run_id: str, payload: dict) -> dict:
