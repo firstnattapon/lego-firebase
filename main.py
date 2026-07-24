@@ -1,30 +1,29 @@
-"""Google Cloud Function entrypoint for one LEGO row plus durable order outbox.
+"""Cloud Functions for time-aligned LEGO DNA and independent order execution.
 
-Pipeline status is explicit:
-- ROW_COMMITTED: row persisted, no broker action required.
-- ROW_COMMITTED_ORDER_FILLED/TERMINAL: broker path reached a terminal state.
-- ORDER_PENDING: broker accepted/non-terminal; durable state will reconcile later.
-- ORDER_RETRY_REQUIRED: uncertain/transient failure; HTTP 503, intent remains durable.
+lego_one_row: market clock -> snapshot -> model row -> durable outbox candidate.
+lego_order_worker: dispatch/reconcile outbox intents without blocking DNA time.
 """
 from __future__ import annotations
 
 import os
 import time
 import traceback
+from datetime import datetime, timedelta, timezone
 
 import firebase_admin
 import functions_framework
 from firebase_admin import credentials, db
 
-from lego_one_row import READY_BUY, READY_SELL, compute_row
+from lego_one_row import READY_BUY, READY_SELL, compute_row, dna_step_for
 from lego_orders import (REALIZED_STATUSES, TERMINAL_STATUSES, UAT,
                          evaluate_submit_gate, normalize_status,
                          order_confirmation_phrase, summarize_order_result)
-from lego_state import (PendingOrderExists, SlotAlreadyConsumed, StaleAnchorError,
-                        apply_realized_fill, chain_key, clear_pending_order,
-                        commit_final_row, get_pending_order, read_anchor,
-                        update_order_audit, update_pending_order,
-                        write_order_audit)
+from lego_outbox import (expire_unsent_before, list_actionable, put_intent,
+                         row_is_committed, update_intent)
+from lego_state import (SlotAlreadyConsumed, StaleAnchorError, apply_realized_fill,
+                        chain_key, commit_final_row, make_run_id, read_anchor,
+                        update_order_audit, write_order_audit)
+from market_clock import MarketClockError, resolve_dna_step, resolve_market_slot
 from webull_io import (build_clients, build_order_payload, environment_label,
                        fetch_open_orders, fetch_order_detail, fetch_snapshot,
                        is_transient_exception, is_us_market_open, load_config,
@@ -32,6 +31,7 @@ from webull_io import (build_clients, build_order_payload, environment_label,
 
 ORDER_POLL_ATTEMPTS = 3
 ORDER_POLL_DELAY_S = 2.0
+UTC = timezone.utc
 
 
 def _init_firebase():
@@ -42,6 +42,10 @@ def _init_firebase():
         )
 
 
+def _iso(dt: datetime) -> str:
+    return dt.astimezone(UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
 def _poll_order_status(trade_client, client_order_id: str, place_res: dict) -> dict:
     detail = None
     for i in range(ORDER_POLL_ATTEMPTS):
@@ -49,227 +53,249 @@ def _poll_order_status(trade_client, client_order_id: str, place_res: dict) -> d
             time.sleep(ORDER_POLL_DELAY_S)
         detail = fetch_order_detail(trade_client, client_order_id)
         summary = summarize_order_result(place_res, detail)
-        if summary["status"] in TERMINAL_STATUSES:
+        if normalize_status(summary.get("status")) in TERMINAL_STATUSES:
             return summary
     return summarize_order_result(place_res, detail)
 
 
-def _pending_row_shape(pending: dict) -> dict:
-    return {
-        "สถานะ": pending["row_status"],
-        "สินทรัพย์": pending["symbol"],
-        "_meta": {
-            "side": pending["side"],
-            "quantity": float(pending["quantity"]),
-            "step": int(pending["step"]),
-        },
-    }
-
-
-def _apply_realized_if_available(cfg, pending: dict, summary: dict) -> dict:
+def _apply_realized_if_available(intent: dict, summary: dict) -> dict:
     status = normalize_status(summary.get("status"))
     if status not in REALIZED_STATUSES:
         return summary
     qty = summary.get("filled_quantity")
     price = summary.get("filled_price")
     if qty is None or price is None:
-        summary = dict(summary)
-        summary["realized_warning"] = (
-            "broker ยืนยัน fill แต่ยังไม่มี filled_quantity/filled_price — ยังไม่นับ realized")
-        return summary
+        out = dict(summary)
+        out["realized_warning"] = "fill confirmed but quantity/price unavailable"
+        return out
     realized = apply_realized_fill(
-        pending["chain_key"], pending["run_id"], pending["side"],
+        intent["chain_key"], intent["run_id"], intent["side"],
         cumulative_qty=float(qty), price=float(price),
         cumulative_fee=float(summary.get("filled_fee", 0.0) or 0.0),
     )
-    summary = dict(summary)
-    summary.update(realized)
-    return summary
+    out = dict(summary)
+    out.update(realized)
+    return out
 
 
-def _persist_order_summary(cfg, pending: dict, summary: dict) -> None:
-    run_id = pending["run_id"]
-    update_order_audit(run_id, summary)
+def _persist_summary(intent: dict, summary: dict) -> None:
+    run_id = intent["run_id"]
     status = normalize_status(summary.get("status"))
-    update_pending_order(cfg, run_id, {**summary, "status": status})
-    if status in TERMINAL_STATUSES:
-        clear_pending_order(cfg, run_id)
+    fields = {**summary, "status": status}
+    update_intent(intent["chain_key"], run_id, fields)
+    update_order_audit(run_id, fields)
 
 
-def _reconcile_existing_pending(trade_client, cfg, pending: dict) -> tuple[dict, int]:
-    run_id = pending["run_id"]
-    try:
-        detail = fetch_order_detail(trade_client, run_id)
-        summary = summarize_order_result({}, detail)
-        if summary["status"] == "UNKNOWN":
-            raise RuntimeError("broker order detail ยัง UNKNOWN")
-        summary = _apply_realized_if_available(cfg, pending, summary)
-        _persist_order_summary(cfg, pending, summary)
-        status = normalize_status(summary["status"])
-        if status in TERMINAL_STATUSES:
-            return {"pipeline_status": "ORDER_RECONCILED_TERMINAL", "order": summary}, 200
-        return {"pipeline_status": "ORDER_PENDING", "order": summary}, 202
-    except Exception as exc:
-        err = f"{type(exc).__name__}: {exc}"
-        update_pending_order(cfg, run_id, {"status": pending.get("status", "PLACING"),
-                                           "last_error": err[:500]})
-        update_order_audit(run_id, {"last_error": err[:500]})
-        return {"pipeline_status": "ORDER_RETRY_REQUIRED", "run_id": run_id,
-                "error": err}, 503
+def _pending_row_shape(intent: dict) -> dict:
+    return {
+        "สถานะ": intent["row_status"],
+        "สินทรัพย์": intent["symbol"],
+        "_meta": {
+            "side": intent["side"],
+            "quantity": float(intent["quantity"]),
+            "step": int(intent["step"]),
+        },
+    }
 
 
-def _dispatch_pending(trade_client, cfg, pending: dict) -> tuple[dict, int]:
-    run_id = pending["run_id"]
+def _dispatch_or_reconcile_one(trade_client, data_client, cfg, intent: dict) -> dict:
+    run_id = intent["run_id"]
+    ck = intent["chain_key"]
+    status = normalize_status(intent.get("status"))
+
+    if not row_is_committed(run_id):
+        update_intent(ck, run_id, {
+            "status": "NOT_PLACED",
+            "terminal_reason": "source row was not committed",
+        })
+        return {"run_id": run_id, "status": "NOT_PLACED"}
+
+    if status in {"PLACING_UNKNOWN", "PLACING", "SUBMITTED", "UNKNOWN",
+                  "PARTIAL_FILLED", "PARTIALLY_FILLED"}:
+        try:
+            summary = summarize_order_result({}, fetch_order_detail(trade_client, run_id))
+            if normalize_status(summary.get("status")) == "UNKNOWN":
+                raise RuntimeError("broker order detail still UNKNOWN")
+            summary = _apply_realized_if_available(intent, summary)
+            _persist_summary(intent, summary)
+            return {"run_id": run_id, **summary}
+        except Exception as exc:
+            err = f"{type(exc).__name__}: {exc}"
+            update_intent(ck, run_id, {"status": "PLACING_UNKNOWN", "last_error": err[:500]})
+            update_order_audit(run_id, {"status": "PLACING_UNKNOWN", "last_error": err[:500]})
+            return {"run_id": run_id, "status": "PLACING_UNKNOWN", "error": err}
+
+    if status != "PENDING_DISPATCH":
+        return {"run_id": run_id, "status": status}
+
+    now = datetime.now(UTC)
+    expiry = datetime.fromisoformat(str(intent["expires_at"]).replace("Z", "+00:00"))
+    if now >= expiry:
+        update_intent(ck, run_id, {"status": "EXPIRED_UNSENT"})
+        return {"run_id": run_id, "status": "EXPIRED_UNSENT"}
+
+    open_orders = fetch_open_orders(trade_client, cfg.symbol)
+    if open_orders:
+        update_intent(ck, run_id, {
+            "status": "SUPPRESSED_ACTIVE_ORDER",
+            "terminal_reason": f"{len(open_orders)} active broker order(s)",
+        })
+        return {"run_id": run_id, "status": "SUPPRESSED_ACTIVE_ORDER"}
+
+    fresh = fetch_snapshot(trade_client, data_client, cfg)
+    decision_holdings = float(intent.get("decision_holdings", 0.0) or 0.0)
+    tolerance = float(os.environ.get("LEGO_HOLDINGS_DRIFT_TOLERANCE", "0.000001"))
+    drift = abs(float(fresh["holdings"]) - decision_holdings)
+    if drift > tolerance:
+        update_intent(ck, run_id, {
+            "status": "SUPPRESSED_STATE_CHANGED",
+            "holdings_drift": drift,
+            "dispatch_holdings": fresh["holdings"],
+        })
+        return {"run_id": run_id, "status": "SUPPRESSED_STATE_CHANGED",
+                "holdings_drift": drift}
+
     env = environment_label()
     if env != UAT:
-        err = f"environment={env}; pending order ส่งได้เฉพาะ UAT"
-        update_pending_order(cfg, run_id, {"status": "PENDING", "last_error": err})
-        return {"pipeline_status": "ORDER_RETRY_REQUIRED", "run_id": run_id,
-                "error": err}, 503
+        update_intent(ck, run_id, {"status": "NOT_PLACED", "terminal_reason": f"environment={env}"})
+        return {"run_id": run_id, "status": "NOT_PLACED"}
 
+    row = _pending_row_shape(intent)
+    order = build_order_payload(cfg, intent["side"], float(intent["quantity"]), run_id)
+    write_order_audit(run_id, {
+        "run_id": run_id, "chain_key": ck, "side": intent["side"],
+        "quantity": float(intent["quantity"]), "symbol": cfg.symbol,
+        "environment": env, "status": "PENDING_DISPATCH", "realized": False,
+        "placed_at": intent["created_at"],
+    })
     try:
-        open_orders = fetch_open_orders(trade_client, cfg.symbol)
-        if open_orders:
-            update_pending_order(cfg, run_id, {
-                "status": "PENDING",
-                "last_error": f"open order ค้าง {len(open_orders)} ตัว",
-            })
-            return {"pipeline_status": "ORDER_BLOCKED_OPEN_ORDER", "run_id": run_id,
-                    "open_orders": len(open_orders)}, 202
-
-        row = _pending_row_shape(pending)
-        order = build_order_payload(cfg, pending["side"], float(pending["quantity"]), run_id)
-        write_order_audit(run_id, {
-            "run_id": run_id,
-            "chain_key": pending["chain_key"],
-            "side": pending["side"],
-            "quantity": float(pending["quantity"]),
-            "symbol": pending["symbol"],
-            "environment": env,
-            "status": "PENDING",
-            "realized": False,
-            "placed_at": pending["created_at"],
-        })
-
         preview_ok = preview_market_order(trade_client, order)
         evaluate_submit_gate(env, row, preview_ok,
                              order_confirmation_phrase(row), committed=True)
     except Exception as exc:
         err = f"{type(exc).__name__}: {exc}"
-        update_pending_order(cfg, run_id, {"status": "PENDING", "last_error": err[:500]})
-        update_order_audit(run_id, {"status": "PENDING", "last_error": err[:500]})
-        return {"pipeline_status": "ORDER_RETRY_REQUIRED", "run_id": run_id,
-                "phase": "PRE_PLACE", "error": err}, 503
+        update_intent(ck, run_id, {"status": "NOT_PLACED", "last_error": err[:500]})
+        update_order_audit(run_id, {"status": "NOT_PLACED", "last_error": err[:500]})
+        return {"run_id": run_id, "status": "NOT_PLACED", "error": err}
 
-    update_pending_order(cfg, run_id, {"status": "PLACING", "place_attempted": True})
-    update_order_audit(run_id, {"status": "PLACING", "place_attempted": True})
+    update_intent(ck, run_id, {"status": "PLACING_UNKNOWN", "place_attempted": True})
+    update_order_audit(run_id, {"status": "PLACING_UNKNOWN", "place_attempted": True})
     try:
         place_res = place_market_order(trade_client, order)
         summary = _poll_order_status(trade_client, run_id, place_res)
-        summary = _apply_realized_if_available(cfg, pending, summary)
-        _persist_order_summary(cfg, pending, summary)
-        status = normalize_status(summary["status"])
-        if status in TERMINAL_STATUSES:
-            return {"pipeline_status": "ROW_COMMITTED_ORDER_TERMINAL",
-                    "run_id": run_id, "order": summary}, 200
-        return {"pipeline_status": "ORDER_PENDING", "run_id": run_id,
-                "order": summary}, 202
+        summary = _apply_realized_if_available(intent, summary)
+        _persist_summary(intent, summary)
+        return {"run_id": run_id, **summary}
     except Exception as exc:
         err = f"{type(exc).__name__}: {exc}"
-        update_pending_order(cfg, run_id, {"status": "PLACING", "last_error": err[:500]})
-        update_order_audit(run_id, {"status": "PLACING", "last_error": err[:500]})
-        return {"pipeline_status": "ORDER_RETRY_REQUIRED", "run_id": run_id,
-                "phase": "PLACE_OR_POLL", "error": err}, 503
+        update_intent(ck, run_id, {"status": "PLACING_UNKNOWN", "last_error": err[:500]})
+        update_order_audit(run_id, {"status": "PLACING_UNKNOWN", "last_error": err[:500]})
+        return {"run_id": run_id, "status": "PLACING_UNKNOWN", "error": err}
 
 
-def _process_pending_order(trade_client, cfg, pending: dict) -> tuple[dict, int]:
-    status = normalize_status(pending.get("status"))
-    if status in {"PLACING", "SUBMITTED", "PENDING_SUBMIT", "UNKNOWN",
-                  "PARTIAL_FILLED", "PARTIALLY_FILLED"}:
-        return _reconcile_existing_pending(trade_client, cfg, pending)
-    return _dispatch_pending(trade_client, cfg, pending)
-
-
-def _build_order_intent(cfg, row: dict, captured_at: str) -> dict:
-    m = row["_meta"]
-    return {
-        "status": "PENDING",
-        "row_status": row["สถานะ"],
-        "side": m["side"],
-        "quantity": m["quantity"],
-        "symbol": cfg.symbol,
-        "step": m["step"],
-        "created_at": captured_at,
-    }
+def _run_order_worker(cfg, limit: int = 3) -> dict:
+    trade_client, data_client = build_clients()
+    ck = chain_key(cfg)
+    expire_unsent_before(ck, datetime.now(UTC))
+    results = []
+    for intent in list_actionable(ck, limit=limit):
+        results.append(_dispatch_or_reconcile_one(trade_client, data_client, cfg, intent))
+    return {"processed": len(results), "results": results}
 
 
 @functions_framework.http
 def lego_one_row(request):
+    """Commit the current model slot first. Order failures never block DNA time."""
     _init_firebase()
     cfg = load_config()
-    if not is_us_market_open():
+    decision_time = datetime.now(UTC)
+
+    if not is_us_market_open(decision_time):
         return {"status": "PASS_MARKET_CLOSED", "committed": False,
                 "pipeline_status": "MARKET_CLOSED"}, 200
 
     try:
-        trade_client, data_client = build_clients()
-
-        pending = get_pending_order(cfg)
-        if pending:
-            pending_out, pending_code = _process_pending_order(trade_client, cfg, pending)
-            if pending_code != 200:
-                return pending_out, pending_code
-
         anchor = read_anchor(cfg)
+        legacy_step = dna_step_for(anchor)
+        slot = None
+        clock_error = None
+        try:
+            slot = resolve_market_slot(decision_time)
+            if slot is None:
+                return {"status": "PASS_MARKET_CLOSED", "committed": False,
+                        "pipeline_status": "MARKET_CLOSED"}, 200
+            effective_step, alignment_error = resolve_dna_step(legacy_step, slot)
+        except MarketClockError as exc:
+            if os.environ.get("LEGO_DNA_CLOCK_MODE", "shadow").lower() == "market":
+                raise
+            effective_step, alignment_error = legacy_step, None
+            clock_error = str(exc)
+
+        trade_client, data_client = build_clients()
         snapshot = fetch_snapshot(trade_client, data_client, cfg)
-        row = compute_row(cfg, snapshot, anchor)
+        if slot:
+            snapshot["market_slot_id"] = slot.slot_id
+        row = compute_row(cfg, snapshot, anchor, dna_step=effective_step)
 
         env = environment_label()
         auto = os.environ.get("AUTO_SUBMIT", "false").lower() == "true"
         should_submit = auto and env == UAT and row["สถานะ"] in (READY_BUY, READY_SELL)
-        intent = _build_order_intent(cfg, row, snapshot["captured_at"]) if should_submit else None
 
-        result = commit_final_row(cfg, snapshot, anchor, row, order_intent=intent)
+        # Current commit implementation derives the same deterministic run_id used below.
+        prospective_run_id = make_run_id(chain_key(cfg), None if anchor is None else anchor.version, snapshot)
+        if should_submit and slot:
+            margin = int(os.environ.get("LEGO_ORDER_EXPIRY_MARGIN_SECONDS", "15"))
+            expires_at = max(slot.slot_start_utc, slot.slot_end_utc - timedelta(seconds=margin))
+            put_intent(chain_key(cfg), prospective_run_id, {
+                "status": "PENDING_DISPATCH",
+                "row_status": row["สถานะ"], "side": row["_meta"]["side"],
+                "quantity": row["_meta"]["quantity"], "symbol": cfg.symbol,
+                "step": row["DNA step"], "signal": row["DNA signal"],
+                "decision_price": snapshot["price"],
+                "decision_holdings": snapshot["holdings"],
+                "decision_time": _iso(decision_time),
+                "created_at": snapshot["captured_at"],
+                "slot_id": slot.slot_id,
+                "slot_start_utc": _iso(slot.slot_start_utc),
+                "slot_end_utc": _iso(slot.slot_end_utc),
+                "expires_at": _iso(expires_at),
+            })
+
+        result = commit_final_row(cfg, snapshot, anchor, row)
         out = {
-            "status": row["สถานะ"],
-            "committed": result["committed"],
+            "status": row["สถานะ"], "committed": result["committed"],
             "idempotent": result.get("idempotent", False),
-            "run_id": result["run_id"],
-            "version": result.get("version"),
-            "step": row["DNA step"],
-            "signal": row["DNA signal"],
+            "run_id": result["run_id"], "version": result.get("version"),
+            "step": row["DNA step"], "signal": row["DNA signal"],
             "model_acted": row["_meta"]["acted"],
             "pipeline_status": "ROW_COMMITTED",
+            "clock_mode": os.environ.get("LEGO_DNA_CLOCK_MODE", "shadow").lower(),
+            "legacy_step": legacy_step,
+            "market_step": None if slot is None else slot.market_ordinal,
+            "alignment_error": alignment_error,
+            "market_slot_id": None if slot is None else slot.slot_id,
         }
+        if clock_error:
+            out["clock_warning"] = clock_error
 
-        if auto and env != UAT and row["สถานะ"] in (READY_BUY, READY_SELL):
-            out["pipeline_status"] = "ROW_COMMITTED_ORDER_DISABLED_PRODUCTION"
-            out["order_skipped"] = f"environment={env} — read-only"
-            return out, 200
-
-        if intent and result["committed"]:
-            pending = get_pending_order(cfg)
-            if not pending:
-                return {**out, "pipeline_status": "ORDER_OUTBOX_MISSING"}, 500
-            order_out, order_code = _dispatch_pending(trade_client, cfg, pending)
-            return {**out, **order_out}, order_code
-
+        # Compatibility: optional best-effort inline worker, never changes HTTP success.
+        if os.environ.get("LEGO_INLINE_ORDER_WORKER", "true").lower() == "true":
+            try:
+                out["order_worker"] = _run_order_worker(cfg, limit=1)
+            except Exception as exc:
+                out["order_worker"] = {"processed": 0, "error": f"{type(exc).__name__}: {exc}"}
         return out, 200
 
     except SlotAlreadyConsumed as exc:
         return {"status": "PASS_SLOT_CONSUMED", "committed": False,
                 "pipeline_status": "SLOT_CONSUMED", "note": str(exc)}, 200
-    except PendingOrderExists as exc:
-        return {"status": "PENDING_ORDER_EXISTS", "committed": False,
-                "pipeline_status": "ORDER_PENDING", "note": str(exc)}, 202
     except StaleAnchorError as exc:
         return {"status": "STALE_ANCHOR", "committed": False,
                 "pipeline_status": "STALE_ANCHOR", "note": str(exc)}, 409
     except Exception as exc:
         try:
             db.reference("webull_lego_errors").push({
-                "error": str(exc),
-                "type": type(exc).__name__,
+                "error": str(exc), "type": type(exc).__name__,
                 "trace": traceback.format_exc()[:2000],
             })
         except Exception:
@@ -278,3 +304,16 @@ def lego_one_row(request):
         return {"status": "ERROR", "committed": False,
                 "pipeline_status": "SNAPSHOT_OR_ENGINE_ERROR",
                 "error": str(exc), "type": type(exc).__name__}, code
+
+
+@functions_framework.http
+def lego_order_worker(request):
+    """Independent worker; schedule separately when inline mode is disabled."""
+    _init_firebase()
+    cfg = load_config()
+    try:
+        limit = int(os.environ.get("LEGO_ORDER_WORKER_LIMIT", "3"))
+        return {"pipeline_status": "ORDER_WORKER_OK", **_run_order_worker(cfg, limit)}, 200
+    except Exception as exc:
+        return {"pipeline_status": "ORDER_WORKER_ERROR",
+                "error": f"{type(exc).__name__}: {exc}"}, 503
