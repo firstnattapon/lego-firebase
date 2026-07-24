@@ -1,9 +1,9 @@
 """Pure LEGO row engine for the fixed 17-column contract.
 
-The 17-column recurrence is a *model ledger*, not broker-realized P&L.
-An act occurs only when the decision is READY_BUY/READY_SELL. A raw DNA signal
-of 1 that lands inside the threshold band is PASS_THRESHOLD and freezes the
-model ledger.
+The 17-column recurrence is a model ledger, not broker-realized P&L. An act
+occurs only when the final decision is READY_BUY/READY_SELL. DNA progression is
+supplied by the market clock in production; legacy anchor+1 remains available
+for shadow mode and backward-compatible tests.
 """
 from __future__ import annotations
 
@@ -20,22 +20,10 @@ READY_SELL = "READY_SELL"
 DECISION_STAGE = 8
 
 COLUMN_ORDER = [
-    "เวลา (UTC)",
-    "สินทรัพย์",
-    "สถานะ",
-    "DNA step",
-    "DNA signal",
-    "ราคา Pₙ (USD)",
-    "จำนวนถือครอง (หุ้น)",
-    "คำสั่ง",
-    "ฝั่ง",
-    "เหตุผล",
-    "จำนวนสั่ง (หุ้น)",
-    "มูลค่าพอร์ต (USD)",
-    "ส่วนต่างเป้าหมาย (USD)",
-    "Rₙ อ้างอิง (USD)",
-    "ΔAₙ ต่อสเต็ป (USD)",
-    "Aₙ สะสม (USD)",
+    "เวลา (UTC)", "สินทรัพย์", "สถานะ", "DNA step", "DNA signal",
+    "ราคา Pₙ (USD)", "จำนวนถือครอง (หุ้น)", "คำสั่ง", "ฝั่ง", "เหตุผล",
+    "จำนวนสั่ง (หุ้น)", "มูลค่าพอร์ต (USD)", "ส่วนต่างเป้าหมาย (USD)",
+    "Rₙ อ้างอิง (USD)", "ΔAₙ ต่อสเต็ป (USD)", "Aₙ สะสม (USD)",
     "Eₙ ส่วนเกินสะสม (USD)",
 ]
 
@@ -78,7 +66,11 @@ class Config:
             raise ValueError("decimal_precision ต้อง 0..5")
 
 
-def dna_step_for(anchor: Anchor | None) -> int:
+def dna_step_for(anchor: Anchor | None, explicit_step: int | None = None) -> int:
+    if explicit_step is not None:
+        if type(explicit_step) is not int or explicit_step < 0:
+            raise ValueError("explicit DNA step ต้องเป็นจำนวนเต็ม >= 0")
+        return explicit_step
     return 0 if anchor is None else anchor.dna_step + 1
 
 
@@ -136,15 +128,6 @@ class Recurrence:
 
 def compute_recurrence(cfg: Config, price: float, anchor: Anchor | None,
                        acted: bool | None = None, *, signal: int | None = None) -> Recurrence:
-    """Compute the model recurrence.
-
-    Genesis: R=ΔA=A=E=0.
-    acted=True: ΔA=Fix_c(P/P_acted-1), then move P_acted to P.
-    acted=False: ΔA=0, A and P_acted freeze; E stays at the last act value.
-    """
-    # Backward-compatible direct API: legacy callers may pass signal=0/1.
-    # The production compute_row path never uses raw signal here; it passes the
-    # final decision boolean, which fixes PASS_THRESHOLD(signal=1) semantics.
     if acted is None:
         if signal not in (0, 1):
             raise ValueError("ต้องระบุ acted bool หรือ signal ∈ {0,1}")
@@ -169,8 +152,9 @@ def compute_recurrence(cfg: Config, price: float, anchor: Anchor | None,
     return Recurrence(R, 0.0, A, A - R_acted, float(anchor.prev_price))
 
 
-def compute_row(cfg: Config, snapshot: dict, anchor: Anchor | None) -> dict:
-    step = dna_step_for(anchor)
+def compute_row(cfg: Config, snapshot: dict, anchor: Anchor | None,
+                dna_step: int | None = None) -> dict:
+    step = dna_step_for(anchor, dna_step)
     signal = dna_signal_for(cfg.dna_code, step)
     price = float(snapshot["price"])
     holdings = float(snapshot.get("holdings", 0.0) or 0.0)
