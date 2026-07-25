@@ -687,3 +687,33 @@ def test_row_doc_tagged_with_semantics(fake_db):
     from lego_state import CASHFLOW_SEMANTICS
     doc = next(iter(fake_db["webull_lego_rows"].values()))
     assert doc["semantics"] == CASHFLOW_SEMANTICS == "gated_theoretical_v2"
+
+
+# --- vanished-position predicate and gate-array fingerprint ------------------
+
+def test_holdings_continuity_only_refuses_a_vanished_position():
+    from lego_one_row import Anchor, HoldingsAnomaly, check_holdings_continuity
+
+    def anchor(prev_holdings):
+        return Anchor(version=1, dna_step=1, p0=100.0, prev_price=100.0,
+                      prev_actual=0.0, prev_holdings=prev_holdings)
+
+    check_holdings_continuity(None, 0.0)              # genesis: no reference yet
+    check_holdings_continuity(anchor(None), 0.0)      # state written before the field
+    check_holdings_continuity(anchor(0.0), 0.0)       # flat stays flat
+    check_holdings_continuity(anchor(15.0), 4.0)      # a sell is ordinary
+    check_holdings_continuity(anchor(15.0), 15.0)
+    with pytest.raises(HoldingsAnomaly):
+        check_holdings_continuity(anchor(15.0), 0.0)
+
+
+def test_dna_fingerprint_tracks_the_array_not_the_code():
+    from dna_engine import dna_fingerprint, decode_dna
+
+    # Same array from two different spellings of bypass -> same fingerprint.
+    assert decode_dna("bypass:50") == decode_dna("[1, 50]")
+    assert dna_fingerprint("bypass:50") == dna_fingerprint("[1, 50]")
+    # Different arrays -> different fingerprints.
+    assert dna_fingerprint("bypass:50") != dna_fingerprint("bypass:51")
+    assert dna_fingerprint("26021034252903219354832053493") != dna_fingerprint("bypass:26")
+    assert len(dna_fingerprint("bypass:50")) == 16

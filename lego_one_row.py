@@ -36,6 +36,10 @@ class RowValidationError(RuntimeError):
     pass
 
 
+class HoldingsAnomaly(RuntimeError):
+    """The chain last saw a position; this snapshot says there is none."""
+
+
 @dataclass(frozen=True)
 class Anchor:
     version: int
@@ -64,6 +68,33 @@ class Config:
             raise ValueError("diff ต้อง finite และ >= 0")
         if not (0 <= self.decimal_precision <= 5):
             raise ValueError("decimal_precision ต้อง 0..5")
+
+
+def check_holdings_continuity(anchor: Anchor | None, holdings: float) -> None:
+    """Refuse a snapshot that says the position vanished.
+
+    _extract_qty returns 0.0 both when the account is genuinely flat and when a
+    well-formed positions response simply does not mention the symbol. The two
+    are indistinguishable at the adapter, and the second one is the worst
+    possible input: value = 0 makes gap = fix_c, the largest order the strategy
+    can ever produce, placed on top of a position we already hold. Nothing
+    downstream catches it — the dispatch-time drift check compares two readings
+    from the same source, preview passes because the cash is real, and the
+    17-column ledger is theoretical and never reads filled quantity. A broker
+    that keeps answering that way buys fix_c again every slot until buying power
+    runs out.
+
+    A rebalance can never produce it either: a SELL targets value fix_c, so it
+    leaves fix_c/price > 0 shares behind. Holdings reaching exactly zero while
+    the chain remembers a position is therefore not a market event, and only
+    that case is refused — a partial drop is ordinary and stays silent.
+    """
+    if anchor is None or anchor.prev_holdings is None:
+        return                       # genesis, or state written before the field
+    if anchor.prev_holdings > 0 and holdings == 0:
+        raise HoldingsAnomaly(
+            f"chain เคยถือ {anchor.prev_holdings} หุ้น แต่ snapshot นี้อ่านได้ 0 — "
+            "อาจเป็น positions response ที่ไม่ครบ ไม่ใช่การถือ 0 จริง จึงไม่ commit")
 
 
 def dna_step_for(anchor: Anchor | None, explicit_step: int | None = None) -> int:

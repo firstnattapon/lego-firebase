@@ -15,6 +15,7 @@ invariant:
 """
 from __future__ import annotations
 
+import hashlib
 import json
 from dataclasses import dataclass, field
 from functools import lru_cache
@@ -141,6 +142,23 @@ def decode_dna(dna_code: str) -> list[int]:
     if not isinstance(dna_code, str):
         raise DNAError(f"dna_code ผิดรูปแบบ: {dna_code!r}")
     return list(_decode_cached(dna_code))
+
+
+def dna_fingerprint(dna_code: str) -> str:
+    """Digest of the decoded gate array — not of the code that produced it.
+
+    The gate array is the only derived artifact that decides every row, and it
+    was the only one with no guard: config_hash covers the dna_code string and
+    calendar_fingerprint covers the slot grid, so nothing noticed if the same
+    string decoded to a different array. It can, because numpy documents that
+    Generator "does not provide a version compatibility guarantee... the bit
+    stream may change", and requirements let numpy move. Storing this on the
+    chain makes that change fail closed instead of silently trading a different
+    strategy under the same name.
+    """
+    return hashlib.sha256(
+        ",".join(str(b) for b in _decode_cached(dna_code)).encode()
+    ).hexdigest()[:16]
 
 
 def dna_summary(dna_code: str) -> dict:

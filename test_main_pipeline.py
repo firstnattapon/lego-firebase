@@ -5,7 +5,7 @@ that slot provenance reaches Firebase.
 """
 from __future__ import annotations
 
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 import pytest
 
@@ -251,3 +251,96 @@ def test_whole_share_quantity_is_not_truncated(monkeypatch, auto_submit):
     assert body["status"] == "READY_BUY"
     main._run_order_worker(main.load_config(), limit=1)
     assert sent and sent[0][0]["quantity"] == "20"
+
+
+# --- a snapshot that loses the position must never become an order -----------
+
+def test_vanished_holdings_fails_closed(monkeypatch):
+    """gap = fix_c is the largest order the strategy can make; it must not come
+    from a positions response that simply forgot the symbol."""
+    _run(monkeypatch, SESSION_OPEN_SLOT, 320.0, holdings=9.0)
+    state_ref = FAKE_DB.reference(f"{STATE_PATH}/{chain_key(main.load_config())}")
+    before = state_ref.get()["version"]
+
+    body, code = _run(monkeypatch, datetime(2026, 7, 23, 18, 30, 5, tzinfo=UTC),
+                      320.0, holdings=0.0)
+    assert code == 409 and body["pipeline_status"] == "HOLDINGS_ANOMALY"
+    assert body["committed"] is False
+    assert state_ref.get()["version"] == before        # pointer + prev_holdings intact
+    assert state_ref.get()["prev_holdings"] == 9.0
+
+
+def test_zero_holdings_never_compounds_across_slots(monkeypatch, auto_submit):
+    """The damage was never one bad order: a broker that keeps answering 0 used
+    to buy fix_c again every slot until buying power ran out."""
+    placed = []
+    monkeypatch.setattr(main, "preview_market_order", lambda tc, o: True)
+    monkeypatch.setattr(main, "fetch_open_orders", lambda tc, s: [])
+    monkeypatch.setattr(main, "fetch_order_detail", lambda tc, r: {"order_status": "FILLED"})
+    monkeypatch.setattr(main, "place_market_order",
+                        lambda tc, o: placed.append(o[0]["quantity"]) or {"order_status": "FILLED"})
+    _run(monkeypatch, SESSION_OPEN_SLOT, 100.0, holdings=15.0)
+    main._run_order_worker(main.load_config(), limit=3)
+    placed.clear()
+
+    # 18:30, 19:00, 19:30 — the rest of this session, all reading a lost position
+    for i in (1, 2, 3):
+        body, code = _run(monkeypatch,
+                          SESSION_OPEN_SLOT + timedelta(minutes=30 * i), 100.0, holdings=0.0)
+        assert code == 409 and body["pipeline_status"] == "HOLDINGS_ANOMALY"
+        main._run_order_worker(main.load_config(), limit=3)
+    assert placed == []
+
+
+def test_genesis_and_legacy_state_are_not_blocked(monkeypatch):
+    body, code = _run(monkeypatch, SESSION_OPEN_SLOT, 320.0, holdings=0.0)
+    assert code == 200 and body["committed"] is True       # genesis has no reference
+
+    ref = FAKE_DB.reference(f"{STATE_PATH}/{chain_key(main.load_config())}")
+    state = ref.get()
+    state.pop("prev_holdings")                             # state written before the field
+    ref.set(state)
+    body, code = _run(monkeypatch, datetime(2026, 7, 23, 18, 30, 5, tzinfo=UTC),
+                      321.0, holdings=0.0)
+    assert code == 200 and body["committed"] is True
+
+
+def test_flat_chain_stays_flat_without_complaining(monkeypatch):
+    """prev_holdings = 0 -> 0 is not an anomaly, it is an unchanged position."""
+    _run(monkeypatch, SESSION_OPEN_SLOT, 320.0, holdings=0.0)
+    body, code = _run(monkeypatch, datetime(2026, 7, 23, 18, 30, 5, tzinfo=UTC),
+                      321.0, holdings=0.0)
+    assert code == 200 and body["committed"] is True
+
+
+def test_partial_drop_is_ordinary_and_allowed(monkeypatch):
+    _run(monkeypatch, SESSION_OPEN_SLOT, 320.0, holdings=9.0)
+    body, code = _run(monkeypatch, datetime(2026, 7, 23, 18, 30, 5, tzinfo=UTC),
+                      321.0, holdings=4.0)
+    assert code == 200 and body["committed"] is True
+
+
+def test_operator_can_acknowledge_a_real_liquidation(monkeypatch):
+    monkeypatch.setenv("LEGO_ALLOW_ZERO_HOLDINGS", "true")
+    _run(monkeypatch, SESSION_OPEN_SLOT, 320.0, holdings=9.0)
+    body, code = _run(monkeypatch, datetime(2026, 7, 23, 18, 30, 5, tzinfo=UTC),
+                      321.0, holdings=0.0)
+    assert code == 200 and body["committed"] is True
+
+
+# --- the gate array is now guarded like the calendar ------------------------
+
+def test_same_dna_code_decoding_differently_fails_closed(monkeypatch):
+    """numpy documents no stream guarantee for Generator, so the decoded array
+    can change while dna_code and config_hash stay identical."""
+    import lego_state
+    _run(monkeypatch, SESSION_OPEN_SLOT, 320.0)
+    state_ref = FAKE_DB.reference(f"{STATE_PATH}/{chain_key(main.load_config())}")
+    assert state_ref.get()["dna_fingerprint"]
+    before = state_ref.get()["version"]
+
+    monkeypatch.setattr(lego_state, "dna_fingerprint", lambda code: "different0000000")
+    body, code = _run(monkeypatch, datetime(2026, 7, 23, 18, 30, 5, tzinfo=UTC), 321.0)
+    assert code == 409 and body["pipeline_status"] == "DNA_DRIFT"
+    assert body["committed"] is False
+    assert state_ref.get()["version"] == before

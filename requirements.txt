@@ -1,5 +1,11 @@
+# numpy is pinned exactly, not floated. The DNA gate array comes from
+# np.random.default_rng, and numpy documents that Generator "does not provide a
+# version compatibility guarantee ... the bit stream may change". A minor
+# upgrade could therefore decode the same dna_code into a different strategy.
+# The stored dna_fingerprint makes that fail closed; this pin keeps it from
+# happening in the first place. Change it only with a fingerprint check.
+numpy==2.4.6
 functions-framework==3.*
 firebase-admin==6.*
-numpy>=1.26
 webull-openapi-python-sdk
 tzdata>=2024.1

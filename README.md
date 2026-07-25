@@ -128,6 +128,8 @@ gcloud scheduler jobs run lego-tick --location=$REGION --project=$PROJECT
 | `STALE_ANCHOR` | 409 | anchor ไม่ตรง state |
 | `CALENDAR_DRIFT` | 409 | ปฏิทิน/slot config เปลี่ยนหลัง commit แรก |
 | `ORDINAL_REGRESSION` | 409 | slot ใหม่ให้ ordinal ที่ไม่เดินหน้า — DNA เดินถอยไม่ได้ |
+| `HOLDINGS_ANOMALY` | 409 | chain เคยเห็นของ แต่ snapshot อ่านได้ 0 — ไม่ commit ไม่ยิง order |
+| `DNA_DRIFT` | 409 | `dna_code` เดิมแต่ decode ได้ gate array คนละชุด (มักคือ numpy เปลี่ยนเวอร์ชัน) |
 | `CONFIG_ERROR` | 500 | `LEGO_SLOT_SECONDS` ไม่ตั้ง/ไม่รองรับ |
 | `SNAPSHOT_OR_ENGINE_ERROR` | 500/503 | 503 เมื่อเป็น transient |
 
@@ -142,3 +144,7 @@ gcloud scheduler jobs run lego-tick --location=$REGION --project=$PROJECT
 8. order ใบเดียวที่ค้างต้องไม่ขวางใบถัดไป — `PLACING_UNKNOWN` มีเพดาน
    (`LEGO_RECONCILE_MAX_ATTEMPTS`) แล้วจบเป็น `RECONCILE_ABANDONED` + `needs_manual_check`
 9. จำนวนที่ส่ง broker ต้องเท่าจำนวนที่ตัดสินใจเสมอ ทุกค่า `LEGO_DECIMAL_PRECISION` รวม `0`
+10. snapshot ที่ทำให้ของหายไปทั้งก้อนต้องไม่กลายเป็น order — `gap = FIX_C` คือ order ใหญ่สุด
+    ที่กลยุทธ์สร้างได้ และการ rebalance ปกติทำให้ holdings เป็น 0 ไม่ได้
+11. `dna_code` เดิมต้อง decode ได้ gate array เดิมตลอดอายุ chain — `dna_fingerprint` ใน state
+    บังคับข้อนี้ และ `numpy` ถูก pin ตายตัวเพราะ `Generator` ไม่รับประกัน bit stream ข้ามเวอร์ชัน
