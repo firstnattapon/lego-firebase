@@ -26,27 +26,20 @@ def _confirmation_phrase(side, quantity, symbol, step) -> str:
 
 
 def order_confirmation_phrase(row: dict) -> str:
-    """The phrase the dispatcher intends to submit, built from the pending row."""
+    """Side, quantity, symbol and step of one row, in one comparable line."""
     m = row["_meta"]
     return _confirmation_phrase(m["side"], m["quantity"], row["สินทรัพย์"], m["step"])
 
 
-def committed_row_confirmation_phrase(doc: dict) -> str:
-    """The same phrase rebuilt from the committed 17 columns in RTDB.
-
-    This is what makes the confirmation gate mean something. Both sides used to
-    be generated from the same object, so the check compared a value with itself
-    and could not fail. The committed row is an independent witness: it is what
-    the engine actually decided and persisted, so an intent whose side, quantity,
-    symbol or step drifted from it now fails the gate instead of reaching the
-    broker.
-    """
-    return _confirmation_phrase(doc.get("ฝั่ง"), doc.get("จำนวนสั่ง (หุ้น)") or 0.0,
-                                doc.get("สินทรัพย์"), doc.get("DNA step") or 0)
-
-
 def evaluate_submit_gate(environment: str, row: dict, preview_ok: bool,
                          confirmation_input: str, committed: bool) -> None:
+    """Refuse anything that is not exactly what the engine committed.
+
+    `row` must be the committed row and `confirmation_input` the phrase of the
+    intent about to be sent — two sources that travelled separately. Generating
+    both from the same object makes the last check compare a value with itself,
+    which is how it silently stopped being a check at all.
+    """
     if environment != UAT:
         raise SubmitGateError(f"ส่ง order ได้เฉพาะ {UAT}; ปัจจุบัน={environment}")
     if not committed:
