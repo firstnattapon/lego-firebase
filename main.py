@@ -93,10 +93,48 @@ def _persist_summary(intent: dict, summary: dict) -> None:
              {**summary, "status": normalize_status(summary.get("status"))})
 
 
-def _persist_error(chain_key_: str, run_id: str, status: str, exc: Exception) -> dict:
+def _persist_error(chain_key_: str, run_id: str, status: str, exc: Exception,
+                   extra: dict | None = None) -> dict:
     err = f"{type(exc).__name__}: {exc}"
-    _persist(chain_key_, run_id, {"status": status, "last_error": err[:500]})
+    _persist(chain_key_, run_id,
+             {"status": status, "last_error": err[:500], **(extra or {})})
     return {"run_id": run_id, "status": status, "error": err}
+
+
+def _reconcile_max_attempts() -> int:
+    return max(1, int(os.environ.get("LEGO_RECONCILE_MAX_ATTEMPTS", "20")))
+
+
+def _persist_reconcile_failure(intent: dict, exc: Exception) -> dict:
+    """Bound the reconcile loop so one unresolvable order cannot jam the outbox.
+
+    PLACING_UNKNOWN is deliberately non-terminal: an order we failed to confirm
+    may still exist at the broker, so the worker must ask again. But nothing
+    counted the asking. An order the broker never accepted answers 'UNKNOWN'
+    forever, and because list_actionable serves oldest-first up to
+    LEGO_ORDER_WORKER_LIMIT, three such intents starve every later decision —
+    the DNA keeps committing rows while no order is ever sent again.
+
+    Past the bound the outbox stops asking and says so. The open question is not
+    dropped: the order audit keeps run_id, last_error and needs_manual_check,
+    and the dashboard already renders that table.
+    """
+    ck, run_id = intent["chain_key"], intent["run_id"]
+    attempts = int(intent.get("reconcile_attempts", 0) or 0) + 1
+    # last_error is overwritten every tick, and by the time a human reads it the
+    # useful message ("insufficient buying power") has been buried under the
+    # generic one. Keep the first failure, which is the one that explains why.
+    extra = {"reconcile_attempts": attempts}
+    if not intent.get("first_error"):
+        extra["first_error"] = f"{type(exc).__name__}: {exc}"[:500]
+    if attempts < _reconcile_max_attempts():
+        return _persist_error(ck, run_id, "PLACING_UNKNOWN", exc, extra)
+    return _persist_error(ck, run_id, "RECONCILE_ABANDONED", exc, {
+        **extra,
+        "needs_manual_check": True,
+        "terminal_reason": (f"broker ไม่ยืนยันสถานะครบ {attempts} ครั้ง — "
+                            "ต้องเช็คที่ broker เองว่า order นี้มีจริงหรือไม่"),
+    })
 
 
 def _pending_row_shape(intent: dict) -> dict:
@@ -137,7 +175,7 @@ def _dispatch_or_reconcile_one(trade_client, data_client, cfg, intent: dict) -> 
             _persist_summary(intent, summary)
             return {"run_id": run_id, **summary}
         except Exception as exc:
-            return _persist_error(ck, run_id, "PLACING_UNKNOWN", exc)
+            return _persist_reconcile_failure(intent, exc)
 
     if status != "PENDING_DISPATCH":
         return {"run_id": run_id, "status": status}
@@ -165,7 +203,6 @@ def _dispatch_or_reconcile_one(trade_client, data_client, cfg, intent: dict) -> 
         return _stop(ck, run_id, "NOT_PLACED", {"terminal_reason": f"environment={env}"})
 
     row = _pending_row_shape(intent)
-    order = build_order_payload(cfg, intent["side"], float(intent["quantity"]), run_id)
     write_order_audit(run_id, {
         "run_id": run_id, "chain_key": ck, "side": intent["side"],
         "quantity": float(intent["quantity"]), "symbol": cfg.symbol,
@@ -173,6 +210,10 @@ def _dispatch_or_reconcile_one(trade_client, data_client, cfg, intent: dict) -> 
         "placed_at": intent["created_at"],
     })
     try:
+        # Building the payload is part of the gate: a quantity that cannot be
+        # expressed at this precision must end the intent, not abort the whole
+        # worker run and leave the other intents of this tick unprocessed.
+        order = build_order_payload(cfg, intent["side"], float(intent["quantity"]), run_id)
         preview_ok = preview_market_order(trade_client, order)
         evaluate_submit_gate(env, row, preview_ok,
                              order_confirmation_phrase(row), committed=True)
@@ -187,7 +228,9 @@ def _dispatch_or_reconcile_one(trade_client, data_client, cfg, intent: dict) -> 
         _persist_summary(intent, summary)
         return {"run_id": run_id, **summary}
     except Exception as exc:
-        return _persist_error(ck, run_id, "PLACING_UNKNOWN", exc)
+        # Same open question as a failed reconcile — "does this order exist?" —
+        # so it draws on the same bounded budget.
+        return _persist_reconcile_failure(intent, exc)
 
 
 def _outbox_intent(cfg, row: dict, snapshot: dict, slot, decision_time: datetime) -> dict:

@@ -13,6 +13,10 @@ ROWS_PATH = "webull_lego_rows"
 TERMINAL = {
     "FILLED", "CANCELLED", "FAILED", "REJECTED", "EXPIRED_UNSENT",
     "SUPPRESSED_ACTIVE_ORDER", "SUPPRESSED_STATE_CHANGED", "NOT_PLACED",
+    # The broker never resolved this order and the reconcile budget ran out.
+    # Terminal for dispatch only — the order audit keeps needs_manual_check so
+    # a human still answers whether the order exists.
+    "RECONCILE_ABANDONED",
 }
 
 
