@@ -23,7 +23,7 @@ ALLOWED_SLOT_SECONDS = {900: "15m", 1800: "30m", 3600: "1h",
                         14400: "4h", 86400: "1d"}
 # Bump when the built-in holiday/early-close rules change; it re-keys the
 # calendar fingerprint so an existing chain fails closed instead of re-phasing.
-CALENDAR_RULES_VERSION = "2026-07-nyse-v1"
+CALENDAR_RULES_VERSION = "2026-07-nyse-v2"
 CLOCK_MODES = ("shadow", "market", "legacy")
 
 
@@ -80,6 +80,19 @@ def _easter_sunday(year: int) -> date:
     return date(year, month, day)
 
 
+def _new_year_observed(d: date) -> date | None:
+    """Jan 1 อาทิตย์ -> จันทร์ 2; Jan 1 เสาร์ -> ไม่ observe เลย
+
+    NYSE Rule 7.2 ยกเว้นกรณี 'unusual business conditions such as the ending of a
+    monthly or yearly accounting period' — 31 ธ.ค. เป็นวันสิ้นเดือน/ไตรมาส/ปี จึง
+    เป็นวันเทรดเต็มวัน คืน Dec 31 เป็นวันหยุดจะทำให้ N_j = 0 และ ordinal เลื่อน
+    ถาวรเทียบ bar index ที่เทรนมา โดยที่ fingerprint guard จับไม่ได้
+    """
+    if d.weekday() == 5:
+        return None
+    return d + timedelta(days=1) if d.weekday() == 6 else d
+
+
 @lru_cache(maxsize=64)
 def _holiday_set(year: int, declared: str) -> frozenset[date]:
     """Cached per (year, declared holidays) so the cache can never go stale.
@@ -89,7 +102,7 @@ def _holiday_set(year: int, declared: str) -> frozenset[date]:
     fingerprint guard exists to prevent.
     """
     holidays = {
-        _observed(date(year, 1, 1)),
+        # New Year ใช้กฎเฉพาะของมัน (ดู _new_year_observed) ไม่ใช้ _observed
         _nth_weekday(year, 1, 0, 3),       # MLK
         _nth_weekday(year, 2, 0, 3),       # Presidents Day
         _easter_sunday(year) - timedelta(days=2),
@@ -101,8 +114,9 @@ def _holiday_set(year: int, declared: str) -> frozenset[date]:
     }
     if year >= 2022:
         holidays.add(_observed(date(year, 6, 19)))  # Juneteenth
-    # New Year's observed can fall in the previous year.
-    holidays.add(_observed(date(year + 1, 1, 1)))
+    ny = _new_year_observed(date(year, 1, 1))
+    if ny is not None:
+        holidays.add(ny)
     for raw in declared.split(","):
         raw = raw.strip()
         if raw:
@@ -122,9 +136,9 @@ def _early_close(d: date) -> bool:
     # Christmas Eve when it is a weekday and not itself an observed holiday.
     if d.month == 12 and d.day == 24 and d.weekday() < 5:
         return True
-    # Common Independence Day early closes.
-    if d.month == 7 and ((d.day == 3 and d.weekday() < 5) or
-                         (d.day == 2 and d.weekday() == 4)):
+    # July 3 เมื่อเป็นวันทำการ. ไม่มีเคส July 2: ถ้า July 4 ตกวันอาทิตย์ holiday
+    # จริงคือจันทร์ 5 ก.ค. และปฏิทินทางการไม่มี early close เดือน ก.ค. ปีนั้น
+    if d.month == 7 and d.day == 3 and d.weekday() < 5:
         return True
     extra = os.environ.get("LEGO_MARKET_EARLY_CLOSES", "")
     return d.isoformat() in {x.strip() for x in extra.split(",") if x.strip()}

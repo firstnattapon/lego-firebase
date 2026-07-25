@@ -226,10 +226,15 @@ def commit_final_row(cfg: Config, snapshot: dict, anchor: Anchor | None, row: di
         }
         if slot_id is not None:
             next_state["slot_id"] = slot_id
-            if not slot_id.startswith("epoch:"):
-                # A degraded (clock-less) commit makes no claim about the
-                # calendar, so it must not pin one onto the chain.
-                next_state["calendar_fingerprint"] = calendar_fingerprint()
+        if slot_id is not None and not slot_id.startswith("epoch:"):
+            next_state["calendar_fingerprint"] = calendar_fingerprint()
+        elif current and current.get("calendar_fingerprint"):
+            # A degraded commit makes no claim about the calendar, so it must not
+            # pin a new one — but dropping the chain's existing fingerprint would
+            # disarm the drift guard for every commit after it, exactly when the
+            # clock has just proven unreliable. Carry it forward, same reason as
+            # market_ordinal below.
+            next_state["calendar_fingerprint"] = current["calendar_fingerprint"]
         if market_ordinal is not None:
             next_state["market_ordinal"] = int(market_ordinal)
         elif current and current.get("market_ordinal") is not None:
