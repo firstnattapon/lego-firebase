@@ -167,7 +167,7 @@ gcloud functions deploy lego-one-row \
   --no-allow-unauthenticated \
   --memory=512Mi \
   --timeout=120s \
-  --set-env-vars="FIREBASE_DB_URL=$DB_URL,WEBULL_ENV=UAT,LEGO_SYMBOL=APLS,LEGO_FIX_C=1500,LEGO_DIFF=60,LEGO_DNA_CODE=bypass:100,LEGO_DECIMAL_PRECISION=5,LEGO_SLOT_SECONDS=1800,AUTO_SUBMIT=false" \
+  --set-env-vars="FIREBASE_DB_URL=$DB_URL,WEBULL_ENV=UAT,LEGO_SYMBOL=APLS,LEGO_FIX_C=1500,LEGO_DIFF=60,LEGO_DNA_CODE=bypass:100,LEGO_DECIMAL_PRECISION=5,LEGO_SLOT_SECONDS=1800,LEGO_DNA_ORIGIN_UTC=2026-07-23T13:30:00Z,LEGO_DNA_CLOCK_MODE=market,AUTO_SUBMIT=false" \
   --set-secrets="WEBULL_APP_KEY=webull-app-key:latest,WEBULL_APP_SECRET=webull-app-secret:latest,WEBULL_ACCOUNT_ID=webull-account-id:latest"
 ```
 
@@ -208,7 +208,8 @@ gcloud functions deploy lego-one-row \
 | env | default | ความหมาย |
 |---|---|---|
 | `LEGO_DNA_CLOCK_MODE` | `shadow` | `shadow` = เดิน step ตาม anchor+1 แล้วรายงานส่วนต่างเฉย ๆ · `market` = ใช้ market ordinal เป็นตัวจริง · `legacy` = ของเดิมไว้ rollback |
-| `LEGO_DNA_ORIGIN_UTC` | — | เวลาเริ่มนับ ordinal · หาได้จาก `find_origin.py` · ไม่ตั้ง = โหมด degraded (mode `market` จะ error) |
+| `LEGO_DNA_ORIGIN_UTC` | — | เวลาเริ่มนับ ordinal · หาได้จาก `find_origin.py` · ไม่ตั้ง = โหมด degraded (mode `market` จะ error) · ⚠️ **degraded + `AUTO_SUBMIT=true` = แถว commit ปกติ แต่ไม่มี order intent ถูกสร้างเลย** — response จะมี `outbox_skipped` และนับสะสมที่ `webull_lego_warnings/degraded_clock_no_order` |
+| `LEGO_DNA_LOW_WATERMARK` | `10` | DNA เหลือน้อยกว่าค่านี้ → response แนบ `dna_steps_remaining` มาเตือนก่อนจะเจอ `DNA_EXHAUSTED` |
 | `LEGO_MARKET_HOLIDAYS` | — | CSV วันที่ ISO เพิ่มเข้าปฏิทินวันหยุด เช่น `2026-01-02` |
 | `LEGO_MARKET_EARLY_CLOSES` | — | CSV วันที่ ISO ที่ปิด 13:00 ET |
 
@@ -221,6 +222,30 @@ gcloud functions deploy lego-one-row \
 | `LEGO_ORDER_EXPIRY_MARGIN_SECONDS` | `15` | กันส่ง order คาบเกี่ยว slot ถัดไป |
 | `LEGO_HOLDINGS_DRIFT_TOLERANCE` | `0.000001` | holdings เปลี่ยนเกินนี้ระหว่างรอส่ง = `SUPPRESSED_STATE_CHANGED` |
 | `LEGO_RECONCILE_MAX_ATTEMPTS` | `20` | ถาม broker ซ้ำได้กี่ครั้งก่อนยอมแพ้เป็น `RECONCILE_ABANDONED` (ที่ `*/5` = ~100 นาที) — กัน order ที่ broker ไม่เคยรับ วนถามไม่รู้จบจนเบียด intent ใหม่ทั้งหมด |
+
+**archive worker** (`lego_archive_worker` — งานบ้าน ยิงวันละครั้งพอ):
+
+| env | default | ความหมาย |
+|---|---|---|
+| `LEGO_ARCHIVE_RETENTION_DAYS` | `30` | intent/audit ที่ terminal แล้วและเก่ากว่านี้ ถูกย้ายไป `*_archive` (ย้าย ไม่ลบ) |
+| `LEGO_ARCHIVE_LIMIT` | `500` | ย้ายได้สูงสุดกี่ record ต่อการเรียก 1 ครั้ง |
+
+> ไม่ย้าย 2 อย่างเสมอ: record ที่ `needs_manual_check` (ยังรอคนตอบ) และ record ที่ไม่มี timestamp
+> (บอกอายุไม่ได้ = ยังไม่เก่าพอ)
+
+---
+
+## 6.0) ⏱️ ตั้ง `LEGO_DNA_ORIGIN_UTC` ตั้งแต่ deploy แรก
+
+คำสั่ง deploy ข้างบนใส่ `LEGO_DNA_ORIGIN_UTC` + `LEGO_DNA_CLOCK_MODE=market` มาให้แล้ว —
+**ค่า origin ในตัวอย่างเป็นแค่ตัวอย่าง ต้องหาของตัวเองก่อน** ด้วย
+`python find_origin.py <dna_step ถัดไป>` (อธิบายเต็มที่ข้อ 7.5)
+
+ถ้ายังไม่พร้อมเปิด mode `market` ให้เอา 2 ตัวนี้ออกได้ แต่ต้องรู้ว่าเกิดอะไรขึ้น:
+ไม่มี origin = market clock resolve ไม่ได้ = โหมด **degraded** ซึ่งยัง commit แถวได้ปกติ
+แต่ **สร้าง order intent ไม่ได้เลยสักใบ** (ไม่มี slot จึงคำนวณ `expires_at` ไม่ได้)
+ระบบจะบอกทุกครั้งด้วย `outbox_skipped` ใน response และนับสะสมไว้ที่
+`webull_lego_warnings/degraded_clock_no_order` — ตั้ง alert ที่ node นี้ได้เลย
 
 ---
 
@@ -245,7 +270,7 @@ gcloud functions deploy lego-order-worker \
   --no-allow-unauthenticated \
   --memory=512Mi \
   --timeout=300s \
-  --set-env-vars="FIREBASE_DB_URL=$DB_URL,WEBULL_ENV=UAT,LEGO_SYMBOL=APLS,LEGO_FIX_C=1500,LEGO_DIFF=60,LEGO_DNA_CODE=bypass:100,LEGO_DECIMAL_PRECISION=5,LEGO_SLOT_SECONDS=1800,AUTO_SUBMIT=false" \
+  --set-env-vars="FIREBASE_DB_URL=$DB_URL,WEBULL_ENV=UAT,LEGO_SYMBOL=APLS,LEGO_FIX_C=1500,LEGO_DIFF=60,LEGO_DNA_CODE=bypass:100,LEGO_DECIMAL_PRECISION=5,LEGO_SLOT_SECONDS=1800,LEGO_DNA_ORIGIN_UTC=2026-07-23T13:30:00Z,LEGO_DNA_CLOCK_MODE=market,AUTO_SUBMIT=false" \
   --set-secrets="WEBULL_APP_KEY=webull-app-key:latest,WEBULL_APP_SECRET=webull-app-secret:latest,WEBULL_ACCOUNT_ID=webull-account-id:latest"
 ```
 
@@ -257,6 +282,46 @@ worker จะทำตามลำดับนี้ทุกครั้ง แ
 แถว committed แล้วหรือยัง → ตามผล order ที่ค้างอยู่ → หมดอายุ slot แล้วหรือยัง →
 มี order เปิดค้างไหม → holdings เปลี่ยนไปหรือยัง → เป็น UAT ไหม → preview + submit gate →
 place → poll สถานะ → มี fill จริงจึงบันทึก realized
+
+---
+
+## 6.2) 🗄️ Deploy function ตัวที่สาม — `lego-archive-worker` (งานบ้าน)
+
+ไม่ deploy ก็เทรดได้ แต่ `webull_lego_order_outbox` และ `webull_lego_order_audit`
+จะโตขึ้นทุก slot ตลอดไป และทั้ง order worker กับ dashboard ต้อง **โหลดทั้ง path**
+ทุกครั้งเพื่อหา record ที่ยังมีชีวิตไม่กี่ใบ ตัวนี้ย้าย record ที่จบแล้วและเก่ากว่า
+`LEGO_ARCHIVE_RETENTION_DAYS` ไปไว้ที่ `*_archive` (ย้าย ไม่ลบ — ยังสอบย้อนหลังได้)
+
+```bash
+gcloud functions deploy lego-archive-worker \
+  --gen2 \
+  --runtime=python312 \
+  --region="$REGION" \
+  --source=. \
+  --entry-point=lego_archive_worker \
+  --trigger-http \
+  --no-allow-unauthenticated \
+  --memory=512Mi \
+  --timeout=300s \
+  --set-env-vars="FIREBASE_DB_URL=$DB_URL,WEBULL_ENV=UAT,LEGO_SYMBOL=APLS,LEGO_FIX_C=1500,LEGO_DIFF=60,LEGO_DNA_CODE=bypass:100,LEGO_DECIMAL_PRECISION=5,LEGO_SLOT_SECONDS=1800,LEGO_DNA_ORIGIN_UTC=2026-07-23T13:30:00Z,LEGO_DNA_CLOCK_MODE=market,AUTO_SUBMIT=false" \
+  --set-secrets="WEBULL_APP_KEY=webull-app-key:latest,WEBULL_APP_SECRET=webull-app-secret:latest,WEBULL_ACCOUNT_ID=webull-account-id:latest"
+```
+
+ตั้งนาฬิกาวันละครั้งหลังตลาดปิดก็พอ:
+
+```bash
+export ARCHIVE_URL="$(gcloud functions describe lego-archive-worker --gen2 --region="$REGION" --format='value(serviceConfig.uri)')"
+
+gcloud scheduler jobs create http lego-archive-tick \
+  --location="$REGION" \
+  --schedule="30 22 * * *" \
+  --time-zone="UTC" \
+  --max-retry-attempts=0 \
+  --uri="$ARCHIVE_URL" \
+  --http-method=POST \
+  --oidc-service-account-email="$FUNCTION_SA" \
+  --oidc-token-audience="$ARCHIVE_URL"
+```
 
 ---
 
@@ -466,6 +531,22 @@ gcloud functions describe lego-one-row --gen2 --region="$REGION" --format='value
 | `ORDINAL_REGRESSION` | slot ให้ ordinal ที่ไม่เดินหน้า | ตรวจ origin/เวลาเครื่อง — DNA เดินถอยไม่ได้ |
 | `HOLDINGS_ANOMALY` | chain เคยเห็นของ แต่ snapshot อ่านได้ 0 | เช็คที่ broker ว่ายังถืออยู่ไหม · ถ้าถืออยู่จริง = positions response ไม่ครบ รอรอบหน้า · ถ้าขายทิ้งไปจริง ตั้ง `LEGO_ALLOW_ZERO_HOLDINGS=true` 1 รอบแล้วเอาออก |
 | `DNA_DRIFT` | `dna_code` เดิม แต่ decode ได้ gate array คนละชุด | เกือบทั้งหมดคือ **numpy เปลี่ยนเวอร์ชัน** — คืน numpy ตัวที่ pin ไว้ใน `requirements.txt` หรือเริ่ม chain ใหม่ ห้ามปล่อยผ่าน (= เทรดคนละกลยุทธ์ใต้ชื่อเดิม) |
+| `DNA_EXHAUSTED` | DNA เดินจนหมด array แล้ว (HTTP 200 ไม่ใช่ error) | ต่อ DNA ที่ยาวกว่าเดิม (= chain ใหม่ เพราะ `config_hash` เปลี่ยน) หรือหยุด scheduler ของ chain นี้ · ป้องกันล่วงหน้าด้วย `dna_steps_remaining` ที่ response แนบมาเมื่อใกล้หมด |
+
+field เตือนใน response ของแถวที่ commit สำเร็จ (ไม่มี field = ไม่มีอะไรต้องดู):
+
+| field | แปลว่า | ต้องทำอะไร |
+|---|---|---|
+| `outbox_skipped` | แถวเป็น `READY_*` และเปิด `AUTO_SUBMIT` แล้ว แต่ **ไม่มี order intent ถูกสร้าง** เพราะ clock degraded | ตั้ง `LEGO_DNA_ORIGIN_UTC` (ข้อ 7.5) — ระหว่างนี้ DNA เดินต่อแต่ไม่มีคำสั่งซื้อขายออกเลย |
+| `outbox_error` | สร้าง intent ไม่สำเร็จ (แถว commit แล้ว ไม่ rollback) | ดู error แล้วเช็ค RTDB rules/quota · slot ถัดไปยังทำงานปกติ |
+| `clock_warning` | resolve slot ไม่ได้ จึงเดินด้วย legacy step | เหมือน `outbox_skipped` — ต้นเหตุเดียวกัน |
+| `dna_steps_remaining` | DNA เหลือน้อยกว่า `LEGO_DNA_LOW_WATERMARK` | เตรียม DNA ชุดใหม่ก่อนถึง `DNA_EXHAUSTED` |
+
+สถานะ outbox ที่ต้องมีคนเข้าไปดู (นอกจาก `RECONCILE_ABANDONED`):
+
+| status | แปลว่า | ต้องทำอะไร |
+|---|---|---|
+| `REALIZED_MATH_ERROR` | **order fill สำเร็จแล้วที่ broker** แต่คำนวณ realized ต่อไม่ได้ (ตัวเลข cumulative fill ที่ได้มาทำให้ราคาต่อหน่วยของส่วนเพิ่ม ≤ 0) | ห้ามส่ง order ซ้ำ — order มีจริงและ fill แล้ว · เข้าไปกระทบยอด `webull_lego_realized` เอง โดยดู `filled_quantity`/`filled_price` ที่เก็บไว้ใน audit |
 
 ตรวจใน **Streamlit:**
 
@@ -657,7 +738,7 @@ gcloud functions deploy lego-one-row \
   --no-allow-unauthenticated \
   --memory=512Mi \
   --timeout=120s \
-  --set-env-vars="FIREBASE_DB_URL=$DB_URL,WEBULL_ENV=UAT,LEGO_SYMBOL=APLS,LEGO_FIX_C=1500,LEGO_DIFF=60,LEGO_DNA_CODE=bypass:100,LEGO_DECIMAL_PRECISION=5,LEGO_SLOT_SECONDS=1800,AUTO_SUBMIT=false" \
+  --set-env-vars="FIREBASE_DB_URL=$DB_URL,WEBULL_ENV=UAT,LEGO_SYMBOL=APLS,LEGO_FIX_C=1500,LEGO_DIFF=60,LEGO_DNA_CODE=bypass:100,LEGO_DECIMAL_PRECISION=5,LEGO_SLOT_SECONDS=1800,LEGO_DNA_ORIGIN_UTC=2026-07-23T13:30:00Z,LEGO_DNA_CLOCK_MODE=market,AUTO_SUBMIT=false" \
   --set-secrets="WEBULL_APP_KEY=webull-app-key:latest,WEBULL_APP_SECRET=webull-app-secret:latest,WEBULL_ACCOUNT_ID=webull-account-id:latest"
 ```
 

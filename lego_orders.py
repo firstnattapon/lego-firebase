@@ -14,13 +14,32 @@ class SubmitGateError(RuntimeError):
     pass
 
 
+def _confirmation_phrase(side, quantity, symbol, step) -> str:
+    """One canonical spelling so two independent sources can be compared.
+
+    Numbers are normalized because the two sides do not travel the same way: one
+    is held in memory, the other round-trips through RTDB, which may hand a whole
+    float back as an int. Comparing 25.0 with 25 would block a perfectly good
+    order, so the phrase — not the caller — decides the spelling.
+    """
+    return f"CONFIRM {side} {float(quantity)} {symbol} STEP {int(step)}"
+
+
 def order_confirmation_phrase(row: dict) -> str:
+    """Side, quantity, symbol and step of one row, in one comparable line."""
     m = row["_meta"]
-    return f"CONFIRM {m['side']} {m['quantity']} {row['สินทรัพย์']} STEP {m['step']}"
+    return _confirmation_phrase(m["side"], m["quantity"], row["สินทรัพย์"], m["step"])
 
 
 def evaluate_submit_gate(environment: str, row: dict, preview_ok: bool,
                          confirmation_input: str, committed: bool) -> None:
+    """Refuse anything that is not exactly what the engine committed.
+
+    `row` must be the committed row and `confirmation_input` the phrase of the
+    intent about to be sent — two sources that travelled separately. Generating
+    both from the same object makes the last check compare a value with itself,
+    which is how it silently stopped being a check at all.
+    """
     if environment != UAT:
         raise SubmitGateError(f"ส่ง order ได้เฉพาะ {UAT}; ปัจจุบัน={environment}")
     if not committed:
@@ -32,8 +51,13 @@ def evaluate_submit_gate(environment: str, row: dict, preview_ok: bool,
         raise SubmitGateError("quantity <= 0 — ไม่ส่ง")
     if not preview_ok:
         raise SubmitGateError("preview ไม่ผ่าน — ไม่ส่ง")
+    # Meaningful only when the caller passes a phrase from a *different* source
+    # than `row`; the dispatcher passes the outbox intent's phrase and `row` is
+    # rebuilt from the committed RTDB row.
     if confirmation_input != order_confirmation_phrase(row):
-        raise SubmitGateError("confirmation phrase ไม่ตรง — ไม่ส่ง")
+        raise SubmitGateError(
+            f"confirmation phrase ไม่ตรงกับแถวที่ commit ไว้ — ไม่ส่ง "
+            f"(intent={confirmation_input!r} committed={order_confirmation_phrase(row)!r})")
 
 
 REALIZED_STATUSES = {"FILLED", "PARTIAL_FILLED", "PARTIALLY_FILLED"}

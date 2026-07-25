@@ -7,5 +7,12 @@
 numpy==2.4.6
 functions-framework==3.*
 firebase-admin==6.*
-webull-openapi-python-sdk
+# The SDK is pinned for the same reason as numpy, on a shorter fuse: it owns the
+# HMAC signing, the auth flow, and the exact order payload that reaches the
+# broker, so an unplanned upgrade at deploy time changes the money path with
+# nothing in this repo to notice. 2.0.15 is the version whose surface this
+# adapter is written against (account_v2.get_account_position, order_v3.preview/
+# place/get_order_detail/get_order_open, market_data.get_snapshot with
+# extend_hour_required/overnight_required). Move it only after a UAT run.
+webull-openapi-python-sdk==2.0.15
 tzdata>=2024.1

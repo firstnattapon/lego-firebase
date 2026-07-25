@@ -86,3 +86,56 @@ sys.modules.setdefault('firebase_admin.db', FAKE_DB)
 ff = types.ModuleType('functions_framework')
 ff.http = lambda fn: fn
 sys.modules.setdefault('functions_framework', ff)
+
+
+# --- Webull SDK doubles ------------------------------------------------------
+# webull_io is the only boundary that touches real money, and it was the least
+# covered file in the repo for one reason: every call goes through a TradeClient
+# or DataClient the tests had no way to build. These stand in for exactly the
+# surface webull_io uses, so its shape-parsing and fail-closed branches can be
+# exercised the same way firebase is.
+
+class FakeResponse:
+    def __init__(self, payload):
+        self._payload = payload
+
+    def json(self):
+        return copy.deepcopy(self._payload)
+
+
+class FakeCall:
+    """One SDK method: records its calls, returns a payload or raises."""
+
+    def __init__(self, payload=None):
+        self.payload = payload
+        self.calls = []
+
+    def __call__(self, *args, **kwargs):
+        self.calls.append((args, kwargs))
+        if isinstance(self.payload, Exception):
+            raise self.payload
+        if callable(self.payload):
+            return FakeResponse(self.payload(*args, **kwargs))
+        return FakeResponse(self.payload)
+
+
+class FakeNamespace:
+    def __init__(self, **members):
+        self.__dict__.update(members)
+
+
+def fake_trade_client(*, positions=None, open_orders=None, order_detail=None,
+                      preview=None, place=None):
+    return FakeNamespace(
+        account_v2=FakeNamespace(get_account_position=FakeCall(positions)),
+        order_v3=FakeNamespace(
+            get_order_open=FakeCall(open_orders),
+            get_order_detail=FakeCall(order_detail),
+            preview_order=FakeCall(preview),
+            place_order=FakeCall(place),
+        ),
+    )
+
+
+def fake_data_client(*, snapshot=None):
+    return FakeNamespace(market_data=FakeNamespace(get_snapshot=FakeCall(snapshot)))

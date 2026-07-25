@@ -194,17 +194,53 @@ def _extract_qty(positions, symbol: str) -> float:
     return 0.0
 
 
+_PRICE_KEYS = ("last", "lastPrice", "price", "close")
+
+
+def _entry_symbol(entry: dict) -> str:
+    return str(entry.get("symbol") or "").upper()
+
+
+def _price_of(entry: dict) -> float:
+    for key in _PRICE_KEYS:
+        if entry.get(key):
+            return float(entry[key])
+    return 0.0
+
+
 def _extract_price(snap, symbol: str) -> float:
+    """Read the price of *symbol*, never of whatever came first.
+
+    _extract_qty refuses to answer with another symbol's position; this function
+    took the first entry it saw, so a batch response or a mis-routed quote priced
+    the row off a different stock. That price goes straight into build_decision,
+    where gap = fix_c - holdings*price decides BUY/SELL/PASS and the order size,
+    with no later check that could notice.
+
+    An entry that names a different symbol is now skipped. Returning 0.0 is the
+    fail-closed answer: fetch_snapshot already turns a non-positive price into a
+    ValueError, so the row is never built rather than built on a wrong price.
+    """
+    want = symbol.upper()
     if isinstance(snap, list):
-        snap = snap[0] if snap else {}
+        entries = [e for e in snap if isinstance(e, dict)]
+        matching = [e for e in entries if _entry_symbol(e) == want]
+        if matching:
+            snap = matching[0]
+        elif any(_entry_symbol(e) for e in entries):
+            return 0.0                  # the response is about other symbols only
+        else:
+            # Unnamed single-symbol payload: the historical shape get_snapshot
+            # returns for a one-symbol request.
+            snap = entries[0] if entries else {}
     if not isinstance(snap, dict):
         return 0.0
-    for key in ("last", "lastPrice", "price", "close"):
-        if snap.get(key):
-            return float(snap[key])
-    nested = snap.get(symbol.upper()) or snap.get(symbol)
+    named = _entry_symbol(snap)
+    if not named or named == want:
+        price = _price_of(snap)
+        if price:
+            return price
+    nested = snap.get(want) or snap.get(symbol)
     if isinstance(nested, dict):
-        for key in ("last", "lastPrice", "price", "close"):
-            if nested.get(key):
-                return float(nested[key])
+        return _price_of(nested)
     return 0.0

@@ -8,13 +8,14 @@ Stack: **Scheduler (เวลา) → Cloud Function (engine) → RTDB (data) �
 
 | module | หน้าที่ |
 |---|---|
-| `main.py` | Cloud Function 2 ตัว: `lego_one_row` (เดิน DNA) และ `lego_order_worker` (ส่ง/ตาม order) |
+| `main.py` | Cloud Function 3 ตัว: `lego_one_row` (เดิน DNA), `lego_order_worker` (ส่ง/ตาม order), `lego_archive_worker` (ย้าย record ที่จบแล้วออกจาก path ที่ loop สแกน) |
 | `market_clock.py` | นาฬิกาตลาด: slot, market ordinal, ปฏิทิน NYSE, calendar fingerprint |
 | `lego_one_row.py` | สมการ 17 คอลัมน์: DNA step/signal, decision, recurrence Rₙ/ΔAₙ/Aₙ/Eₙ |
 | `dna_engine.py` | ถอด DNA code เป็น gate array 0/1 |
 | `lego_state.py` | Step 18 persistence: transaction, idempotency, guard ทุกตัว, realized ledger |
 | `lego_outbox.py` | order outbox (1 decision = 1 intent) แยกจาก DNA pointer |
 | `lego_orders.py` | submit gate, normalize ผล broker, จับคู่ fill เป็น realized |
+| `lego_archive.py` | ย้าย intent/audit ที่ terminal แล้วไป `*_archive` (ไม่ลบ) ให้ path ที่ scan โตตามงานที่ยังค้างเท่านั้น |
 | `webull_io.py` | adapter ของ Webull OpenAPI (snapshot, position, preview/place/detail) |
 | `find_origin.py` | เครื่องมือหา `LEGO_DNA_ORIGIN_UTC` ก่อนเปิด clock mode `market` |
 
@@ -40,18 +41,25 @@ done
     "webull_lego_rows":  { ".read": true, ".write": false },
     "webull_lego_state": { ".read": true, ".write": false },
     "webull_lego_order_audit": { ".read": true, ".write": false },
+    "webull_lego_order_audit_archive": { ".read": true, ".write": false },
     "webull_lego_order_outbox": { ".read": false, ".write": false },
+    "webull_lego_order_outbox_archive": { ".read": false, ".write": false },
     "webull_lego_realized": { ".read": false, ".write": false },
-    "webull_lego_errors":{ ".read": false, ".write": false }
+    "webull_lego_errors":{ ".read": false, ".write": false },
+    "webull_lego_warnings":{ ".read": true, ".write": false }
   }
 }
 ```
 > service account ของ Cloud Function (Admin SDK) ข้าม rules อยู่แล้ว จึงเขียนได้; client อื่นอ่านได้อย่างเดียว
 
-## 3. Deploy Cloud Functions (Gen2, HTTP) — ต้อง deploy ทั้ง 2 ตัว
+## 3. Deploy Cloud Functions (Gen2, HTTP) — ต้อง deploy ทั้ง 3 ตัว
 
 ```bash
-ENVS=FIREBASE_DB_URL=$DB_URL,WEBULL_ENV=UAT,LEGO_SYMBOL=APLS,LEGO_FIX_C=1500,LEGO_DIFF=60,LEGO_DNA_CODE=bypass:100,LEGO_DECIMAL_PRECISION=5,LEGO_SLOT_SECONDS=1800,AUTO_SUBMIT=false
+# LEGO_DNA_ORIGIN_UTC + LEGO_DNA_CLOCK_MODE อยู่ในชุดนี้ตั้งแต่ต้น ไม่ใช่ของเสริมทีหลัง:
+# ไม่ตั้ง origin = clock resolve ไม่ได้ = โหมด degraded ซึ่ง "commit แถวได้ปกติ แต่ไม่สร้าง
+# order intent เลยสักใบ" (response จะมี outbox_skipped + นับใน webull_lego_warnings)
+# หาค่า origin ด้วย `python find_origin.py <dna_step ถัดไป>` ก่อน แล้วค่อย deploy
+ENVS=FIREBASE_DB_URL=$DB_URL,WEBULL_ENV=UAT,LEGO_SYMBOL=APLS,LEGO_FIX_C=1500,LEGO_DIFF=60,LEGO_DNA_CODE=bypass:100,LEGO_DECIMAL_PRECISION=5,LEGO_SLOT_SECONDS=1800,LEGO_DNA_ORIGIN_UTC=2026-07-23T13:30:00Z,LEGO_DNA_CLOCK_MODE=market,AUTO_SUBMIT=false
 SECRETS=WEBULL_APP_KEY=webull-app-key:latest,WEBULL_APP_SECRET=webull-app-secret:latest,WEBULL_ACCOUNT_ID=webull-account-id:latest
 
 gcloud functions deploy lego-one-row \
@@ -67,10 +75,19 @@ gcloud functions deploy lego-order-worker \
   --trigger-http --no-allow-unauthenticated \
   --memory=512Mi --timeout=300s \
   --set-env-vars=$ENVS --set-secrets=$SECRETS --project=$PROJECT
+
+gcloud functions deploy lego-archive-worker \
+  --gen2 --runtime=python312 --region=$REGION \
+  --source=. --entry-point=lego_archive_worker \
+  --trigger-http --no-allow-unauthenticated \
+  --memory=512Mi --timeout=300s \
+  --set-env-vars=$ENVS --set-secrets=$SECRETS --project=$PROJECT
 ```
 > UAT ก่อนเสมอ (`WEBULL_ENV=UAT`), `AUTO_SUBMIT=false` จน pipeline นิ่ง แล้วค่อยเปิด
 > **ไม่ deploy `lego-order-worker` = intent ทุกใบจะหมดอายุเป็น `EXPIRED_UNSENT`** เพราะ
 > `LEGO_INLINE_ORDER_WORKER` default `false` (ตั้งใจ: broker latency ห้ามถ่วงเวลา DNA)
+> `lego-archive-worker` เป็นงานบ้าน (วันละครั้งพอ) ไม่ deploy ก็เทรดได้ แต่ path
+> `webull_lego_order_outbox` / `webull_lego_order_audit` จะโตไม่หยุดและทุก tick ต้องโหลดทั้งก้อน
 
 ตาราง env ครบทุกตัวอยู่ใน [QUICKSTART_TH.md](QUICKSTART_TH.md) หัวข้อ 6
 
@@ -93,6 +110,14 @@ gcloud scheduler jobs create http lego-order-tick \
   --max-retry-attempts=0 \
   --uri="$WURL" --http-method=POST \
   --oidc-service-account-email="$SA" --oidc-token-audience="$WURL" \
+  --project=$PROJECT
+
+AURL=$(gcloud functions describe lego-archive-worker --gen2 --region=$REGION --format='value(serviceConfig.uri)')
+gcloud scheduler jobs create http lego-archive-tick \
+  --location=$REGION --schedule="30 22 * * *" --time-zone="UTC" \
+  --max-retry-attempts=0 \
+  --uri="$AURL" --http-method=POST \
+  --oidc-service-account-email="$SA" --oidc-token-audience="$AURL" \
   --project=$PROJECT
 ```
 > cron ยิงเผื่อไว้ 13:00–20:30 UTC (ครอบทั้ง EDT 13:30–20:00 และ EST 14:30–21:00);
@@ -130,8 +155,18 @@ gcloud scheduler jobs run lego-tick --location=$REGION --project=$PROJECT
 | `ORDINAL_REGRESSION` | 409 | slot ใหม่ให้ ordinal ที่ไม่เดินหน้า — DNA เดินถอยไม่ได้ |
 | `HOLDINGS_ANOMALY` | 409 | chain เคยเห็นของ แต่ snapshot อ่านได้ 0 — ไม่ commit ไม่ยิง order |
 | `DNA_DRIFT` | 409 | `dna_code` เดิมแต่ decode ได้ gate array คนละชุด (มักคือ numpy เปลี่ยนเวอร์ชัน) |
+| `DNA_EXHAUSTED` | 200 | DNA เดินจนหมด array (`bypass:100` ที่ slot 30m ≈ 8 วันทำการ) — เป็นจุดจบที่คาดไว้ ไม่ใช่ระบบพัง ต้องต่อ DNA ใหม่หรือหยุด scheduler |
 | `CONFIG_ERROR` | 500 | `LEGO_SLOT_SECONDS` ไม่ตั้ง/ไม่รองรับ |
 | `SNAPSHOT_OR_ENGINE_ERROR` | 500/503 | 503 เมื่อเป็น transient |
+
+field เตือนที่จะโผล่ใน response ของแถวที่ commit สำเร็จ (ไม่มี = ไม่มีอะไรต้องดู):
+
+| field | แปลว่า |
+|---|---|
+| `outbox_skipped` | แถวนี้เป็น `READY_*` และ `AUTO_SUBMIT=true` แต่ **ไม่มี order intent ถูกสร้าง** เพราะ clock degraded (ไม่มี slot จึงคำนวณ `expires_at` ไม่ได้) — นับสะสมที่ `webull_lego_warnings/degraded_clock_no_order` |
+| `outbox_error` | สร้าง intent ไม่สำเร็จ (แถว commit แล้ว ไม่ rollback) |
+| `clock_warning` | market clock resolve ไม่ได้ จึงเดินด้วย legacy step |
+| `dna_steps_remaining` | DNA เหลือน้อยกว่า `LEGO_DNA_LOW_WATERMARK` (default 10) แล้ว |
 
 ## ✅ ตรวจ invariant หลัง deploy
 1. ทุกแถวผ่าน `validate_row_columns` (17 คอลัมน์)
@@ -148,3 +183,11 @@ gcloud scheduler jobs run lego-tick --location=$REGION --project=$PROJECT
     ที่กลยุทธ์สร้างได้ และการ rebalance ปกติทำให้ holdings เป็น 0 ไม่ได้
 11. `dna_code` เดิมต้อง decode ได้ gate array เดิมตลอดอายุ chain — `dna_fingerprint` ใน state
     บังคับข้อนี้ และ `numpy` ถูก pin ตายตัวเพราะ `Generator` ไม่รับประกัน bit stream ข้ามเวอร์ชัน
+12. การตัดสินใจ "ไม่ส่ง order" ต้องมีที่ให้เห็นเสมอ — เงียบไม่ได้ ถ้า `AUTO_SUBMIT=true` แล้วแถวเป็น
+    `READY_*` ต้องได้อย่างใดอย่างหนึ่ง: intent ใน outbox, `outbox_error`, หรือ `outbox_skipped`
+13. ราคาที่เข้าสมการต้องเป็นราคาของ `LEGO_SYMBOL` เท่านั้น — snapshot ที่ตอบมาเป็น symbol อื่น
+    ต้อง fail closed ไม่ใช่เอามาคิด `gap`
+14. order ที่ fill แล้วต้องไม่ถูกส่งซ้ำ แม้ realized ledger จะคำนวณต่อไม่ได้ — จบเป็น
+    `REALIZED_MATH_ERROR` + `needs_manual_check` (คนละเรื่องกับ "ไม่รู้ว่า order มีจริงไหม")
+15. `webull-openapi-python-sdk` ต้อง pin exact version — SDK คุม signing/auth/order payload
+    โดยตรง การอัปเดตต้องผ่าน UAT ก่อนเสมอ (เหตุผลเดียวกับ numpy)

@@ -112,6 +112,18 @@ def dna_signal_for(dna_code: str, step: int) -> int:
     return int(dna[step])
 
 
+def dna_steps_remaining(dna_code: str, step: int) -> int:
+    """Slots this dna_code can still serve after *step*.
+
+    Running out is not a fault — it is the DNA finishing — but it arrives as a
+    hard stop with no warning: a 100-step code on a 30m grid lasts about eight
+    trading days, and the first sign is the row that cannot be built. decode_dna
+    is cached, so the count is free on every row and lets the response warn while
+    there is still time to extend the code.
+    """
+    return max(0, len(decode_dna(dna_code)) - int(step) - 1)
+
+
 @dataclass(frozen=True)
 class Decision:
     status: str

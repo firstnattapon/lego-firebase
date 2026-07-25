@@ -17,6 +17,12 @@ TERMINAL = {
     # Terminal for dispatch only — the order audit keeps needs_manual_check so
     # a human still answers whether the order exists.
     "RECONCILE_ABANDONED",
+    # The broker confirmed the fill; only our realized math could not use it.
+    # Nothing is left to dispatch — re-sending would duplicate a filled order —
+    # so it must leave the queue, and needs_manual_check keeps the ledger gap
+    # visible. Without this it would sit actionable forever and starve later
+    # decisions exactly the way RECONCILE_ABANDONED was introduced to prevent.
+    "REALIZED_MATH_ERROR",
 }
 
 
@@ -74,9 +80,19 @@ def list_actionable(chain_key: str, limit: int = 20) -> list[dict]:
     return rows[:limit]
 
 
-def row_is_committed(run_id: str) -> bool:
+def read_committed_row(run_id: str) -> dict | None:
+    """The committed row behind an intent, or None when it is not committed.
+
+    The dispatcher already had to read this row to answer 'was it committed?';
+    returning the document itself lets the submit gate compare the intent against
+    what the engine actually persisted, at no extra read.
+    """
     row = db.reference(f"{ROWS_PATH}/{run_id}").get()
-    return isinstance(row, dict) and row.get("committed") is True
+    return row if isinstance(row, dict) and row.get("committed") is True else None
+
+
+def row_is_committed(run_id: str) -> bool:
+    return read_committed_row(run_id) is not None
 
 
 def expire_unsent_before(chain_key: str, now_utc: datetime) -> int:
