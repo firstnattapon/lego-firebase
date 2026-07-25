@@ -2,6 +2,7 @@
 
 lego_one_row: market clock -> snapshot -> model row -> durable outbox candidate.
 lego_order_worker: dispatch/reconcile outbox intents without blocking DNA time.
+lego_archive_worker: move finished order records out of the live paths.
 """
 from __future__ import annotations
 
@@ -14,13 +15,15 @@ import firebase_admin
 import functions_framework
 from firebase_admin import credentials, db
 
-from lego_one_row import (READY_BUY, READY_SELL, HoldingsAnomaly,
-                          check_holdings_continuity, compute_row, dna_step_for)
+from lego_archive import archive_terminal_records
+from lego_one_row import (READY_BUY, READY_SELL, DNAExhausted, HoldingsAnomaly,
+                          check_holdings_continuity, compute_row, dna_step_for,
+                          dna_steps_remaining)
 from lego_orders import (REALIZED_STATUSES, TERMINAL_STATUSES, UAT,
                          evaluate_submit_gate, normalize_status,
                          order_confirmation_phrase, summarize_order_result)
 from lego_outbox import (expire_unsent_before, list_actionable, put_intent,
-                         row_is_committed, update_intent)
+                         read_committed_row, update_intent)
 from lego_state import (CalendarDriftError, DNADriftError, OrdinalRegression,
                         SlotAlreadyConsumed, StaleAnchorError, apply_realized_fill,
                         chain_key, commit_final_row, read_anchor,
@@ -36,6 +39,17 @@ from webull_io import (build_clients, build_order_payload, environment_label,
 ORDER_POLL_ATTEMPTS = 3
 ORDER_POLL_DELAY_S = 2.0
 UTC = timezone.utc
+WARNINGS_PATH = "webull_lego_warnings"
+ERRORS_PATH = "webull_lego_errors"
+
+
+class RealizedMathError(RuntimeError):
+    """The broker confirmed a fill, but our incremental realized math refused it.
+
+    A different question from 'does this order exist?': the order does exist and
+    is filled. Only the ledger update failed, and asking the broker again cannot
+    change that, so it must not spend the reconcile budget.
+    """
 
 
 def _init_firebase():
@@ -62,6 +76,31 @@ def _poll_order_status(trade_client, client_order_id: str, place_res: dict) -> d
     return summarize_order_result(place_res, detail)
 
 
+def _record_warning(kind: str, message: str, extra: dict | None = None) -> None:
+    """Make a silent skip alertable without growing without bound.
+
+    One node per kind, updated in place with a counter, instead of a push per
+    slot: a degraded clock repeats every slot forever, so pushing a record each
+    time would recreate the unbounded path this system is already trimming.
+    Never raises — a warning that breaks the run it is warning about is worse
+    than no warning.
+    """
+    try:
+        ref = db.reference(f"{WARNINGS_PATH}/{kind}")
+        now = _iso(datetime.now(UTC))
+
+        def txn(current):
+            doc = dict(current or {})
+            doc["count"] = int(doc.get("count", 0) or 0) + 1
+            doc.setdefault("first_at", now)
+            doc.update({"last_at": now, "message": message[:500], **(extra or {})})
+            return doc
+
+        ref.transaction(txn)
+    except Exception:
+        pass
+
+
 def _apply_realized_if_available(intent: dict, summary: dict) -> dict:
     status = normalize_status(summary.get("status"))
     if status not in REALIZED_STATUSES:
@@ -72,11 +111,17 @@ def _apply_realized_if_available(intent: dict, summary: dict) -> dict:
         out = dict(summary)
         out["realized_warning"] = "fill confirmed but quantity/price unavailable"
         return out
-    realized = apply_realized_fill(
-        intent["chain_key"], intent["run_id"], intent["side"],
-        cumulative_qty=float(qty), price=float(price),
-        cumulative_fee=float(summary.get("filled_fee", 0.0) or 0.0),
-    )
+    try:
+        realized = apply_realized_fill(
+            intent["chain_key"], intent["run_id"], intent["side"],
+            cumulative_qty=float(qty), price=float(price),
+            cumulative_fee=float(summary.get("filled_fee", 0.0) or 0.0),
+        )
+    except ValueError as exc:
+        # Raised by apply_realized_fill/apply_fill when the incremental fill
+        # numbers cannot be made sense of. Kept distinct from every other failure
+        # here, all of which mean 'we could not reach or read the broker'.
+        raise RealizedMathError(str(exc)) from exc
     out = dict(summary)
     out.update(realized)
     return out
@@ -138,7 +183,46 @@ def _persist_reconcile_failure(intent: dict, exc: Exception) -> dict:
     })
 
 
+def _persist_realized_math_error(intent: dict, summary: dict, exc: Exception) -> dict:
+    """End an intent whose order filled but whose realized math did not.
+
+    This used to share the reconcile path, which reads 'we do not know whether
+    this order exists'. Here we do know: the broker answered, and the answer says
+    filled. Retrying cannot fix arithmetic, so it ends immediately instead of
+    spending attempts, and the broker's own numbers are kept on the audit so the
+    person reconciling can see the fill was real and only the ledger is behind.
+    """
+    fields = {
+        "status": "REALIZED_MATH_ERROR",
+        "needs_manual_check": True,
+        "realized": False,
+        "broker_status": normalize_status(summary.get("status")),
+        "last_error": f"{type(exc).__name__}: {exc}"[:500],
+        "terminal_reason": ("broker ยืนยัน fill แล้ว แต่คำนวณ realized ไม่ได้ — "
+                            "ห้ามส่ง order ซ้ำ ต้องกระทบยอด realized ledger เอง"),
+    }
+    for key in ("filled_quantity", "filled_price", "filled_fee", "reject_reason"):
+        if key in summary:
+            fields[key] = summary[key]
+    _persist(intent["chain_key"], intent["run_id"], fields)
+    _record_warning("realized_math_error",
+                    "order fill ยืนยันแล้วแต่คำนวณ realized ไม่ได้ — ต้องกระทบยอดเอง",
+                    {"run_id": intent["run_id"], "chain_key": intent["chain_key"]})
+    return {"run_id": intent["run_id"], **fields}
+
+
+def _finish_with_realized(intent: dict, summary: dict) -> dict:
+    """The broker has answered; the only failure left belongs to us."""
+    try:
+        summary = _apply_realized_if_available(intent, summary)
+    except RealizedMathError as exc:
+        return _persist_realized_math_error(intent, summary, exc)
+    _persist_summary(intent, summary)
+    return {"run_id": intent["run_id"], **summary}
+
+
 def _pending_row_shape(intent: dict) -> dict:
+    """What the outbox intent says it wants to send."""
     return {
         "สถานะ": intent["row_status"],
         "สินทรัพย์": intent["symbol"],
@@ -146,6 +230,19 @@ def _pending_row_shape(intent: dict) -> dict:
             "side": intent["side"],
             "quantity": float(intent["quantity"]),
             "step": int(intent["step"]),
+        },
+    }
+
+
+def _committed_row_shape(doc: dict) -> dict:
+    """What the engine actually committed — the gate's source of truth."""
+    return {
+        "สถานะ": doc.get("สถานะ"),
+        "สินทรัพย์": doc.get("สินทรัพย์"),
+        "_meta": {
+            "side": doc.get("ฝั่ง"),
+            "quantity": float(doc.get("จำนวนสั่ง (หุ้น)") or 0.0),
+            "step": int(doc.get("DNA step") or 0),
         },
     }
 
@@ -162,7 +259,8 @@ def _dispatch_or_reconcile_one(trade_client, data_client, cfg, intent: dict) -> 
     ck = intent["chain_key"]
     status = normalize_status(intent.get("status"))
 
-    if not row_is_committed(run_id):
+    committed_row = read_committed_row(run_id)
+    if committed_row is None:
         return _stop(ck, run_id, "NOT_PLACED",
                      {"terminal_reason": "source row was not committed"})
 
@@ -172,11 +270,12 @@ def _dispatch_or_reconcile_one(trade_client, data_client, cfg, intent: dict) -> 
             summary = summarize_order_result({}, fetch_order_detail(trade_client, run_id))
             if normalize_status(summary.get("status")) == "UNKNOWN":
                 raise RuntimeError("broker order detail still UNKNOWN")
-            summary = _apply_realized_if_available(intent, summary)
-            _persist_summary(intent, summary)
-            return {"run_id": run_id, **summary}
         except Exception as exc:
+            # Everything inside this try is 'can we reach and read the broker?'.
+            # The realized ledger is applied outside it so its failures are not
+            # reported as an unresolved order.
             return _persist_reconcile_failure(intent, exc)
+        return _finish_with_realized(intent, summary)
 
     if status != "PENDING_DISPATCH":
         return {"run_id": run_id, "status": status}
@@ -203,7 +302,6 @@ def _dispatch_or_reconcile_one(trade_client, data_client, cfg, intent: dict) -> 
     if env != UAT:
         return _stop(ck, run_id, "NOT_PLACED", {"terminal_reason": f"environment={env}"})
 
-    row = _pending_row_shape(intent)
     write_order_audit(run_id, {
         "run_id": run_id, "chain_key": ck, "side": intent["side"],
         "quantity": float(intent["quantity"]), "symbol": cfg.symbol,
@@ -216,8 +314,12 @@ def _dispatch_or_reconcile_one(trade_client, data_client, cfg, intent: dict) -> 
         # worker run and leave the other intents of this tick unprocessed.
         order = build_order_payload(cfg, intent["side"], float(intent["quantity"]), run_id)
         preview_ok = preview_market_order(trade_client, order)
-        evaluate_submit_gate(env, row, preview_ok,
-                             order_confirmation_phrase(row), committed=True)
+        # Two independent witnesses: the gate judges the committed row, the
+        # phrase comes from the intent about to be sent. They are only equal
+        # while the outbox still agrees with what the engine decided.
+        evaluate_submit_gate(env, _committed_row_shape(committed_row), preview_ok,
+                             order_confirmation_phrase(_pending_row_shape(intent)),
+                             committed=True)
     except Exception as exc:
         return _persist_error(ck, run_id, "NOT_PLACED", exc)
 
@@ -225,13 +327,11 @@ def _dispatch_or_reconcile_one(trade_client, data_client, cfg, intent: dict) -> 
     try:
         place_res = place_market_order(trade_client, order)
         summary = _poll_order_status(trade_client, run_id, place_res)
-        summary = _apply_realized_if_available(intent, summary)
-        _persist_summary(intent, summary)
-        return {"run_id": run_id, **summary}
     except Exception as exc:
         # Same open question as a failed reconcile — "does this order exist?" —
         # so it draws on the same bounded budget.
         return _persist_reconcile_failure(intent, exc)
+    return _finish_with_realized(intent, summary)
 
 
 def _outbox_intent(cfg, row: dict, snapshot: dict, slot, decision_time: datetime) -> dict:
@@ -330,8 +430,24 @@ def lego_one_row(request):
         env = environment_label()
         auto = os.environ.get("AUTO_SUBMIT", "false").lower() == "true"
         should_submit = auto and env == UAT and row["สถานะ"] in (READY_BUY, READY_SELL)
+        row_durable = bool(result["committed"] or result.get("idempotent"))
         outbox_error = None
-        if should_submit and slot and (result["committed"] or result.get("idempotent")):
+        outbox_skipped = None
+        if should_submit and row_durable and slot is None:
+            # A degraded clock has no slot window, so expires_at cannot be
+            # computed and no intent can be created. Deciding that silently was
+            # the worst of both worlds: the row still read READY_BUY with
+            # committed=true and no error field, so a dashboard showed a working
+            # bot that had never sent a single order. Say it on the response and
+            # on a counter something can alert on.
+            outbox_skipped = ("degraded clock: ไม่มี slot window จึงคำนวณ expires_at ไม่ได้ "
+                              "— แถวนี้ commit แล้วแต่ไม่มีการสร้าง order intent")
+            _record_warning("degraded_clock_no_order", outbox_skipped, {
+                "run_id": result["run_id"], "row_status": row["สถานะ"],
+                "clock_mode": mode, "hint": "ตั้ง LEGO_DNA_ORIGIN_UTC (find_origin.py) "
+                                            "แล้วเปิด LEGO_DNA_CLOCK_MODE=market",
+            })
+        elif should_submit and row_durable:
             # The slot is already durable at this point, so a failed intent may
             # only cost this row its order — reporting it as a DNA failure would
             # be a lie and would invite a retry that finds the slot consumed.
@@ -358,6 +474,13 @@ def lego_one_row(request):
             out["clock_warning"] = clock_error
         if outbox_error:
             out["outbox_error"] = outbox_error
+        if outbox_skipped:
+            out["outbox_skipped"] = outbox_skipped
+        # Warn while extending the DNA is still possible; silent until the last
+        # few slots so a healthy chain keeps the response it has always had.
+        remaining = dna_steps_remaining(cfg.dna_code, row["DNA step"])
+        if remaining <= int(os.environ.get("LEGO_DNA_LOW_WATERMARK", "10")):
+            out["dna_steps_remaining"] = remaining
 
         # Off by default: dispatching inline adds broker latency to the DNA
         # invocation, which raises the odds of a scheduler timeout+retry.
@@ -386,9 +509,20 @@ def lego_one_row(request):
     except HoldingsAnomaly as exc:
         return {"status": "HOLDINGS_ANOMALY", "committed": False,
                 "pipeline_status": "HOLDINGS_ANOMALY", "note": str(exc)}, 409
+    except DNAExhausted as exc:
+        # The DNA finishing is an expected end state, not a fault: bypass:100 on
+        # a 30m grid lasts about eight trading days. Without this clause it fell
+        # through to the generic handler and answered 500 on every slot forever,
+        # pushing an error record each time and firing any 5xx alert with nothing
+        # actionable in it. 200 with its own status says what happened and what
+        # to do, and the scheduler stops treating it as an outage.
+        return {"status": "PASS_DNA_EXHAUSTED", "committed": False,
+                "pipeline_status": "DNA_EXHAUSTED", "note": str(exc),
+                "hint": "ต่ออายุด้วย LEGO_DNA_CODE ที่ยาวขึ้น (chain ใหม่) "
+                        "หรือหยุด scheduler ของ chain นี้"}, 200
     except Exception as exc:
         try:
-            db.reference("webull_lego_errors").push({
+            db.reference(ERRORS_PATH).push({
                 "error": str(exc), "type": type(exc).__name__,
                 "trace": traceback.format_exc()[:2000],
             })
@@ -410,4 +544,16 @@ def lego_order_worker(request):
         return {"pipeline_status": "ORDER_WORKER_OK", **_run_order_worker(cfg, limit)}, 200
     except Exception as exc:
         return {"pipeline_status": "ORDER_WORKER_ERROR",
+                "error": f"{type(exc).__name__}: {exc}"}, 503
+
+
+@functions_framework.http
+def lego_archive_worker(request):
+    """Daily housekeeping; touches no live intent and never runs on the DNA path."""
+    _init_firebase()
+    try:
+        return {"pipeline_status": "ARCHIVE_OK",
+                **archive_terminal_records(datetime.now(UTC))}, 200
+    except Exception as exc:
+        return {"pipeline_status": "ARCHIVE_ERROR",
                 "error": f"{type(exc).__name__}: {exc}"}, 503

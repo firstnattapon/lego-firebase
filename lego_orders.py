@@ -14,9 +14,35 @@ class SubmitGateError(RuntimeError):
     pass
 
 
+def _confirmation_phrase(side, quantity, symbol, step) -> str:
+    """One canonical spelling so two independent sources can be compared.
+
+    Numbers are normalized because the two sides do not travel the same way: one
+    is held in memory, the other round-trips through RTDB, which may hand a whole
+    float back as an int. Comparing 25.0 with 25 would block a perfectly good
+    order, so the phrase — not the caller — decides the spelling.
+    """
+    return f"CONFIRM {side} {float(quantity)} {symbol} STEP {int(step)}"
+
+
 def order_confirmation_phrase(row: dict) -> str:
+    """The phrase the dispatcher intends to submit, built from the pending row."""
     m = row["_meta"]
-    return f"CONFIRM {m['side']} {m['quantity']} {row['สินทรัพย์']} STEP {m['step']}"
+    return _confirmation_phrase(m["side"], m["quantity"], row["สินทรัพย์"], m["step"])
+
+
+def committed_row_confirmation_phrase(doc: dict) -> str:
+    """The same phrase rebuilt from the committed 17 columns in RTDB.
+
+    This is what makes the confirmation gate mean something. Both sides used to
+    be generated from the same object, so the check compared a value with itself
+    and could not fail. The committed row is an independent witness: it is what
+    the engine actually decided and persisted, so an intent whose side, quantity,
+    symbol or step drifted from it now fails the gate instead of reaching the
+    broker.
+    """
+    return _confirmation_phrase(doc.get("ฝั่ง"), doc.get("จำนวนสั่ง (หุ้น)") or 0.0,
+                                doc.get("สินทรัพย์"), doc.get("DNA step") or 0)
 
 
 def evaluate_submit_gate(environment: str, row: dict, preview_ok: bool,
@@ -32,8 +58,13 @@ def evaluate_submit_gate(environment: str, row: dict, preview_ok: bool,
         raise SubmitGateError("quantity <= 0 — ไม่ส่ง")
     if not preview_ok:
         raise SubmitGateError("preview ไม่ผ่าน — ไม่ส่ง")
+    # Meaningful only when the caller passes a phrase from a *different* source
+    # than `row`; the dispatcher passes the outbox intent's phrase and `row` is
+    # rebuilt from the committed RTDB row.
     if confirmation_input != order_confirmation_phrase(row):
-        raise SubmitGateError("confirmation phrase ไม่ตรง — ไม่ส่ง")
+        raise SubmitGateError(
+            f"confirmation phrase ไม่ตรงกับแถวที่ commit ไว้ — ไม่ส่ง "
+            f"(intent={confirmation_input!r} committed={order_confirmation_phrase(row)!r})")
 
 
 REALIZED_STATUSES = {"FILLED", "PARTIAL_FILLED", "PARTIALLY_FILLED"}
