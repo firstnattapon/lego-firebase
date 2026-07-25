@@ -84,6 +84,26 @@ def fetch_snapshot(trade_client, data_client, cfg: Config) -> dict:
     }
 
 
+def quantity_string(qty: float, precision: int) -> str:
+    """Format an order quantity, stripping trailing zeros only after a point.
+
+    At LEGO_DECIMAL_PRECISION=0 (whole shares — a documented, allowed setting)
+    the formatted quantity has no '.' to stop rstrip('0'), so 20 shares became
+    '2' and 100 became '1'. Nothing downstream could catch it: the 17-column
+    ledger is theoretical and never reads the filled quantity, so the dashboard
+    would show a healthy chain while the real position was 10% of target.
+
+    A quantity that rounds away to zero is refused rather than sent as '0'.
+    """
+    text = f"{qty:.{precision}f}"
+    if "." in text:
+        text = text.rstrip("0").rstrip(".")
+    if not text or float(text) <= 0:
+        raise ValueError(
+            f"quantity {qty!r} ปัดที่ {precision} ทศนิยมแล้วเหลือ 0 — fail closed ไม่ส่ง")
+    return text
+
+
 def build_order_payload(cfg: Config, side: str, qty: float, client_order_id: str) -> list[dict]:
     return [{
         "combo_type": "NORMAL",
@@ -92,7 +112,7 @@ def build_order_payload(cfg: Config, side: str, qty: float, client_order_id: str
         "instrument_type": "EQUITY",
         "market": "US",
         "order_type": "MARKET",
-        "quantity": f"{qty:.{cfg.decimal_precision}f}".rstrip("0").rstrip(".") or "0",
+        "quantity": quantity_string(qty, cfg.decimal_precision),
         "side": side,
         "time_in_force": "DAY",
         "entrust_type": "QTY",

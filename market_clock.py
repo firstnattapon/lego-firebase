@@ -181,11 +181,13 @@ def slot_seconds() -> int:
     return sec
 
 
-def _session_slots(d: date, sec: int) -> int:
+def session_slot_count(d: date, sec: int) -> int:
     """Count bars the way yfinance emits them: a partial trailing bar counts.
 
     Floor division silently dropped the 15:30-16:00 half bar on 1h and made 1d
     zero, which drifts the ordinal against the trained bar index every session.
+    Public because find_origin needs the same count; this is the only place the
+    rule may be written.
     """
     bounds = session_bounds(d)
     if not bounds:
@@ -210,7 +212,7 @@ def _ordinal_from_origin(origin: datetime, slot_start: datetime, sec: int) -> in
     total = -origin_index + slot_index
     d = origin_date
     while d < slot_date:
-        total += _session_slots(d, sec)
+        total += session_slot_count(d, sec)
         d += timedelta(days=1)
     return total
 

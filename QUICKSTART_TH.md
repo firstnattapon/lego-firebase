@@ -196,7 +196,7 @@ gcloud functions deploy lego-one-row \
 |---|---|---|
 | `LEGO_DIFF` | `0` | ครึ่งความกว้างแถบ no-trade · `|gap| ≤ DIFF` → `PASS_THRESHOLD` |
 | `LEGO_DNA_CODE` | `bypass:100` | โค้ด DNA (`bypass:N` / `[1, N]` / stream ตัวเลขล้วน) |
-| `LEGO_DECIMAL_PRECISION` | `5` | ทศนิยมของจำนวนสั่ง (0–5) |
+| `LEGO_DECIMAL_PRECISION` | `5` | ทศนิยมของจำนวนสั่ง (0–5) · `0` = สั่งเป็นจำนวนเต็มหุ้น · ต้องเท่ากันทั้ง 2 ฟังก์ชัน (อยู่ใน `config_hash`) |
 | `LEGO_STRATEGY_ID` | `shannon_demon_lego` | ป้ายกำกับกลยุทธ์ (อยู่ใน `config_hash`) |
 | `WEBULL_ENV` | `UAT` | `UAT` = ส่ง order ได้ · อย่างอื่น = Production (read-only) |
 | `AUTO_SUBMIT` | `false` | `true` = สร้าง order intent อัตโนมัติเมื่อแถวเป็น `READY_*` |
@@ -219,6 +219,7 @@ gcloud functions deploy lego-one-row \
 | `LEGO_ORDER_WORKER_LIMIT` | `3` | จำนวน intent สูงสุดต่อการเรียก 1 ครั้ง |
 | `LEGO_ORDER_EXPIRY_MARGIN_SECONDS` | `15` | กันส่ง order คาบเกี่ยว slot ถัดไป |
 | `LEGO_HOLDINGS_DRIFT_TOLERANCE` | `0.000001` | holdings เปลี่ยนเกินนี้ระหว่างรอส่ง = `SUPPRESSED_STATE_CHANGED` |
+| `LEGO_RECONCILE_MAX_ATTEMPTS` | `20` | ถาม broker ซ้ำได้กี่ครั้งก่อนยอมแพ้เป็น `RECONCILE_ABANDONED` (ที่ `*/5` = ~100 นาที) — กัน order ที่ broker ไม่เคยรับ วนถามไม่รู้จบจนเบียด intent ใหม่ทั้งหมด |
 
 ---
 
@@ -361,11 +362,17 @@ slot ปัจจุบัน      = 2026-07-23:9 (เริ่ม 2026-07-23T18
 เอาไป update ทั้งสองฟังก์ชัน (ค่าต้องตรงกัน):
 
 ```bash
-for fn in lego-one-row lego-order-worker; do
-  gcloud functions deploy "$fn" --gen2 --region="$REGION" \
-    --update-env-vars="LEGO_DNA_ORIGIN_UTC=2026-07-23T18:00:00Z,LEGO_DNA_CLOCK_MODE=market"
-done
+gcloud functions deploy lego-one-row --gen2 --region="$REGION" \
+  --source=. --entry-point=lego_one_row \
+  --update-env-vars="LEGO_DNA_ORIGIN_UTC=2026-07-23T18:00:00Z,LEGO_DNA_CLOCK_MODE=market"
+
+gcloud functions deploy lego-order-worker --gen2 --region="$REGION" \
+  --source=. --entry-point=lego_order_worker \
+  --update-env-vars="LEGO_DNA_ORIGIN_UTC=2026-07-23T18:00:00Z,LEGO_DNA_CLOCK_MODE=market"
 ```
+
+> เขียนแยกสองคำสั่งเพราะ `--entry-point` ของสองฟังก์ชันไม่เหมือนกัน — ระบุให้ชัดทุกครั้ง
+> อย่าพึ่งให้ gcloud จำค่าเดิม และรันจาก root ของ repo เสมอเพราะ `--source=.`
 
 > 🚨 **แก้ได้ครั้งเดียวก่อน commit แถวแรกเท่านั้น**
 > `LEGO_DNA_ORIGIN_UTC`, `LEGO_SLOT_SECONDS`, `LEGO_MARKET_HOLIDAYS`,
@@ -440,6 +447,10 @@ gcloud functions describe lego-one-row --gen2 --region="$REGION" --format='value
 - ✅ ไม่มี error ผิดปกติใน `webull_lego_errors`
 - ✅ ถ้าเปิด `AUTO_SUBMIT=true`: `webull_lego_order_outbox` ต้องไม่ค้างเป็น `PENDING_DISPATCH`
   ข้าม slot — ถ้าเห็น `EXPIRED_UNSENT` ทุกใบ แปลว่ายังไม่ได้ deploy `lego-order-worker` (ข้อ 6.1)
+- ⚠️ ถ้าเห็น `RECONCILE_ABANDONED` ใน outbox (หรือ `needs_manual_check: true` ใน
+  `webull_lego_order_audit`) = **ต้องเข้าไปเช็คที่ broker เองว่า order ใบนั้นมีจริงไหม**
+  ระบบถาม broker จนครบ `LEGO_RECONCILE_MAX_ATTEMPTS` แล้วไม่ได้คำตอบ จึงเลิกถามเพื่อไม่ให้
+  ไปเบียด order ใหม่ · อ่าน `first_error` เพื่อรู้สาเหตุตั้งต้น (`last_error` คือครั้งล่าสุด)
 
 ค่า `pipeline_status` ที่ต้องอ่านให้ออกจาก log:
 

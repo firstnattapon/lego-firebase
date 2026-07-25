@@ -24,7 +24,8 @@ from __future__ import annotations
 import sys
 from datetime import date, datetime, timedelta
 
-from market_clock import NY, UTC, MarketClockError, session_bounds, slot_seconds
+from market_clock import (NY, UTC, MarketClockError, session_bounds,
+                          session_slot_count, slot_seconds)
 
 
 def current_slot(at: datetime | None = None) -> tuple[date, int, datetime]:
@@ -44,13 +45,15 @@ def current_slot(at: datetime | None = None) -> tuple[date, int, datetime]:
 
 
 def last_slot_index(session_date: date) -> int:
-    """Index of the final bar of a session, counting a partial trailing bar."""
-    bounds = session_bounds(session_date)
-    if bounds is None:
+    """Index of the final bar of a session.
+
+    The trailing-partial-bar rule lives in market_clock and nowhere else; a
+    second copy of it here is how the ordinal drifts away from the trained bars.
+    """
+    slots = session_slot_count(session_date, slot_seconds())
+    if not slots:
         raise MarketClockError(f"{session_date} ไม่ใช่วันทำการ")
-    sec = slot_seconds()
-    span = int((bounds[1] - bounds[0]).total_seconds())
-    return max(0, -(-span // sec) - 1)
+    return slots - 1
 
 
 def walk_back(n: int, at: datetime | None = None) -> datetime:

@@ -136,6 +136,38 @@ def test_intent_uses_the_committed_run_id(monkeypatch, auto_submit):
     assert row_is_committed(body["run_id"]) is True
 
 
+def test_outbox_failure_never_reports_the_row_as_uncommitted(monkeypatch, auto_submit):
+    """The slot is durable before the outbox is touched, so an intent that fails
+    to write costs this row its order and nothing else."""
+    def boom(*args, **kwargs):
+        raise RuntimeError("RTDB write failed")
+    monkeypatch.setattr(main, "put_intent", boom)
+
+    body, code = _run(monkeypatch, SESSION_OPEN_SLOT, 320.0)
+    assert code == 200
+    assert body["committed"] is True
+    assert body["pipeline_status"] == "ROW_COMMITTED"
+    assert "RTDB write failed" in body["outbox_error"]
+    row = FAKE_DB.reference(f"webull_lego_rows/{body['run_id']}").get()
+    assert row["committed"] is True
+    assert FAKE_DB.reference(f"{STATE_PATH}/{chain_key(main.load_config())}").get()["version"] == 1
+
+
+def test_unsupported_clock_mode_is_a_config_error(monkeypatch):
+    """Same family as an untrained slot size: a deploy typo, not an engine fault."""
+    monkeypatch.setenv("LEGO_DNA_CLOCK_MODE", "turbo")
+    body, code = _run(monkeypatch, SESSION_OPEN_SLOT, 320.0)
+    assert code == 500 and body["pipeline_status"] == "CONFIG_ERROR"
+    assert FAKE_DB.reference("webull_lego_rows").get() is None
+
+
+def test_clock_mode_tolerates_whitespace_and_case(monkeypatch):
+    monkeypatch.setenv("LEGO_DNA_CLOCK_MODE", "  Market ")
+    body, code = _run(monkeypatch, SESSION_OPEN_SLOT, 320.0)
+    assert code == 200 and body["clock_mode"] == "market"
+    assert body["step"] == body["market_step"] == 0
+
+
 def test_rejected_commit_leaves_no_intent_behind(monkeypatch, auto_submit):
     first, _ = _run(monkeypatch, SESSION_OPEN_SLOT, 320.0)
     body, code = _run(monkeypatch, datetime(2026, 7, 23, 18, 12, 41, tzinfo=UTC), 320.9)
@@ -152,3 +184,70 @@ def test_order_worker_failure_never_blocks_the_row(monkeypatch):
     assert code == 200
     assert body["committed"] is True
     assert "broker down" in body["order_worker"]["error"]
+
+
+# --- execution-leg safety: the order that never resolves ---------------------
+
+def _stub_broker(monkeypatch, *, place=None, detail=None):
+    monkeypatch.setattr(main, "preview_market_order", lambda tc, o: True)
+    monkeypatch.setattr(main, "fetch_open_orders", lambda tc, s: [])
+    monkeypatch.setattr(main, "place_market_order",
+                        place or (lambda tc, o: {"order_status": "FILLED"}))
+    monkeypatch.setattr(main, "fetch_order_detail", detail or (lambda tc, r: {}))
+
+
+def _reject(*args, **kwargs):
+    raise RuntimeError("insufficient buying power")
+
+
+def test_unresolvable_order_stops_being_retried(monkeypatch, auto_submit):
+    """PLACING_UNKNOWN must be bounded: the broker answers UNKNOWN forever when
+    it never accepted the order, and nothing else expires that state."""
+    monkeypatch.setenv("LEGO_RECONCILE_MAX_ATTEMPTS", "3")
+    _stub_broker(monkeypatch, place=_reject)
+    body, _ = _run(monkeypatch, SESSION_OPEN_SLOT, 320.0)
+    ck = chain_key(main.load_config())
+
+    seen = [main._run_order_worker(main.load_config(), limit=3)["results"][0]["status"]
+            for _ in range(3)]
+    assert seen == ["PLACING_UNKNOWN", "PLACING_UNKNOWN", "RECONCILE_ABANDONED"]
+
+    assert list_actionable(ck) == []                      # drops out of the queue
+    audit = FAKE_DB.reference(f"webull_lego_order_audit/{body['run_id']}").get()
+    assert audit["needs_manual_check"] is True            # but not out of sight
+    assert "insufficient buying power" in audit["first_error"]   # why it started
+    assert "still UNKNOWN" in audit["last_error"]                # why it gave up
+
+
+def test_a_stuck_intent_never_starves_a_later_decision(monkeypatch, auto_submit):
+    """The whole execution leg used to die silently: three unresolvable intents
+    fill LEGO_ORDER_WORKER_LIMIT oldest-first and no order goes out again."""
+    monkeypatch.setenv("LEGO_RECONCILE_MAX_ATTEMPTS", "2")
+    _stub_broker(monkeypatch, place=_reject)
+    cfg = main.load_config()
+    ck = chain_key(cfg)
+    _run(monkeypatch, SESSION_OPEN_SLOT, 320.0)
+    for _ in range(2):
+        main._run_order_worker(cfg, limit=1)
+
+    # broker recovers, a later slot decides to trade
+    _stub_broker(monkeypatch, detail=lambda tc, r: {
+        "order_status": "FILLED", "filled_quantity": 1.0, "avg_filled_price": 322.0})
+    later, _ = _run(monkeypatch, datetime(2026, 7, 23, 19, 30, 5, tzinfo=UTC), 322.0)
+    main._run_order_worker(cfg, limit=1)
+    assert FAKE_DB.reference(
+        f"{OUTBOX_PATH}/{ck}/{later['run_id']}").get()["status"] == "FILLED"
+
+
+def test_whole_share_quantity_is_not_truncated(monkeypatch, auto_submit):
+    """LEGO_DECIMAL_PRECISION=0 is documented as valid; 20 shares must not
+    reach the broker as '2'."""
+    monkeypatch.setenv("LEGO_DECIMAL_PRECISION", "0")
+    monkeypatch.setenv("LEGO_FIX_C", "2000")
+    sent = []
+    _stub_broker(monkeypatch, place=lambda tc, o: sent.append(o) or {"order_status": "FILLED"},
+                 detail=lambda tc, r: {"order_status": "FILLED"})
+    body, _ = _run(monkeypatch, SESSION_OPEN_SLOT, 100.0, holdings=0.0)
+    assert body["status"] == "READY_BUY"
+    main._run_order_worker(main.load_config(), limit=1)
+    assert sent and sent[0][0]["quantity"] == "20"

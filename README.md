@@ -139,3 +139,6 @@ gcloud scheduler jobs run lego-tick --location=$REGION --project=$PROJECT
 5. order ส่งได้เฉพาะ UAT + READY_* + row committed แล้ว + ผ่าน submit gate; Production read-only
 6. FILLED ยืนยันจาก order detail ของ broker เท่านั้น — ไม่โม้จาก SUBMITTED
 7. commit แถวก่อน แล้วค่อยเขียน outbox — order พังต้องไม่ rollback แถวและไม่ขวาง slot ถัดไป
+8. order ใบเดียวที่ค้างต้องไม่ขวางใบถัดไป — `PLACING_UNKNOWN` มีเพดาน
+   (`LEGO_RECONCILE_MAX_ATTEMPTS`) แล้วจบเป็น `RECONCILE_ABANDONED` + `needs_manual_check`
+9. จำนวนที่ส่ง broker ต้องเท่าจำนวนที่ตัดสินใจเสมอ ทุกค่า `LEGO_DECIMAL_PRECISION` รวม `0`

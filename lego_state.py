@@ -203,6 +203,13 @@ def commit_final_row(cfg: Config, snapshot: dict, anchor: Anchor | None, row: di
                 next_state["calendar_fingerprint"] = calendar_fingerprint()
         if market_ordinal is not None:
             next_state["market_ordinal"] = int(market_ordinal)
+        elif current and current.get("market_ordinal") is not None:
+            # A degraded commit resolves no ordinal, but dropping the chain's
+            # last one would disarm the regression guard for every commit after
+            # it — exactly when the clock has just proven unreliable. Carrying
+            # the old value forward under-reports by the degraded slots, which
+            # still catches a genuine walk backwards.
+            next_state["market_ordinal"] = int(current["market_ordinal"])
         if clock_mode is not None:
             next_state["clock_mode"] = clock_mode
         return next_state
