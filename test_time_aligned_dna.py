@@ -6,13 +6,15 @@ import pytest
 
 from conftest import FAKE_DB
 from lego_one_row import Config, compute_row
+from lego_orders import normalize_status as broker_status
 from lego_outbox import list_actionable, put_intent, row_is_committed, update_intent
+from lego_outbox import normalize_status as outbox_status
 from lego_state import (STATE_PATH, CalendarDriftError, OrdinalRegression,
                         SlotAlreadyConsumed, chain_key, commit_final_row, read_anchor)
-from market_clock import (MarketClockError, _session_slots, calendar_fingerprint,
-                          clock_mode, fallback_slot_id, is_regular_session,
+from market_clock import (MarketClockError, calendar_fingerprint, clock_mode,
+                          fallback_slot_id, is_regular_session,
                           market_ordinal_for_slot_id, resolve_dna_step,
-                          resolve_market_slot, slot_seconds)
+                          resolve_market_slot, session_slot_count, slot_seconds)
 
 UTC = timezone.utc
 NORMAL_SESSION = date(2026, 7, 23)        # Thursday, 09:30-16:00 ET
@@ -46,8 +48,8 @@ def _commit(snapshot, anchor, step, slot_id, ordinal):
     (86400, 1, 1),      # 1d
 ])
 def test_session_slot_count_matches_trained_bars(sec, normal, early):
-    assert _session_slots(NORMAL_SESSION, sec) == normal
-    assert _session_slots(EARLY_CLOSE, sec) == early
+    assert session_slot_count(NORMAL_SESSION, sec) == normal
+    assert session_slot_count(EARLY_CLOSE, sec) == early
 
 
 def test_untrained_slot_size_is_rejected(monkeypatch):
@@ -170,7 +172,7 @@ def test_ordinal_must_move_forward():
         _commit(snap1, anchor, 2, "2026-07-23:12", 2)     # sideways
     state = FAKE_DB.reference(f"{STATE_PATH}/{chain_key(CFG)}").get()
     assert (state["version"], state["market_ordinal"]) == (1, 2)
-    assert FAKE_DB.reference("webull_lego_rows").get().keys().__len__() == 1
+    assert len(FAKE_DB.reference("webull_lego_rows").get()) == 1   # no orphan row
 
 
 def test_ordinal_guard_allows_forward_jumps():
@@ -181,16 +183,29 @@ def test_ordinal_guard_allows_forward_jumps():
     assert _commit(snap1, anchor, 3, "2026-07-23:12", 3)["committed"] is True
 
 
-def test_degraded_commit_carries_no_ordinal_so_the_guard_stays_out_of_the_way():
-    snap0 = {"captured_at": "2026-07-23T18:00:05Z", "price": 320.0, "holdings": 9.0}
+def test_degraded_commit_does_not_disarm_the_ordinal_guard():
+    """A clock-less commit resolves no ordinal, but must not erase the chain's.
+
+    Dropping it would leave the guard off for every later commit — precisely
+    when the clock has just proven unreliable.
+    """
+    snap0 = {"captured_at": "2026-07-23T20:30:05Z", "price": 320.0, "holdings": 9.0}
     _commit(snap0, None, 5, "2026-07-23:14", 5)
     anchor = read_anchor(CFG)
-    snap1 = {"captured_at": "2026-07-23T18:30:05Z", "price": 321.0, "holdings": 9.0}
+    snap1 = {"captured_at": "2026-07-23T21:00:05Z", "price": 321.0, "holdings": 9.0}
     row = compute_row(CFG, snap1, anchor, dna_step=6)
     result = commit_final_row(CFG, snap1, anchor, row,
                               slot_id=fallback_slot_id(snap1["captured_at"]),
                               clock_mode="shadow:degraded")
     assert result["committed"] is True
+    state = FAKE_DB.reference(f"{STATE_PATH}/{chain_key(CFG)}").get()
+    assert state["market_ordinal"] == 5          # carried, not dropped
+
+    anchor = read_anchor(CFG)
+    snap2 = {"captured_at": "2026-07-23T18:30:05Z", "price": 322.0, "holdings": 9.0}
+    with pytest.raises(OrdinalRegression):
+        _commit(snap2, anchor, 2, "2026-07-23:11", 2)
+    assert read_anchor(CFG).dna_step == 6        # pointer never walked backwards
 
 
 # --- one calendar for every path ---------------------------------------------
@@ -284,3 +299,17 @@ def test_outbox_supports_multiple_slots_without_overwrite():
 
 def test_outbox_worker_must_require_committed_source_row():
     assert row_is_committed("missing") is False
+
+
+def test_outbox_status_normalization_matches_the_broker_normalizer():
+    """One normalizer, two defaults: outbox reads a missing status as UNKNOWN.
+
+    A blank-but-present status must stay blank — 'UNKNOWN' routes an intent into
+    the broker-reconcile branch, which a whitespace value should never trigger.
+    """
+    assert outbox_status(None) == "UNKNOWN"
+    assert outbox_status("") == "UNKNOWN"
+    assert outbox_status(0) == "UNKNOWN"
+    assert outbox_status("   ") == ""
+    assert outbox_status("partial filled") == broker_status("partial filled")
+    assert outbox_status("Submitted") == "SUBMITTED"

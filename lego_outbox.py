@@ -17,8 +17,8 @@ TERMINAL = {
 
 
 def normalize_status(value) -> str:
-    """Same normalization as lego_orders; an empty status is UNKNOWN here."""
-    return _normalize_status(value) or "UNKNOWN"
+    """Same normalization as lego_orders; a missing status reads as UNKNOWN."""
+    return _normalize_status(value or "UNKNOWN")
 
 
 def put_intent(chain_key: str, run_id: str, payload: dict) -> dict:

@@ -228,8 +228,11 @@ def lego_one_row(request):
 
     try:
         # Mandatory: the slot grid must match the timeframe the DNA was trained
-        # on, so a missing/unsupported value is a deploy error, not a runtime one.
+        # on, and the clock mode decides which step the row gets. A missing or
+        # unsupported value is a deploy error, not a runtime one, so both are
+        # resolved up front instead of surfacing later as an engine failure.
         slot_seconds()
+        mode = clock_mode()
     except MarketClockError as exc:
         return {"status": "CONFIG_ERROR", "committed": False,
                 "pipeline_status": "CONFIG_ERROR", "error": str(exc)}, 500
@@ -243,7 +246,6 @@ def lego_one_row(request):
     try:
         anchor = read_anchor(cfg)
         legacy_step = dna_step_for(anchor)
-        mode = clock_mode()
         slot = None
         clock_error = None
         try:
@@ -279,9 +281,16 @@ def lego_one_row(request):
         env = environment_label()
         auto = os.environ.get("AUTO_SUBMIT", "false").lower() == "true"
         should_submit = auto and env == UAT and row["สถานะ"] in (READY_BUY, READY_SELL)
+        outbox_error = None
         if should_submit and slot and (result["committed"] or result.get("idempotent")):
-            put_intent(chain_key(cfg), result["run_id"],
-                       _outbox_intent(cfg, row, snapshot, slot, decision_time))
+            # The slot is already durable at this point, so a failed intent may
+            # only cost this row its order — reporting it as a DNA failure would
+            # be a lie and would invite a retry that finds the slot consumed.
+            try:
+                put_intent(chain_key(cfg), result["run_id"],
+                           _outbox_intent(cfg, row, snapshot, slot, decision_time))
+            except Exception as exc:
+                outbox_error = f"{type(exc).__name__}: {exc}"
 
         out = {
             "status": row["สถานะ"], "committed": result["committed"],
@@ -298,6 +307,8 @@ def lego_one_row(request):
         }
         if clock_error:
             out["clock_warning"] = clock_error
+        if outbox_error:
+            out["outbox_error"] = outbox_error
 
         # Off by default: dispatching inline adds broker latency to the DNA
         # invocation, which raises the odds of a scheduler timeout+retry.

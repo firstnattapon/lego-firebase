@@ -10,7 +10,7 @@ from datetime import datetime, timezone
 import pytest
 
 from find_origin import current_slot, last_slot_index, walk_back
-from market_clock import MarketClockError, resolve_market_slot
+from market_clock import MarketClockError, resolve_market_slot, session_slot_count
 
 UTC = timezone.utc
 THURSDAY_1545_ET = datetime(2026, 7, 23, 19, 45, tzinfo=UTC)     # slot 12 of 13
@@ -57,11 +57,20 @@ def test_walk_back_counts_an_early_close_session_correctly(monkeypatch):
         assert _ordinal_at(monkeypatch, origin, FRIDAY_AFTER_THANKSGIVING) == n
 
 
-def test_walk_back_matches_a_one_day_grid(monkeypatch):
-    monkeypatch.setenv("LEGO_SLOT_SECONDS", "86400")
-    for n in (0, 1, 5):
+@pytest.mark.parametrize("sec", ["900", "3600", "14400", "86400"])
+def test_walk_back_holds_on_every_trained_timeframe(monkeypatch, sec):
+    monkeypatch.setenv("LEGO_SLOT_SECONDS", sec)
+    for n in (0, 1, 5, 30):
         origin = walk_back(n, THURSDAY_1545_ET)
         assert _ordinal_at(monkeypatch, origin, THURSDAY_1545_ET) == n
+
+
+def test_last_slot_index_delegates_to_the_clocks_bar_count(monkeypatch):
+    """One owner for the trailing-partial-bar rule; no second copy to drift."""
+    for sec in (900, 1800, 3600, 14400, 86400):
+        monkeypatch.setenv("LEGO_SLOT_SECONDS", str(sec))
+        for day in (THURSDAY_1545_ET.date(), FRIDAY_AFTER_THANKSGIVING.date()):
+            assert last_slot_index(day) == session_slot_count(day, sec) - 1
 
 
 def test_outside_a_session_fails_closed():

@@ -136,6 +136,38 @@ def test_intent_uses_the_committed_run_id(monkeypatch, auto_submit):
     assert row_is_committed(body["run_id"]) is True
 
 
+def test_outbox_failure_never_reports_the_row_as_uncommitted(monkeypatch, auto_submit):
+    """The slot is durable before the outbox is touched, so an intent that fails
+    to write costs this row its order and nothing else."""
+    def boom(*args, **kwargs):
+        raise RuntimeError("RTDB write failed")
+    monkeypatch.setattr(main, "put_intent", boom)
+
+    body, code = _run(monkeypatch, SESSION_OPEN_SLOT, 320.0)
+    assert code == 200
+    assert body["committed"] is True
+    assert body["pipeline_status"] == "ROW_COMMITTED"
+    assert "RTDB write failed" in body["outbox_error"]
+    row = FAKE_DB.reference(f"webull_lego_rows/{body['run_id']}").get()
+    assert row["committed"] is True
+    assert FAKE_DB.reference(f"{STATE_PATH}/{chain_key(main.load_config())}").get()["version"] == 1
+
+
+def test_unsupported_clock_mode_is_a_config_error(monkeypatch):
+    """Same family as an untrained slot size: a deploy typo, not an engine fault."""
+    monkeypatch.setenv("LEGO_DNA_CLOCK_MODE", "turbo")
+    body, code = _run(monkeypatch, SESSION_OPEN_SLOT, 320.0)
+    assert code == 500 and body["pipeline_status"] == "CONFIG_ERROR"
+    assert FAKE_DB.reference("webull_lego_rows").get() is None
+
+
+def test_clock_mode_tolerates_whitespace_and_case(monkeypatch):
+    monkeypatch.setenv("LEGO_DNA_CLOCK_MODE", "  Market ")
+    body, code = _run(monkeypatch, SESSION_OPEN_SLOT, 320.0)
+    assert code == 200 and body["clock_mode"] == "market"
+    assert body["step"] == body["market_step"] == 0
+
+
 def test_rejected_commit_leaves_no_intent_behind(monkeypatch, auto_submit):
     first, _ = _run(monkeypatch, SESSION_OPEN_SLOT, 320.0)
     body, code = _run(monkeypatch, datetime(2026, 7, 23, 18, 12, 41, tzinfo=UTC), 320.9)

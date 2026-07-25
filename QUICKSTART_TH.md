@@ -361,11 +361,17 @@ slot ปัจจุบัน      = 2026-07-23:9 (เริ่ม 2026-07-23T18
 เอาไป update ทั้งสองฟังก์ชัน (ค่าต้องตรงกัน):
 
 ```bash
-for fn in lego-one-row lego-order-worker; do
-  gcloud functions deploy "$fn" --gen2 --region="$REGION" \
-    --update-env-vars="LEGO_DNA_ORIGIN_UTC=2026-07-23T18:00:00Z,LEGO_DNA_CLOCK_MODE=market"
-done
+gcloud functions deploy lego-one-row --gen2 --region="$REGION" \
+  --source=. --entry-point=lego_one_row \
+  --update-env-vars="LEGO_DNA_ORIGIN_UTC=2026-07-23T18:00:00Z,LEGO_DNA_CLOCK_MODE=market"
+
+gcloud functions deploy lego-order-worker --gen2 --region="$REGION" \
+  --source=. --entry-point=lego_order_worker \
+  --update-env-vars="LEGO_DNA_ORIGIN_UTC=2026-07-23T18:00:00Z,LEGO_DNA_CLOCK_MODE=market"
 ```
+
+> เขียนแยกสองคำสั่งเพราะ `--entry-point` ของสองฟังก์ชันไม่เหมือนกัน — ระบุให้ชัดทุกครั้ง
+> อย่าพึ่งให้ gcloud จำค่าเดิม และรันจาก root ของ repo เสมอเพราะ `--source=.`
 
 > 🚨 **แก้ได้ครั้งเดียวก่อน commit แถวแรกเท่านั้น**
 > `LEGO_DNA_ORIGIN_UTC`, `LEGO_SLOT_SECONDS`, `LEGO_MARKET_HOLIDAYS`,
