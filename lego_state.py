@@ -7,6 +7,7 @@ from datetime import datetime, timezone
 
 from firebase_admin import db
 
+from dna_engine import dna_fingerprint
 from lego_one_row import Anchor, Config, validate_row_columns
 from lego_orders import apply_fill, normalize_status
 from market_clock import calendar_fingerprint, market_ordinal_for_slot_id
@@ -28,6 +29,15 @@ class SlotAlreadyConsumed(RuntimeError):
 
 class CalendarDriftError(RuntimeError):
     """The market calendar no longer reproduces this chain's committed slots."""
+
+
+class DNADriftError(RuntimeError):
+    """The same dna_code no longer decodes to the gate array this chain traded.
+
+    Same family as CalendarDriftError: an input the chain was built on changed
+    underneath it, so continuing would trade a different strategy under the same
+    name. Fail closed and let a human decide.
+    """
 
 
 class OrdinalRegression(RuntimeError):
@@ -85,6 +95,23 @@ def verify_calendar_continuity(state: dict | None) -> None:
             f"slot {slot_id} เคย commit เป็น ordinal {int(ordinal)} แต่คำนวณใหม่ได้ {recomputed}")
 
 
+def verify_dna_continuity(cfg: Config, state: dict | None) -> None:
+    """Fail closed when the same dna_code stops decoding to the traded array.
+
+    Runs on every commit, not only clock-resolved ones: the gate array decides
+    the row regardless of which slot it landed on. Chains written before the
+    field simply have nothing to compare — the next commit records it.
+    """
+    if not state:
+        return
+    stored = state.get("dna_fingerprint")
+    if stored and stored != dna_fingerprint(cfg.dna_code):
+        raise DNADriftError(
+            f"dna_code เดิมแต่ decode ได้ gate array คนละชุด: {stored} -> "
+            f"{dna_fingerprint(cfg.dna_code)} (มักเกิดจาก numpy เปลี่ยนเวอร์ชัน) "
+            "— chain นี้จะกลายเป็นคนละกลยุทธ์ ต้องคืน numpy เดิมหรือเริ่ม chain ใหม่")
+
+
 def read_anchor(cfg: Config) -> Anchor | None:
     state = db.reference(f"{STATE_PATH}/{chain_key(cfg)}").get()
     if not state:
@@ -136,6 +163,7 @@ def commit_final_row(cfg: Config, snapshot: dict, anchor: Anchor | None, row: di
     state_ref = db.reference(f"{STATE_PATH}/{ck}")
     meta = row["_meta"]
     state_before = state_ref.get()
+    verify_dna_continuity(cfg, state_before)
     if slot_id is not None:
         verify_calendar_continuity(state_before)
     _repair_pending_row(state_before)
@@ -192,6 +220,7 @@ def commit_final_row(cfg: Config, snapshot: dict, anchor: Anchor | None, row: di
             "last_run_id": run_id,
             "updated_at": snapshot["captured_at"],
             "config_hash": config_hash(cfg),
+            "dna_fingerprint": dna_fingerprint(cfg.dna_code),
             "symbol": cfg.symbol,
             "cashflow_semantics": CASHFLOW_SEMANTICS,
         }

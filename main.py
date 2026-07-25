@@ -14,16 +14,17 @@ import firebase_admin
 import functions_framework
 from firebase_admin import credentials, db
 
-from lego_one_row import READY_BUY, READY_SELL, compute_row, dna_step_for
+from lego_one_row import (READY_BUY, READY_SELL, HoldingsAnomaly,
+                          check_holdings_continuity, compute_row, dna_step_for)
 from lego_orders import (REALIZED_STATUSES, TERMINAL_STATUSES, UAT,
                          evaluate_submit_gate, normalize_status,
                          order_confirmation_phrase, summarize_order_result)
 from lego_outbox import (expire_unsent_before, list_actionable, put_intent,
                          row_is_committed, update_intent)
-from lego_state import (CalendarDriftError, OrdinalRegression, SlotAlreadyConsumed,
-                        StaleAnchorError, apply_realized_fill, chain_key,
-                        commit_final_row, read_anchor, update_order_audit,
-                        write_order_audit)
+from lego_state import (CalendarDriftError, DNADriftError, OrdinalRegression,
+                        SlotAlreadyConsumed, StaleAnchorError, apply_realized_fill,
+                        chain_key, commit_final_row, read_anchor,
+                        update_order_audit, write_order_audit)
 from market_clock import (MarketClockError, clock_mode, fallback_slot_id,
                           is_regular_session, resolve_dna_step, resolve_market_slot,
                           slot_seconds)
@@ -305,6 +306,11 @@ def lego_one_row(request):
 
         trade_client, data_client = build_clients()
         snapshot = fetch_snapshot(trade_client, data_client, cfg)
+        # Before the row exists: a snapshot that lost the position would make
+        # gap = fix_c, the largest order possible, and committing it would also
+        # write prev_holdings = 0 and disarm this check for every commit after.
+        if os.environ.get("LEGO_ALLOW_ZERO_HOLDINGS", "false").lower() != "true":
+            check_holdings_continuity(anchor, float(snapshot["holdings"]))
         if slot:
             slot_id = slot.slot_id
         else:
@@ -374,6 +380,12 @@ def lego_one_row(request):
     except OrdinalRegression as exc:
         return {"status": "ORDINAL_REGRESSION", "committed": False,
                 "pipeline_status": "ORDINAL_REGRESSION", "note": str(exc)}, 409
+    except DNADriftError as exc:
+        return {"status": "DNA_DRIFT", "committed": False,
+                "pipeline_status": "DNA_DRIFT", "note": str(exc)}, 409
+    except HoldingsAnomaly as exc:
+        return {"status": "HOLDINGS_ANOMALY", "committed": False,
+                "pipeline_status": "HOLDINGS_ANOMALY", "note": str(exc)}, 409
     except Exception as exc:
         try:
             db.reference("webull_lego_errors").push({

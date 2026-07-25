@@ -201,6 +201,7 @@ gcloud functions deploy lego-one-row \
 | `WEBULL_ENV` | `UAT` | `UAT` = ส่ง order ได้ · อย่างอื่น = Production (read-only) |
 | `AUTO_SUBMIT` | `false` | `true` = สร้าง order intent อัตโนมัติเมื่อแถวเป็น `READY_*` |
 | `WEBULL_TOKEN_DIR` | `/tmp/webull_token` | ที่เก็บ token ของ SDK |
+| `LEGO_ALLOW_ZERO_HOLDINGS` | `false` | `true` = ยอมรับว่า "ถือ 0 จริง" ทั้งที่ chain เคยเห็นของ · ใช้เฉพาะตอนขายทิ้งเอง/ย้าย position นอกระบบ **แล้วเอาออกทันที** (ดู `HOLDINGS_ANOMALY`) |
 
 **นาฬิกา DNA** (ทุกตัวมีผลต่อ phase ของ gate array — ดูหัวข้อ 7.5):
 
@@ -463,6 +464,8 @@ gcloud functions describe lego-one-row --gen2 --region="$REGION" --format='value
 | `STALE_ANCHOR` | มี 2 instance เขียนชนกัน | ตั้ง `--max-retry-attempts=0` และอย่ายิงซ้อน |
 | `CALENDAR_DRIFT` | ปฏิทิน/slot/origin เปลี่ยนหลัง commit แรก | คืนค่าเดิม หรือเริ่ม chain ใหม่ (ข้อ 7.5) |
 | `ORDINAL_REGRESSION` | slot ให้ ordinal ที่ไม่เดินหน้า | ตรวจ origin/เวลาเครื่อง — DNA เดินถอยไม่ได้ |
+| `HOLDINGS_ANOMALY` | chain เคยเห็นของ แต่ snapshot อ่านได้ 0 | เช็คที่ broker ว่ายังถืออยู่ไหม · ถ้าถืออยู่จริง = positions response ไม่ครบ รอรอบหน้า · ถ้าขายทิ้งไปจริง ตั้ง `LEGO_ALLOW_ZERO_HOLDINGS=true` 1 รอบแล้วเอาออก |
+| `DNA_DRIFT` | `dna_code` เดิม แต่ decode ได้ gate array คนละชุด | เกือบทั้งหมดคือ **numpy เปลี่ยนเวอร์ชัน** — คืน numpy ตัวที่ pin ไว้ใน `requirements.txt` หรือเริ่ม chain ใหม่ ห้ามปล่อยผ่าน (= เทรดคนละกลยุทธ์ใต้ชื่อเดิม) |
 
 ตรวจใน **Streamlit:**
 
