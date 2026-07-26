@@ -19,9 +19,9 @@ from lego_archive import archive_terminal_records
 from lego_one_row import (READY_BUY, READY_SELL, DNAExhausted, HoldingsAnomaly,
                           check_holdings_continuity, compute_row, dna_step_for,
                           dna_steps_remaining)
-from lego_orders import (REALIZED_STATUSES, TERMINAL_STATUSES, UAT,
-                         evaluate_submit_gate, normalize_status,
-                         order_confirmation_phrase, summarize_order_result)
+from lego_orders import (TERMINAL_STATUSES, UAT, evaluate_submit_gate,
+                         normalize_status, order_confirmation_phrase,
+                         summarize_order_result)
 from lego_outbox import (expire_unsent_before, list_actionable, put_intent,
                          read_committed_row, update_intent)
 from lego_state import (CalendarDriftError, DNADriftError, OrdinalRegression,
@@ -102,8 +102,9 @@ def _record_warning(kind: str, message: str, extra: dict | None = None) -> None:
 
 
 def _apply_realized_if_available(intent: dict, summary: dict) -> dict:
-    status = normalize_status(summary.get("status"))
-    if status not in REALIZED_STATUSES:
+    # summarize_order_result decides this from the filled quantity, not from the
+    # status alone, so a fill that ends CANCELLED or EXPIRED is still accounted.
+    if not summary.get("realized"):
         return summary
     qty = summary.get("filled_quantity")
     price = summary.get("filled_price")

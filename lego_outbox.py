@@ -12,6 +12,14 @@ ROWS_PATH = "webull_lego_rows"
 # lego_orders.TERMINAL_STATUSES, which only means the broker is done.
 TERMINAL = {
     "FILLED", "CANCELLED", "FAILED", "REJECTED", "EXPIRED_UNSENT",
+    # The broker's own EXPIRED — a DAY order the session ended on — as opposed to
+    # EXPIRED_UNSENT, which is ours for an intent that never left. It was missing
+    # here while lego_orders.TERMINAL_STATUSES had it, so such an intent stayed
+    # actionable forever: no branch in the dispatcher handles it, yet
+    # list_actionable kept serving it oldest-first. Three of them fill
+    # LEGO_ORDER_WORKER_LIMIT and no later decision is ever dispatched again —
+    # the same starvation RECONCILE_ABANDONED was added to prevent.
+    "EXPIRED",
     "SUPPRESSED_ACTIVE_ORDER", "SUPPRESSED_STATE_CHANGED", "NOT_PLACED",
     # The broker never resolved this order and the reconcile budget ran out.
     # Terminal for dispatch only — the order audit keeps needs_manual_check so

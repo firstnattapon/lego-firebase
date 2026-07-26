@@ -325,6 +325,31 @@ def test_detail_partial_filled_with_space_from_sdk_enum():
     assert s["realized"] is True
 
 
+def test_a_fill_counts_even_when_the_order_ends_somewhere_else():
+    """A DAY order that fills 30 of 70 and is cancelled at the close reports
+    CANCELLED — those 30 shares are still real and still ours."""
+    s = summarize_order_result({}, {"order_status": "CANCELLED",
+                                    "filled_quantity": "30",
+                                    "avg_filled_price": "12.5"})
+    assert s["status"] == "CANCELLED" and s["realized"] is True
+    assert s["filled_quantity"] == "30" and s["filled_price"] == 12.5
+
+
+@pytest.mark.parametrize("status", ["CANCELLED", "EXPIRED", "REJECTED"])
+def test_an_order_that_never_filled_realizes_nothing(status):
+    s = summarize_order_result({}, {"order_status": status, "filled_quantity": "0"})
+    assert s["realized"] is False
+
+
+def test_broker_expiry_leaves_the_dispatch_queue():
+    """EXPIRED is terminal at the broker; leaving it actionable starves the
+    outbox exactly the way an unresolvable reconcile did."""
+    from lego_outbox import TERMINAL as OUTBOX_TERMINAL
+    assert TERMINAL_STATUSES <= OUTBOX_TERMINAL
+    assert "EXPIRED" in OUTBOX_TERMINAL          # broker's own, not EXPIRED_UNSENT
+    assert "PARTIAL_FILLED" not in OUTBOX_TERMINAL
+
+
 def test_partial_realized_but_not_terminal():
     # partial = ของเข้าพอร์ตแล้วบางส่วน (realized) แต่ order ยังไม่จบ — ต้องตามต่อ
     assert "PARTIAL_FILLED" in REALIZED_STATUSES

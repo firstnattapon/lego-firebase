@@ -118,13 +118,21 @@ def summarize_order_result(place_response: dict, detail: dict | None = None) -> 
         fields.get("order_status") or fields.get("status")
         or (place_response or {}).get("order_status")
         or (place_response or {}).get("status"))
-    realized = status in REALIZED_STATUSES
+    filled = fields.get("filled_quantity") or fields.get("filled_qty")
+    filled_number = _coalesce_float(fields, ("filled_quantity", "filled_qty"))
+    # Shares moved or they did not; the status is a label on top of that. Keying
+    # this on the status set alone lost every fill that ended somewhere else: a
+    # DAY order that fills 30 of 70 and is cancelled at the close reports
+    # CANCELLED with filled_quantity=30, and those 30 real shares never reached
+    # the realized ledger. Double counting is not the risk — apply_realized_fill
+    # stores the cumulative quantity per order, so seeing the same 30 again is a
+    # zero-sized delta.
+    realized = status in REALIZED_STATUSES or bool(filled_number and filled_number > 0)
     out = {
         "status": status or "UNKNOWN",
         "realized": realized,
         "note": "realized ใช้เฉพาะ fill จริง; model ledger แยกจาก broker ledger",
     }
-    filled = fields.get("filled_quantity") or fields.get("filled_qty")
     if filled is not None:
         out["filled_quantity"] = filled
     price = _coalesce_float(fields, EXECUTION_PRICE_FIELDS, minimum_exclusive=0.0)
