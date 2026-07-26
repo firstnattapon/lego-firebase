@@ -39,6 +39,9 @@ def env(monkeypatch):
     monkeypatch.delenv("AUTO_SUBMIT", raising=False)
     monkeypatch.delenv("LEGO_INLINE_ORDER_WORKER", raising=False)
     monkeypatch.setattr(main, "build_clients", lambda: (object(), object()))
+    # A healthy token by default: the tests below own the warnings node and
+    # a real token file does not exist in a test process.
+    monkeypatch.setattr(main, "token_health", lambda: {"ok": True, "reasons": []})
 
 
 def _run(monkeypatch, moment: datetime, price: float, holdings: float = 9.0):
@@ -159,6 +162,27 @@ def test_unsupported_clock_mode_is_a_config_error(monkeypatch):
     body, code = _run(monkeypatch, SESSION_OPEN_SLOT, 320.0)
     assert code == 500 and body["pipeline_status"] == "CONFIG_ERROR"
     assert FAKE_DB.reference("webull_lego_rows").get() is None
+
+
+def test_unknown_market_category_is_a_config_error(monkeypatch):
+    """It is a snapshot query parameter, so a typo is answered by the broker."""
+    monkeypatch.setenv("LEGO_MARKET_CATEGORY", "US_STONK")
+    body, code = _run(monkeypatch, SESSION_OPEN_SLOT, 320.0)
+    assert code == 500 and body["pipeline_status"] == "CONFIG_ERROR"
+    assert FAKE_DB.reference("webull_lego_rows").get() is None
+
+
+def test_an_unhealthy_token_is_reported_without_stopping_the_row(monkeypatch):
+    """Days of warning beat a dead chain: the row still commits."""
+    monkeypatch.setattr(main, "token_health", lambda: {
+        "ok": False, "reasons": ["token เหลืออีก 0.50 วันก่อนหมดอายุ"],
+        "token_dir": "/tmp/webull_token", "days_left": 0.5, "expires_at": None})
+    body, code = _run(monkeypatch, SESSION_OPEN_SLOT, 320.0)
+    assert code == 200 and body["committed"] is True
+    assert "หมดอายุ" in body["token_warning"]
+    warning = FAKE_DB.reference("webull_lego_warnings/webull_token").get()
+    assert warning["count"] == 1 and warning["days_left"] == 0.5
+    assert "expires_at" not in warning        # None is not written to RTDB
 
 
 def test_clock_mode_tolerates_whitespace_and_case(monkeypatch):

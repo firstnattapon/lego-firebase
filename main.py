@@ -33,8 +33,8 @@ from market_clock import (MarketClockError, clock_mode, fallback_slot_id,
                           slot_seconds)
 from webull_io import (build_clients, build_order_payload, environment_label,
                        fetch_open_orders, fetch_order_detail, fetch_snapshot,
-                       is_transient_exception, load_config, place_market_order,
-                       preview_market_order)
+                       is_transient_exception, load_config, market_category,
+                       place_market_order, preview_market_order, token_health)
 
 ORDER_POLL_ATTEMPTS = 3
 ORDER_POLL_DELAY_S = 2.0
@@ -373,11 +373,14 @@ def lego_one_row(request):
     try:
         # Mandatory: the slot grid must match the timeframe the DNA was trained
         # on, and the clock mode decides which step the row gets. A missing or
-        # unsupported value is a deploy error, not a runtime one, so both are
-        # resolved up front instead of surfacing later as an engine failure.
+        # unsupported value is a deploy error, not a runtime one, so all three are
+        # resolved up front instead of surfacing later as an engine failure —
+        # the market category included, since a typo there reaches the broker as
+        # a query parameter and comes back as an unhelpful snapshot error.
         slot_seconds()
         mode = clock_mode()
-    except MarketClockError as exc:
+        market_category()
+    except (MarketClockError, ValueError) as exc:
         return {"status": "CONFIG_ERROR", "committed": False,
                 "pipeline_status": "CONFIG_ERROR", "error": str(exc)}, 500
 
@@ -405,6 +408,18 @@ def lego_one_row(request):
             clock_error = str(exc)
 
         trade_client, data_client = build_clients()
+        # The token dies of old age silently: nothing in the SDK renews it, and
+        # recovery needs a human to approve 2FA within 300 seconds. build_clients
+        # refreshes it while it is still valid; this reports what is left so the
+        # cases it cannot fix by itself — an ephemeral token dir, a token already
+        # gone — are visible days before they stop the chain.
+        health = token_health()
+        token_warning = None if health["ok"] else "; ".join(health["reasons"])
+        if token_warning:
+            _record_warning("webull_token", token_warning, {
+                k: v for k, v in health.items()
+                if k in ("token_dir", "ephemeral_token_dir", "status",
+                         "expires_at", "days_left") and v is not None})
         snapshot = fetch_snapshot(trade_client, data_client, cfg)
         # Before the row exists: a snapshot that lost the position would make
         # gap = fix_c, the largest order possible, and committing it would also
@@ -472,6 +487,8 @@ def lego_one_row(request):
         }
         if clock_error:
             out["clock_warning"] = clock_error
+        if token_warning:
+            out["token_warning"] = token_warning
         if outbox_error:
             out["outbox_error"] = outbox_error
         if outbox_skipped:
