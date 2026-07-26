@@ -44,6 +44,9 @@ def env(monkeypatch):
                 "LEGO_MARKET_HOLIDAYS"):
         monkeypatch.delenv(key, raising=False)
     monkeypatch.setattr(main, "build_clients", lambda: (object(), object()))
+    # A healthy token by default: the tests below own the warnings node and
+    # a real token file does not exist in a test process.
+    monkeypatch.setattr(main, "token_health", lambda: {"ok": True, "reasons": []})
 
 
 @pytest.fixture

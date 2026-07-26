@@ -7,8 +7,10 @@ fail-closed branches are testable like everything else.
 """
 from __future__ import annotations
 
+import logging
 import sys
 import types
+from datetime import datetime, timedelta, timezone
 
 import pytest
 
@@ -119,6 +121,41 @@ def test_preview_rejects_error_payloads(payload, expected):
     assert preview_market_order(fake_trade_client(preview=payload), []) is expected
 
 
+def test_open_orders_follow_the_broker_paging(monkeypatch):
+    """A full page is a page, not the whole book — our own order may be on page 2."""
+    monkeypatch.setenv("LEGO_OPEN_ORDER_PAGE_SIZE", "2")
+    pages = [
+        {"orders": [{"symbol": "TSLA", "client_order_id": "a"},
+                    {"symbol": "TSLA", "client_order_id": "b"}]},
+        {"orders": [{"symbol": "FFWM", "client_order_id": "c"}]},
+    ]
+    client = fake_trade_client(open_orders=lambda *a, **k: pages.pop(0))
+    assert fetch_open_orders(client, "FFWM") == [{"symbol": "FFWM", "client_order_id": "c"}]
+    assert client.order_v3.get_order_open.calls[1][1]["last_client_order_id"] == "b"
+
+
+def test_open_order_paging_stops_without_a_usable_cursor(monkeypatch):
+    """A full page whose entries carry no id must end the walk, not repeat it."""
+    monkeypatch.setenv("LEGO_OPEN_ORDER_PAGE_SIZE", "2")
+    client = fake_trade_client(open_orders={"orders": [{"symbol": "TSLA"}, {"symbol": "TSLA"}]})
+    assert fetch_open_orders(client, "FFWM") == []
+    assert len(client.order_v3.get_order_open.calls) == 1
+
+
+def test_open_order_paging_is_bounded(monkeypatch):
+    monkeypatch.setenv("LEGO_OPEN_ORDER_PAGE_SIZE", "1")
+    monkeypatch.setenv("LEGO_OPEN_ORDER_MAX_PAGES", "3")
+    seq = {"n": 0}
+
+    def page(*args, **kwargs):
+        seq["n"] += 1
+        return {"orders": [{"symbol": "TSLA", "client_order_id": f"id-{seq['n']}"}]}
+
+    client = fake_trade_client(open_orders=page)
+    assert fetch_open_orders(client, "FFWM") == []
+    assert len(client.order_v3.get_order_open.calls) == 3
+
+
 def test_place_and_detail_pass_the_account_and_payload_through():
     client = fake_trade_client(place={"order_status": "FILLED"},
                                order_detail={"order_status": "FILLED"})
@@ -157,21 +194,197 @@ def test_permanent_broker_error_is_not_retried():
     assert len(client.order_v3.get_order_open.calls) == 1
 
 
+class _Throttled(Exception):
+    http_status = 429
+
+
+def test_rate_limiting_counts_as_transient():
+    """Every endpoint here has a small per-minute cap; a throttle is a wait."""
+    assert webull_io.is_transient_exception(_Throttled("slow down")) is True
+    assert webull_io.is_transient_exception(_Down("gateway")) is True
+    assert webull_io.is_transient_exception(ValueError("bad request")) is False
+
+
+def test_a_placed_order_is_never_sent_twice():
+    """A transient failure says nothing about whether the broker took the order."""
+    client = fake_trade_client(place=_Down("gateway"))
+    with pytest.raises(_Down):
+        place_market_order(client, [{"client_order_id": "x"}])
+    assert len(client.order_v3.place_order.calls) == 1
+
+
+# ---- market data entitlement -----------------------------------------------
+
+class _Forbidden(Exception):
+    http_status = 403
+
+
+def test_market_data_403_is_named_for_what_it_is():
+    trade = fake_trade_client(positions={"positions": []})
+    data = fake_data_client(snapshot=_Forbidden("forbidden"))
+    with pytest.raises(webull_io.MarketDataForbidden, match="subscription"):
+        fetch_snapshot(trade, data, CFG)
+
+
+def test_the_snapshot_category_is_configurable_and_validated(monkeypatch):
+    trade = fake_trade_client(positions={"positions": []})
+    data = fake_data_client(snapshot=[{"symbol": "FFWM", "last": 12.5}])
+    monkeypatch.setenv("LEGO_MARKET_CATEGORY", "us_etf")
+    fetch_snapshot(trade, data, CFG)
+    assert data.market_data.get_snapshot.calls[0][0][1] == "US_ETF"
+
+    monkeypatch.setenv("LEGO_MARKET_CATEGORY", "US_STONK")
+    with pytest.raises(ValueError, match="fail closed"):
+        fetch_snapshot(trade, data, CFG)
+
+
+def test_the_default_category_is_unchanged(monkeypatch):
+    monkeypatch.delenv("LEGO_MARKET_CATEGORY", raising=False)
+    assert webull_io.market_category() == "US_STOCK"
+
+
+# ---- token lifecycle: the SDK renews nothing --------------------------------
+
+def _write_token(tmp_path, monkeypatch, token: str, expires_at: datetime,
+                 status: str = "NORMAL"):
+    monkeypatch.setenv("WEBULL_TOKEN_DIR", str(tmp_path))
+    # pytest's tmp_path lives under /tmp, which is exactly what the ephemeral
+    # check refuses; that condition has its own test and would mask these.
+    monkeypatch.setattr(webull_io, "token_dir_is_ephemeral", lambda: False)
+    (tmp_path / "token.txt").write_text(
+        f"{token}\n{int(expires_at.timestamp() * 1000)}\n{status}\n", encoding="utf-8")
+
+
+def _now() -> datetime:
+    return datetime.now(timezone.utc)
+
+
+def test_token_health_reads_the_file_the_sdk_writes(tmp_path, monkeypatch):
+    _write_token(tmp_path, monkeypatch, "tok", _now() + timedelta(days=9))
+    health = webull_io.token_health()
+    assert health["ok"] is True and health["found"] is True
+    assert 8.9 < health["days_left"] < 9.1
+
+
+@pytest.mark.parametrize("days,status,reason", [
+    (1, "NORMAL", "หมดอายุ"),
+    (9, "EXPIRED", "NORMAL"),
+])
+def test_token_health_flags_what_will_stop_the_chain(tmp_path, monkeypatch,
+                                                     days, status, reason):
+    _write_token(tmp_path, monkeypatch, "tok", _now() + timedelta(days=days), status)
+    health = webull_io.token_health()
+    assert health["ok"] is False
+    assert any(reason in text for text in health["reasons"])
+
+
+def test_a_missing_token_file_is_not_silent(tmp_path, monkeypatch):
+    monkeypatch.setenv("WEBULL_TOKEN_DIR", str(tmp_path))
+    health = webull_io.token_health()
+    assert health["ok"] is False and health["found"] is False
+
+
+def test_an_ephemeral_token_dir_is_reported(monkeypatch):
+    monkeypatch.setenv("WEBULL_TOKEN_DIR", "/tmp/webull_token")
+    assert webull_io.token_dir_is_ephemeral() is True
+    assert any("รีไซเคิล" in text for text in webull_io.token_health()["reasons"])
+
+
+class _FakeApi:
+    def __init__(self):
+        self.token = None
+
+    def set_token(self, token):
+        self.token = token
+
+
+def _install_fake_token_operation(monkeypatch, payload):
+    calls = []
+
+    class TokenOperation:
+        def __init__(self, api_client):
+            self.api_client = api_client
+
+        def refresh_token(self, token):
+            calls.append(token)
+            if isinstance(payload, Exception):
+                raise payload
+            return FakeNamespace(json=lambda: payload)
+
+    module = FakeNamespace(TokenOperation=TokenOperation)
+    monkeypatch.setitem(
+        sys.modules, "webull.core.http.initializer.token.token_operation", module)
+    for name in ("webull", "webull.core", "webull.core.http",
+                 "webull.core.http.initializer", "webull.core.http.initializer.token"):
+        monkeypatch.setitem(sys.modules, name, types.ModuleType(name))
+    monkeypatch.setitem(
+        sys.modules, "webull.core.http.initializer.token.token_operation", module)
+    return calls
+
+
+def test_a_token_near_expiry_is_refreshed_before_it_dies(tmp_path, monkeypatch):
+    """Nothing in the SDK calls token/refresh; a 15-day token just stops working."""
+    _write_token(tmp_path, monkeypatch, "old", _now() + timedelta(days=1))
+    new_expiry = int((_now() + timedelta(days=15)).timestamp() * 1000)
+    calls = _install_fake_token_operation(
+        monkeypatch, {"token": "new", "expires": new_expiry, "status": "NORMAL"})
+
+    api = _FakeApi()
+    out = webull_io.ensure_token_fresh(api)
+    assert out["refreshed"] is True and out["ok"] is True
+    assert calls == ["old"] and api.token == "new"
+    assert webull_io.read_local_token()["token"] == "new"
+
+
+def test_a_healthy_token_is_left_alone(tmp_path, monkeypatch):
+    _write_token(tmp_path, monkeypatch, "tok", _now() + timedelta(days=10))
+    calls = _install_fake_token_operation(monkeypatch, {"token": "new", "expires": 1})
+    assert webull_io.ensure_token_fresh(_FakeApi())["refreshed"] is False
+    assert calls == []
+
+
+def test_a_failed_refresh_keeps_the_still_valid_token(tmp_path, monkeypatch):
+    """The old token has days left; blocking the slot would cause the outage."""
+    _write_token(tmp_path, monkeypatch, "old", _now() + timedelta(days=1))
+    _install_fake_token_operation(monkeypatch, RuntimeError("network down"))
+    out = webull_io.ensure_token_fresh(_FakeApi())
+    assert out["refreshed"] is False and "network down" in out["refresh_error"]
+    assert webull_io.read_local_token()["token"] == "old"
+
+
+def test_an_unusable_refresh_payload_is_not_written(tmp_path, monkeypatch):
+    _write_token(tmp_path, monkeypatch, "old", _now() + timedelta(days=1))
+    _install_fake_token_operation(monkeypatch, {"status": "NORMAL"})
+    out = webull_io.ensure_token_fresh(_FakeApi())
+    assert out["refreshed"] is False and "refresh_error" in out
+    assert webull_io.read_local_token()["token"] == "old"
+
+
 # ---- client construction ----------------------------------------------------
 
 def _install_fake_sdk(monkeypatch):
     """Stand in for the SDK package tree build_clients imports lazily."""
-    built = {}
+    built = {"clients": 0}
 
     class ApiClient:
         def __init__(self, key, secret, region):
             built["credentials"] = (key, secret, region)
+            built["clients"] += 1
 
         def add_endpoint(self, region, endpoint):
             built["endpoint"] = (region, endpoint)
 
         def set_token_dir(self, token_dir):
             built["token_dir"] = token_dir
+
+        def set_stream_logger(self, log_level=None, stream=None, format_string=None):
+            built["stream_logger"] = log_level
+
+        def set_file_logger(self, *args, **kwargs):        # pragma: no cover
+            raise AssertionError("the SDK file logger must never be reached")
+
+        def set_token(self, token):
+            built["token"] = token
 
     modules = {
         "webull": types.ModuleType("webull"),
@@ -185,6 +398,14 @@ def _install_fake_sdk(monkeypatch):
     for name, module in modules.items():
         monkeypatch.setitem(sys.modules, name, module)
     return built
+
+
+@pytest.fixture(autouse=True)
+def fresh_client_cache():
+    """Clients are cached per instance; no test may inherit another's."""
+    webull_io.reset_clients()
+    yield
+    webull_io.reset_clients()
 
 
 def test_build_clients_targets_uat_by_default(monkeypatch):
@@ -210,6 +431,57 @@ def test_build_clients_targets_production_when_asked(monkeypatch):
     webull_io.build_clients()
     assert built["endpoint"] == ("th", webull_io.PROD_ENDPOINT)
     assert built["token_dir"] == "/tmp/other"
+
+
+def test_a_stream_logger_is_installed_before_the_clients_are_built(monkeypatch):
+    """Otherwise the SDK writes a rotating log file into a read-only directory."""
+    built = _install_fake_sdk(monkeypatch)
+    monkeypatch.setenv("WEBULL_APP_KEY", "key")
+    monkeypatch.setenv("WEBULL_APP_SECRET", "secret")
+
+    webull_io.build_clients()
+    assert built["stream_logger"] == logging.INFO
+
+
+def test_warm_instances_reuse_one_authenticated_client_pair(monkeypatch):
+    """Each build is two token-create calls, against a limit of 10 per 30s."""
+    built = _install_fake_sdk(monkeypatch)
+    monkeypatch.setenv("WEBULL_APP_KEY", "key")
+    monkeypatch.setenv("WEBULL_APP_SECRET", "secret")
+
+    first = webull_io.build_clients()
+    second = webull_io.build_clients()
+    assert first is not None and second[0] is first[0] and second[1] is first[1]
+    assert built["clients"] == 1
+
+
+def test_the_cache_is_dropped_when_the_environment_moves(monkeypatch):
+    built = _install_fake_sdk(monkeypatch)
+    monkeypatch.setenv("WEBULL_APP_KEY", "key")
+    monkeypatch.setenv("WEBULL_APP_SECRET", "secret")
+    webull_io.build_clients()
+
+    monkeypatch.setenv("WEBULL_ENV", "PROD")
+    webull_io.build_clients()
+    assert built["clients"] == 2
+    assert built["endpoint"] == ("th", webull_io.PROD_ENDPOINT)
+
+
+def test_the_cache_expires_so_a_long_lived_instance_reauthenticates(monkeypatch):
+    built = _install_fake_sdk(monkeypatch)
+    monkeypatch.setenv("WEBULL_APP_KEY", "key")
+    monkeypatch.setenv("WEBULL_APP_SECRET", "secret")
+    monkeypatch.setenv("LEGO_CLIENT_CACHE_TTL_SECONDS", "60")
+    clock = {"t": 0.0}
+    monkeypatch.setattr(webull_io.time, "monotonic", lambda: clock["t"])
+
+    webull_io.build_clients()
+    clock["t"] = 59.0
+    webull_io.build_clients()
+    assert built["clients"] == 1
+    clock["t"] = 61.0
+    webull_io.build_clients()
+    assert built["clients"] == 2
 
 
 # ---- the pin that keeps the money path reproducible ------------------------

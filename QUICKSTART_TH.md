@@ -200,7 +200,11 @@ gcloud functions deploy lego-one-row \
 | `LEGO_STRATEGY_ID` | `shannon_demon_lego` | ป้ายกำกับกลยุทธ์ (อยู่ใน `config_hash`) |
 | `WEBULL_ENV` | `UAT` | `UAT` = ส่ง order ได้ · อย่างอื่น = Production (read-only) |
 | `AUTO_SUBMIT` | `false` | `true` = สร้าง order intent อัตโนมัติเมื่อแถวเป็น `READY_*` |
-| `WEBULL_TOKEN_DIR` | `/tmp/webull_token` | ที่เก็บ token ของ SDK |
+| `WEBULL_TOKEN_DIR` | `/tmp/webull_token` | ที่เก็บ token ของ SDK · ⚠️ `/tmp` หายทุกครั้งที่ instance ถูกรีไซเคิล → SDK จะสร้าง token ใหม่และรอคนกด 2FA ในแอป 300 วิ ถ้าไม่มีคนกด = `ERROR_INIT_TOKEN` · ชี้ไป volume ที่คงอยู่ (เช่น GCS FUSE mount) จะเห็นคำเตือนที่ `webull_lego_warnings/webull_token` จนกว่าจะย้าย |
+| `LEGO_TOKEN_REFRESH_MARGIN_DAYS` | `3` | token อายุ 15 วันและ SDK **ไม่ต่ออายุให้** — เหลือน้อยกว่านี้จะเรียก `token/refresh` เองตอนสร้าง client · refresh ล้มเหลวไม่หยุด slot (token เดิมยังใช้ได้) แค่แจ้งเตือน |
+| `LEGO_MARKET_CATEGORY` | `US_STOCK` | Category ที่ใช้ขอ snapshot · ตั้ง `US_ETF` เมื่อ `LEGO_SYMBOL` เป็น ETF · ค่านอก enum ของ SDK = fail closed |
+| `LEGO_CLIENT_CACHE_TTL_SECONDS` | `3600` | instance ที่ยังอุ่นใช้ client คู่เดิม (สร้างใหม่ 1 ครั้ง = 4 auth request และ token create จำกัด 10/30s) · ครบเวลาแล้วสร้างใหม่เพื่อตรวจ token อีกรอบ |
+| `LEGO_WEBULL_LOG_LEVEL` | `INFO` | ระดับ log ของ SDK ที่ส่งลง stdout · `DEBUG` จะพิมพ์ response body ทุกครั้ง (มีข้อมูลบัญชี) |
 | `LEGO_ALLOW_ZERO_HOLDINGS` | `false` | `true` = ยอมรับว่า "ถือ 0 จริง" ทั้งที่ chain เคยเห็นของ · ใช้เฉพาะตอนขายทิ้งเอง/ย้าย position นอกระบบ **แล้วเอาออกทันที** (ดู `HOLDINGS_ANOMALY`) |
 
 **นาฬิกา DNA** (ทุกตัวมีผลต่อ phase ของ gate array — ดูหัวข้อ 7.5):
@@ -222,6 +226,8 @@ gcloud functions deploy lego-one-row \
 | `LEGO_ORDER_EXPIRY_MARGIN_SECONDS` | `15` | กันส่ง order คาบเกี่ยว slot ถัดไป |
 | `LEGO_HOLDINGS_DRIFT_TOLERANCE` | `0.000001` | holdings เปลี่ยนเกินนี้ระหว่างรอส่ง = `SUPPRESSED_STATE_CHANGED` |
 | `LEGO_RECONCILE_MAX_ATTEMPTS` | `20` | ถาม broker ซ้ำได้กี่ครั้งก่อนยอมแพ้เป็น `RECONCILE_ABANDONED` (ที่ `*/5` = ~100 นาที) — กัน order ที่ broker ไม่เคยรับ วนถามไม่รู้จบจนเบียด intent ใหม่ทั้งหมด |
+| `LEGO_OPEN_ORDER_PAGE_SIZE` | `50` | `get_order_open` ตอบเป็น "หน้า" (default ของ broker = 10) · การกันส่งซ้ำอ่านจากรายการนี้ ถ้าหน้าเดียวไม่ครบจะมองไม่เห็น order ของเราเอง |
+| `LEGO_OPEN_ORDER_MAX_PAGES` | `5` | เพดานจำนวนหน้าที่ไล่ต่อการตรวจ 1 ครั้ง (order query จำกัด 40/2s) |
 
 **archive worker** (`lego_archive_worker` — งานบ้าน ยิงวันละครั้งพอ):
 
