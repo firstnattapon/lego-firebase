@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import logging
 import os
+import re
 import sys
 import time
 from datetime import datetime, timezone
@@ -238,12 +239,33 @@ def ensure_token_fresh(api_client) -> dict:
         return out                       # nothing to refresh from
     if health["days_left"] > _refresh_margin_days():
         return out
+    if health["ephemeral_token_dir"]:
+        # A refresh rotates *the* account token, and on an ephemeral dir every
+        # container keeps its own copy of it. Rotating from here would buy
+        # nothing — the new token dies with this container too — while a sibling
+        # container mid-slot could be left holding the token we just replaced.
+        # The health warning already names the fix; refreshing starts working
+        # the moment the token lives somewhere durable.
+        out["refresh_skipped"] = ("token dir ไม่คงอยู่ข้าม container จึงไม่ refresh "
+                                  "(เสี่ยงหมุน token ทิ้งให้ instance อื่นค้าง) — "
+                                  "ย้าย WEBULL_TOKEN_DIR ก่อน")
+        logger.warning("token refresh skipped: %s", out["refresh_skipped"])
+        return out
     local = read_local_token()
     try:
         from webull.core.http.initializer.token.token_operation import TokenOperation
 
         response = TokenOperation(api_client).refresh_token(local["token"]).json()
     except Exception as exc:             # noqa: BLE001 - see docstring
+        # A durable token dir can be shared, so the refresh may have failed
+        # because another instance rotated the token first. That token is ours
+        # as much as one we fetched: adopt it rather than report a failure.
+        adopted = read_local_token()
+        if adopted and adopted["token"] != local["token"]:
+            api_client.set_token(adopted["token"])
+            logger.info("adopted a token refreshed by another instance")
+            return {"refreshed": False, "adopted_external_refresh": True,
+                    **token_health()}
         out["refresh_error"] = f"{type(exc).__name__}: {exc}"
         logger.warning("webull token refresh failed: %s", out["refresh_error"])
         return out
@@ -286,6 +308,45 @@ def _sdk_log_level() -> int:
     return getattr(logging, name, logging.INFO)
 
 
+_SECRET_FIELDS = ("x-signature", "x-access-token", "x-app-key", "app_secret",
+                  "app_key_secret", "access_token")
+_SECRET_PATTERN = re.compile(
+    r"(?P<label>%s)(?P<sep>\"?\s*[:=]\s*\"?)(?P<value>[^\"',\s}\]]+)"
+    % "|".join(re.escape(f) for f in _SECRET_FIELDS), re.IGNORECASE)
+_REDACTED = "<redacted>"
+
+
+class _RedactSecrets(logging.Filter):
+    """Keep the SDK's error logs from carrying credentials into Cloud Logging.
+
+    On any non-2xx the SDK logs json.dumps(vars(request)), and the signer writes
+    the signature straight back onto the request it signed, so that record
+    contains x-signature and x-app-key in full. At DEBUG the signature composer
+    also logs string_to_sign and the signature on their own. None of it is the
+    app secret — that never leaves the signing function — but logging a
+    credential of any kind is the one thing the order flow forbids outright.
+    """
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        try:
+            text = record.getMessage()
+        except Exception:                # a broken format string is not our call
+            return True
+        redacted = _SECRET_PATTERN.sub(
+            lambda m: f"{m.group('label')}{m.group('sep')}{_REDACTED}", text)
+        if redacted != text:
+            record.msg, record.args = redacted, ()
+        return True
+
+
+def _install_redaction(logger_name: str = "webull.core") -> None:
+    """Filters run on handlers, not on ancestor loggers, so attach them there."""
+    sdk_logger = logging.getLogger(logger_name)
+    for handler in sdk_logger.handlers:
+        if not any(isinstance(f, _RedactSecrets) for f in handler.filters):
+            handler.addFilter(_RedactSecrets())
+
+
 def build_clients():
     """Build (or reuse) the SDK clients for this instance.
 
@@ -324,6 +385,7 @@ def build_clients():
     api.set_token_dir(token_dir())
     api.set_stream_logger(log_level=_sdk_log_level(), stream=sys.stdout,
                           format_string="%(asctime)s %(name)s %(levelname)s %(message)s")
+    _install_redaction()
     if token_dir_is_ephemeral():
         logger.warning("WEBULL_TOKEN_DIR=%s อยู่บน storage ชั่วคราว — token จะหายเมื่อ "
                        "instance ถูกรีไซเคิลและต้องยืนยัน 2FA ใหม่", token_dir())
@@ -441,6 +503,27 @@ def _open_order_items(res) -> list:
     raise ValueError("open-orders response shape ไม่รู้จัก — fail closed")
 
 
+def _page_cursor(items: list) -> str | None:
+    """The client_order_id the next page continues from.
+
+    Group orders arrive as a wrapper whose own id may be absent while the legs
+    underneath carry theirs, so the last leg answers when the wrapper cannot.
+    Returning None ends the walk, which is the safe direction: one page short is
+    the behaviour we already had, an endless loop is not.
+    """
+    for entry in reversed(items):
+        if not isinstance(entry, dict):
+            continue
+        if entry.get("client_order_id"):
+            return str(entry["client_order_id"])
+        legs = entry.get("items")
+        if isinstance(legs, list):
+            for leg in reversed(legs):
+                if isinstance(leg, dict) and leg.get("client_order_id"):
+                    return str(leg["client_order_id"])
+    return None
+
+
 def _open_order_page_size() -> int:
     return max(1, int(os.environ.get("LEGO_OPEN_ORDER_PAGE_SIZE", "50")))
 
@@ -476,8 +559,7 @@ def fetch_open_orders(trade_client, symbol: str) -> list[dict]:
                     out.append(c)
         if len(items) < page_size:
             break
-        last = items[-1] if isinstance(items[-1], dict) else {}
-        next_cursor = last.get("client_order_id")
+        next_cursor = _page_cursor(items)
         if not next_cursor or next_cursor == cursor:
             break                        # no usable cursor: stop rather than loop
         cursor = next_cursor

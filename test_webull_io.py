@@ -142,6 +142,20 @@ def test_open_order_paging_stops_without_a_usable_cursor(monkeypatch):
     assert len(client.order_v3.get_order_open.calls) == 1
 
 
+def test_open_order_paging_reads_the_cursor_out_of_a_group_order(monkeypatch):
+    """The wrapper of a group order carries no id of its own; its legs do."""
+    monkeypatch.setenv("LEGO_OPEN_ORDER_PAGE_SIZE", "2")
+    pages = [
+        {"orders": [{"symbol": "TSLA", "client_order_id": "a"},
+                    {"items": [{"symbol": "TSLA", "client_order_id": "b1"},
+                               {"symbol": "TSLA", "client_order_id": "b2"}]}]},
+        {"orders": [{"symbol": "FFWM", "client_order_id": "c"}]},
+    ]
+    client = fake_trade_client(open_orders=lambda *a, **k: pages.pop(0))
+    assert [o["client_order_id"] for o in fetch_open_orders(client, "FFWM")] == ["c"]
+    assert client.order_v3.get_order_open.calls[1][1]["last_client_order_id"] == "b2"
+
+
 def test_open_order_paging_is_bounded(monkeypatch):
     monkeypatch.setenv("LEGO_OPEN_ORDER_PAGE_SIZE", "1")
     monkeypatch.setenv("LEGO_OPEN_ORDER_MAX_PAGES", "3")
@@ -352,6 +366,42 @@ def test_a_failed_refresh_keeps_the_still_valid_token(tmp_path, monkeypatch):
     assert webull_io.read_local_token()["token"] == "old"
 
 
+def test_an_ephemeral_token_dir_is_never_refreshed(tmp_path, monkeypatch):
+    """Rotating the account token from a copy that dies with the container
+    helps nobody and can strand a sibling instance mid-slot."""
+    _write_token(tmp_path, monkeypatch, "old", _now() + timedelta(days=1))
+    monkeypatch.setattr(webull_io, "token_dir_is_ephemeral", lambda: True)
+    calls = _install_fake_token_operation(monkeypatch, {"token": "new", "expires": 1})
+
+    out = webull_io.ensure_token_fresh(_FakeApi())
+    assert out["refreshed"] is False and "ย้าย WEBULL_TOKEN_DIR" in out["refresh_skipped"]
+    assert calls == []
+    assert webull_io.read_local_token()["token"] == "old"
+
+
+def test_a_token_another_instance_refreshed_is_adopted(tmp_path, monkeypatch):
+    """A durable token dir can be shared; losing that race is not a failure."""
+    _write_token(tmp_path, monkeypatch, "old", _now() + timedelta(days=1))
+    winner_expiry = int((_now() + timedelta(days=15)).timestamp() * 1000)
+
+    class TokenOperation:
+        def __init__(self, api_client):
+            pass
+
+        def refresh_token(self, token):
+            (tmp_path / "token.txt").write_text(
+                f"winner\n{winner_expiry}\nNORMAL\n", encoding="utf-8")
+            raise RuntimeError("token already rotated")
+
+    monkeypatch.setitem(sys.modules,
+                        "webull.core.http.initializer.token.token_operation",
+                        FakeNamespace(TokenOperation=TokenOperation))
+    api = _FakeApi()
+    out = webull_io.ensure_token_fresh(api)
+    assert out["adopted_external_refresh"] is True and out["ok"] is True
+    assert api.token == "winner" and "refresh_error" not in out
+
+
 def test_an_unusable_refresh_payload_is_not_written(tmp_path, monkeypatch):
     _write_token(tmp_path, monkeypatch, "old", _now() + timedelta(days=1))
     _install_fake_token_operation(monkeypatch, {"status": "NORMAL"})
@@ -441,6 +491,45 @@ def test_a_stream_logger_is_installed_before_the_clients_are_built(monkeypatch):
 
     webull_io.build_clients()
     assert built["stream_logger"] == logging.INFO
+
+
+def test_sdk_logs_cannot_carry_credentials(caplog):
+    """The SDK logs vars(request) on any non-2xx, and the signer writes the
+    signature back onto the request it signed."""
+    sdk_logger = logging.getLogger("webull.core")
+    handler = logging.StreamHandler()
+    sdk_logger.addHandler(handler)
+    try:
+        webull_io._install_redaction()
+        record = logging.LogRecord("webull.core.client", logging.ERROR, __file__, 1,
+                                   'ServerException {"x-signature": "abc123==", '
+                                   '"x-app-key": "KEY", "symbol": "FFWM"}', (), None)
+        for filt in handler.filters:
+            filt.filter(record)
+    finally:
+        sdk_logger.removeHandler(handler)
+    text = record.getMessage()
+    assert "abc123==" not in text and "KEY" not in text
+    assert text.count("<redacted>") == 2
+    assert "FFWM" in text                      # only the credentials are removed
+
+
+def test_redaction_is_installed_once_per_handler(monkeypatch):
+    _install_fake_sdk(monkeypatch)
+    monkeypatch.setenv("WEBULL_APP_KEY", "key")
+    monkeypatch.setenv("WEBULL_APP_SECRET", "secret")
+    sdk_logger = logging.getLogger("webull.core")
+    handler = logging.StreamHandler()
+    sdk_logger.addHandler(handler)
+    try:
+        webull_io.build_clients()
+        webull_io.reset_clients()
+        webull_io.build_clients()
+        filters = [f for f in handler.filters
+                   if isinstance(f, webull_io._RedactSecrets)]
+    finally:
+        sdk_logger.removeHandler(handler)
+    assert len(filters) == 1
 
 
 def test_warm_instances_reuse_one_authenticated_client_pair(monkeypatch):

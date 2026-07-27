@@ -547,6 +547,7 @@ field เตือนใน response ของแถวที่ commit สำ�
 | `outbox_error` | สร้าง intent ไม่สำเร็จ (แถว commit แล้ว ไม่ rollback) | ดู error แล้วเช็ค RTDB rules/quota · slot ถัดไปยังทำงานปกติ |
 | `clock_warning` | resolve slot ไม่ได้ จึงเดินด้วย legacy step | เหมือน `outbox_skipped` — ต้นเหตุเดียวกัน |
 | `dna_steps_remaining` | DNA เหลือน้อยกว่า `LEGO_DNA_LOW_WATERMARK` | เตรียม DNA ชุดใหม่ก่อนถึง `DNA_EXHAUSTED` |
+| `token_warning` | token ของ Webull ใกล้หมดอายุ / ไม่พบ / เก็บใน dir ที่ไม่คงอยู่ | ดูหัวข้อ `WEBULL_TOKEN_DIR` · นับสะสมที่ `webull_lego_warnings/webull_token` · แถวยัง commit ปกติ ไม่หยุด DNA |
 
 สถานะ outbox ที่ต้องมีคนเข้าไปดู (นอกจาก `RECONCILE_ABANDONED`):
 
