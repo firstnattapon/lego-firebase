@@ -164,6 +164,7 @@ field เตือนที่จะโผล่ใน response ของแถ�
 | field | แปลว่า |
 |---|---|
 | `outbox_skipped` | แถวนี้เป็น `READY_*` และ `AUTO_SUBMIT=true` แต่ **ไม่มี order intent ถูกสร้าง** เพราะ clock degraded (ไม่มี slot จึงคำนวณ `expires_at` ไม่ได้) — นับสะสมที่ `webull_lego_warnings/degraded_clock_no_order` |
+| `outbox_blocked` | แถวนี้เป็น `READY_*` และ `AUTO_SUBMIT=true` แต่ **preflight ไม่ผ่าน** จึงไม่สร้าง intent — `outbox_blocked_checks` บอกว่าติดข้อไหน นับสะสมที่ `webull_lego_warnings/auto_submit_blocked` |
 | `outbox_error` | สร้าง intent ไม่สำเร็จ (แถว commit แล้ว ไม่ rollback) |
 | `clock_warning` | market clock resolve ไม่ได้ จึงเดินด้วย legacy step |
 | `dna_steps_remaining` | DNA เหลือน้อยกว่า `LEGO_DNA_LOW_WATERMARK` (default 10) แล้ว |
@@ -184,7 +185,11 @@ field เตือนที่จะโผล่ใน response ของแถ�
 11. `dna_code` เดิมต้อง decode ได้ gate array เดิมตลอดอายุ chain — `dna_fingerprint` ใน state
     บังคับข้อนี้ และ `numpy` ถูก pin ตายตัวเพราะ `Generator` ไม่รับประกัน bit stream ข้ามเวอร์ชัน
 12. การตัดสินใจ "ไม่ส่ง order" ต้องมีที่ให้เห็นเสมอ — เงียบไม่ได้ ถ้า `AUTO_SUBMIT=true` แล้วแถวเป็น
-    `READY_*` ต้องได้อย่างใดอย่างหนึ่ง: intent ใน outbox, `outbox_error`, หรือ `outbox_skipped`
+    `READY_*` ต้องได้อย่างใดอย่างหนึ่ง: intent ใน outbox, `outbox_error`, `outbox_skipped`
+    หรือ `outbox_blocked`
+16. `AUTO_SUBMIT=true` เป็นแค่ 1 ใน 8 เงื่อนไขของ `auto_submit_preflight` ไม่ใช่สวิตช์เดียว —
+    token ไม่พร้อม / clock degraded / step ไม่ตรง market ordinal / DNA ใกล้หมด ต้อง block
+    การสร้าง intent เสมอ และ preflight ที่ throw ต้องนับเป็น "ไม่ผ่าน" ไม่ใช่ปล่อยผ่าน
 13. ราคาที่เข้าสมการต้องเป็นราคาของ `LEGO_SYMBOL` เท่านั้น — snapshot ที่ตอบมาเป็น symbol อื่น
     ต้อง fail closed ไม่ใช่เอามาคิด `gap`
 14. order ที่ fill แล้วต้องไม่ถูกส่งซ้ำ แม้ realized ledger จะคำนวณต่อไม่ได้ — จบเป็น
