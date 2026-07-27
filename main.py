@@ -24,6 +24,7 @@ from lego_orders import (TERMINAL_STATUSES, UAT, evaluate_submit_gate,
                          summarize_order_result)
 from lego_outbox import (expire_unsent_before, list_actionable, put_intent,
                          read_committed_row, update_intent)
+from lego_preflight import DEFAULT_MIN_DNA_REMAINING, auto_submit_preflight
 from lego_state import (CalendarDriftError, DNADriftError, OrdinalRegression,
                         SlotAlreadyConsumed, StaleAnchorError, apply_realized_fill,
                         chain_key, commit_final_row, read_anchor,
@@ -150,6 +151,20 @@ def _persist_error(chain_key_: str, run_id: str, status: str, exc: Exception,
 
 def _reconcile_max_attempts() -> int:
     return max(1, int(os.environ.get("LEGO_RECONCILE_MAX_ATTEMPTS", "20")))
+
+
+def _min_dna_remaining() -> int:
+    """How much DNA must be left before a new order may be opened.
+
+    Never raises: an unreadable value is a deploy typo, and refusing to answer
+    would abort the row instead of the order, which inverts the priority the
+    whole pipeline is built on.
+    """
+    try:
+        return int(os.environ.get("LEGO_AUTO_SUBMIT_MIN_DNA_REMAINING",
+                                  str(DEFAULT_MIN_DNA_REMAINING)))
+    except (TypeError, ValueError):
+        return DEFAULT_MIN_DNA_REMAINING
 
 
 def _persist_reconcile_failure(intent: dict, exc: Exception) -> dict:
@@ -445,25 +460,30 @@ def lego_one_row(request):
 
         env = environment_label()
         auto = os.environ.get("AUTO_SUBMIT", "false").lower() == "true"
-        should_submit = auto and env == UAT and row["สถานะ"] in (READY_BUY, READY_SELL)
         row_durable = bool(result["committed"] or result.get("idempotent"))
+        # Warn while extending the DNA is still possible; also one of the
+        # preflight inputs, so it is resolved once and read twice.
+        remaining = dna_steps_remaining(cfg.dna_code, row["DNA step"])
         outbox_error = None
         outbox_skipped = None
-        if should_submit and row_durable and slot is None:
-            # A degraded clock has no slot window, so expires_at cannot be
-            # computed and no intent can be created. Deciding that silently was
-            # the worst of both worlds: the row still read READY_BUY with
-            # committed=true and no error field, so a dashboard showed a working
-            # bot that had never sent a single order. Say it on the response and
-            # on a counter something can alert on.
-            outbox_skipped = ("degraded clock: ไม่มี slot window จึงคำนวณ expires_at ไม่ได้ "
-                              "— แถวนี้ commit แล้วแต่ไม่มีการสร้าง order intent")
-            _record_warning("degraded_clock_no_order", outbox_skipped, {
-                "run_id": result["run_id"], "row_status": row["สถานะ"],
-                "clock_mode": mode, "hint": "ตั้ง LEGO_DNA_ORIGIN_UTC (find_origin.py) "
-                                            "แล้วเปิด LEGO_DNA_CLOCK_MODE=market",
-            })
-        elif should_submit and row_durable:
+        outbox_blocked = None
+        preflight = None
+
+        # Validation first and separately: AUTO_SUBMIT used to be the whole gate,
+        # so every condition the deploy checklist asked for — a durable token, a
+        # non-degraded clock, a step that is really the market ordinal, DNA left
+        # to spend — was a silent fail-open. auto_submit_preflight answers all of
+        # them without writing anything, and only an `ok` report reaches
+        # put_intent below.
+        if auto and row["สถานะ"] in (READY_BUY, READY_SELL):
+            preflight = auto_submit_preflight(
+                auto_submit=auto, environment=env, row=row, row_durable=row_durable,
+                slot=slot, token=health, dna_remaining=remaining,
+                min_dna_remaining=_min_dna_remaining())
+
+        if preflight is None:
+            pass                                    # nothing to submit this slot
+        elif preflight["ok"]:
             # The slot is already durable at this point, so a failed intent may
             # only cost this row its order — reporting it as a DNA failure would
             # be a lie and would invite a retry that finds the slot consumed.
@@ -472,6 +492,21 @@ def lego_one_row(request):
                            _outbox_intent(cfg, row, snapshot, slot, decision_time))
             except Exception as exc:
                 outbox_error = f"{type(exc).__name__}: {exc}"
+        else:
+            # Blocked, and said out loud on both channels. Deciding this silently
+            # was the worst of both worlds: the row still read READY_BUY with
+            # committed=true and no error field, so a dashboard showed a working
+            # bot that had never sent a single order.
+            message = preflight["message"]
+            if preflight["field"] == "outbox_skipped":
+                outbox_skipped = message
+            else:
+                outbox_blocked = message
+            extra = {"run_id": result["run_id"], "row_status": row["สถานะ"],
+                     "clock_mode": mode, "blocked_by": preflight["blocked_by"]}
+            if preflight["hint"]:
+                extra["hint"] = preflight["hint"]
+            _record_warning(preflight["warning_kind"], message, extra)
 
         out = {
             "status": row["สถานะ"], "committed": result["committed"],
@@ -494,9 +529,11 @@ def lego_one_row(request):
             out["outbox_error"] = outbox_error
         if outbox_skipped:
             out["outbox_skipped"] = outbox_skipped
-        # Warn while extending the DNA is still possible; silent until the last
-        # few slots so a healthy chain keeps the response it has always had.
-        remaining = dna_steps_remaining(cfg.dna_code, row["DNA step"])
+        if outbox_blocked:
+            out["outbox_blocked"] = outbox_blocked
+            out["outbox_blocked_checks"] = preflight["blocked_by"]
+        # Silent until the last few slots so a healthy chain keeps the response
+        # it has always had.
         if remaining <= int(os.environ.get("LEGO_DNA_LOW_WATERMARK", "10")):
             out["dna_steps_remaining"] = remaining
 

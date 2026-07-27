@@ -199,7 +199,8 @@ gcloud functions deploy lego-one-row \
 | `LEGO_DECIMAL_PRECISION` | `5` | ทศนิยมของจำนวนสั่ง (0–5) · `0` = สั่งเป็นจำนวนเต็มหุ้น · ต้องเท่ากันทั้ง 2 ฟังก์ชัน (อยู่ใน `config_hash`) |
 | `LEGO_STRATEGY_ID` | `shannon_demon_lego` | ป้ายกำกับกลยุทธ์ (อยู่ใน `config_hash`) |
 | `WEBULL_ENV` | `UAT` | `UAT` = ส่ง order ได้ · อย่างอื่น = Production (read-only) |
-| `AUTO_SUBMIT` | `false` | `true` = สร้าง order intent อัตโนมัติเมื่อแถวเป็น `READY_*` |
+| `AUTO_SUBMIT` | `false` | `true` = **ขอ**สร้าง order intent อัตโนมัติเมื่อแถวเป็น `READY_*` · ไม่ใช่สวิตช์เดียว — ต้องผ่าน preflight ครบ 8 ข้อก่อน (ดูหัวข้อ 7.6) |
+| `LEGO_AUTO_SUBMIT_MIN_DNA_REMAINING` | `1` | preflight บล็อกการสร้าง intent ใหม่เมื่อ DNA เหลือน้อยกว่านี้ |
 | `WEBULL_TOKEN_DIR` | `/tmp/webull_token` | ที่เก็บ token ของ SDK · ⚠️ `/tmp` หายทุกครั้งที่ instance ถูกรีไซเคิล → SDK จะสร้าง token ใหม่และรอคนกด 2FA ในแอป 300 วิ ถ้าไม่มีคนกด = `ERROR_INIT_TOKEN` · ชี้ไป volume ที่คงอยู่ (เช่น GCS FUSE mount) จะเห็นคำเตือนที่ `webull_lego_warnings/webull_token` จนกว่าจะย้าย |
 | `LEGO_TOKEN_REFRESH_MARGIN_DAYS` | `3` | token อายุ 15 วันและ SDK **ไม่ต่ออายุให้** — เหลือน้อยกว่านี้จะเรียก `token/refresh` เองตอนสร้าง client · refresh ล้มเหลวไม่หยุด slot (token เดิมยังใช้ได้) แค่แจ้งเตือน |
 | `LEGO_MARKET_CATEGORY` | `US_STOCK` | Category ที่ใช้ขอ snapshot · ตั้ง `US_ETF` เมื่อ `LEGO_SYMBOL` เป็น ETF · ค่านอก enum ของ SDK = fail closed |
@@ -462,6 +463,39 @@ gcloud functions deploy lego-order-worker --gen2 --region="$REGION" \
 
 ---
 
+## 7.6) 🚦 Checklist ก่อนเปิด `AUTO_SUBMIT=true` (บังคับด้วยโค้ด)
+
+`AUTO_SUBMIT=true` **ไม่ใช่** สวิตช์เดียวที่ตัดสินว่าจะส่ง order ทุกแถวที่เป็น `READY_*`
+ต้องผ่าน `auto_submit_preflight` (`lego_preflight.py`) ครบทุกข้อก่อน ไม่ผ่านแม้ข้อเดียว =
+**แถวยัง commit ปกติ แต่ไม่มี order intent ถูกสร้าง** และ response จะบอกเหตุผลเสมอ
+
+| # | check | ผ่านเมื่อ | ไม่ผ่านแปลว่า |
+|---|---|---|---|
+| 1 | `auto_submit_enabled` | `AUTO_SUBMIT=true` | ยังไม่เปิด |
+| 2 | `environment_uat` | `WEBULL_ENV=UAT` | Production = read-only |
+| 3 | `row_durable` | แถว commit หรือ idempotent แล้ว | ห้ามสั่งจากแถวที่ยังไม่ persist |
+| 4 | `row_actionable` | สถานะ `READY_BUY`/`READY_SELL` และ quantity > 0 | ไม่ใช่ decision ที่ส่งได้ |
+| 5 | `clock_not_degraded` | resolve slot ได้ (ตั้ง `LEGO_DNA_ORIGIN_UTC` แล้ว) | ไม่มี slot window → คำนวณ `expires_at` ไม่ได้ |
+| 6 | `step_matches_market_ordinal` | `DNA step` = `market_ordinal` ของ slot | order จะตกคนละ slot กับที่ DNA เทรนมา (เกิดใน mode `shadow` เมื่อ scheduler พลาด slot) |
+| 7 | `token_ready` | `token_health()["ok"]` | token dir ไม่คงอยู่ / ใกล้หมดอายุ / ไม่พบ |
+| 8 | `dna_headroom` | เหลือ ≥ `LEGO_AUTO_SUBMIT_MIN_DNA_REMAINING` | chain ใกล้ `DNA_EXHAUSTED` |
+
+ลำดับที่แนะนำให้ไล่ปิดก่อนเปิดจริง:
+
+1. ย้าย `WEBULL_TOKEN_DIR` ออกจาก `/tmp` ไป volume ที่คงอยู่ (ตาราง env หัวข้อ 6 → check 7)
+2. `python find_origin.py <dna_step+1>` → ตั้ง `LEGO_DNA_ORIGIN_UTC` → `LEGO_DNA_CLOCK_MODE=market`
+   (ข้อ 7.5 → check 5 และ 6) · เปลี่ยนหลัง commit แรก = `CalendarDriftError` ต้องเริ่ม chain ใหม่
+3. ยิง 1 slot แล้วยืนยันว่า response มี `market_slot_id`, `market_step` และ `clock_mode` ไม่มีคำว่า `degraded`
+4. ตัดสินใจเรื่อง DNA (ต่ออายุ / ใส่ champion จริง) ให้เหลือ headroom พอ
+5. ตั้ง alert บน `webull_lego_warnings/auto_submit_blocked` และ `.../webull_token`
+6. ค่อยตั้ง `AUTO_SUBMIT=true` แล้วเฝ้า slot แรกด้วยตา
+
+> [!IMPORTANT]
+> preflight เป็น fail-closed: อ่านค่าไหนไม่ได้ หรือตัว preflight เองพัง ก็นับเป็น "ไม่ผ่าน"
+> ไม่มีทางที่ intent จะถูกสร้างโดยข้าม checklist
+
+---
+
 ## 8) 📊 Deploy Streamlit Dashboard — หน้าจอสวย ๆ
 
 1. Push repository ขึ้น GitHub (ถ้ายังไม่ได้ push)
@@ -544,6 +578,7 @@ field เตือนใน response ของแถวที่ commit สำ�
 | field | แปลว่า | ต้องทำอะไร |
 |---|---|---|
 | `outbox_skipped` | แถวเป็น `READY_*` และเปิด `AUTO_SUBMIT` แล้ว แต่ **ไม่มี order intent ถูกสร้าง** เพราะ clock degraded | ตั้ง `LEGO_DNA_ORIGIN_UTC` (ข้อ 7.5) — ระหว่างนี้ DNA เดินต่อแต่ไม่มีคำสั่งซื้อขายออกเลย |
+| `outbox_blocked` + `outbox_blocked_checks` | เปิด `AUTO_SUBMIT` แล้วแต่ **preflight ไม่ผ่าน** จึงไม่สร้าง intent | ดูว่า `outbox_blocked_checks` ติดข้อไหน แล้วแก้ตามตารางหัวข้อ 7.6 · นับสะสมที่ `webull_lego_warnings/auto_submit_blocked` |
 | `outbox_error` | สร้าง intent ไม่สำเร็จ (แถว commit แล้ว ไม่ rollback) | ดู error แล้วเช็ค RTDB rules/quota · slot ถัดไปยังทำงานปกติ |
 | `clock_warning` | resolve slot ไม่ได้ จึงเดินด้วย legacy step | เหมือน `outbox_skipped` — ต้นเหตุเดียวกัน |
 | `dna_steps_remaining` | DNA เหลือน้อยกว่า `LEGO_DNA_LOW_WATERMARK` | เตรียม DNA ชุดใหม่ก่อนถึง `DNA_EXHAUSTED` |
