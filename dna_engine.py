@@ -159,9 +159,3 @@ def dna_fingerprint(dna_code: str) -> str:
     return hashlib.sha256(
         ",".join(str(b) for b in _decode_cached(dna_code)).encode()
     ).hexdigest()[:16]
-
-
-def dna_summary(dna_code: str) -> dict:
-    dna = decode_dna(dna_code)
-    return {"dna_code": dna_code, "length": len(dna),
-            "ones": int(sum(dna)), "head": dna[:8]}

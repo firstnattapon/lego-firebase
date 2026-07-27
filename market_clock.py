@@ -231,10 +231,6 @@ def _ordinal_from_origin(origin: datetime, slot_start: datetime, sec: int) -> in
     return total
 
 
-def dna_origin_utc() -> datetime:
-    return _parse_origin()
-
-
 def calendar_fingerprint() -> str:
     """Digest of every input that can shift a market ordinal.
 
