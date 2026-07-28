@@ -145,12 +145,20 @@ def evaluate_auto_submit_preflight(*, auto_submit, environment, row, row_durable
             f"DNA step {step} ไม่ตรง market ordinal {ordinal} — "
             "order จะไปตกคนละ slot กับที่ DNA เทรนมา"))
 
+    # `ready`, not `ok`: token_health's `ok` also carries the durability warning
+    # for a token dir that cannot survive a container recycle, and on Cloud
+    # Functions that is every deployment. Gating orders on it made this check
+    # impossible to pass, so committed READY_BUY/READY_SELL rows never became
+    # intents and the position never moved. `ready` drops that one warning only
+    # when the operator accepted it; a health report without the key (an older
+    # caller, a test double) still reads `ok` and keeps the strict behaviour.
     token = token if isinstance(token, dict) else {}
     token_reasons = token.get("reasons") or []
     if not isinstance(token_reasons, (list, tuple)):
         token_reasons = [str(token_reasons)]
+    token_usable = token["ready"] if "ready" in token else token.get("ok")
     checks.append(_check(
-        "token_ready", token.get("ok") is True,
+        "token_ready", token_usable is True,
         "token ยังไม่พร้อม: " + ("; ".join(str(r) for r in token_reasons)
                                  or "token_health ไม่ได้บอกว่า ok")))
 

@@ -202,6 +202,7 @@ gcloud functions deploy lego-one-row \
 | `AUTO_SUBMIT` | `false` | `true` = **ขอ**สร้าง order intent อัตโนมัติเมื่อแถวเป็น `READY_*` · ไม่ใช่สวิตช์เดียว — ต้องผ่าน preflight ครบ 8 ข้อก่อน (ดูหัวข้อ 7.6) |
 | `LEGO_AUTO_SUBMIT_MIN_DNA_REMAINING` | `1` | preflight บล็อกการสร้าง intent ใหม่เมื่อ DNA เหลือน้อยกว่านี้ |
 | `WEBULL_TOKEN_DIR` | `/tmp/webull_token` | ที่เก็บ token ของ SDK · ⚠️ `/tmp` หายทุกครั้งที่ instance ถูกรีไซเคิล → SDK จะสร้าง token ใหม่และรอคนกด 2FA ในแอป 300 วิ ถ้าไม่มีคนกด = `ERROR_INIT_TOKEN` · ชี้ไป volume ที่คงอยู่ (เช่น GCS FUSE mount) จะเห็นคำเตือนที่ `webull_lego_warnings/webull_token` จนกว่าจะย้าย |
+| `LEGO_ALLOW_EPHEMERAL_TOKEN_DIR` | `false` | `true` = ยอมรับว่า token dir อยู่บน `/tmp` แล้วให้ preflight `token_ready` ผ่านได้ · จำเป็นเมื่อยัง mount volume ไม่ได้ เพราะ Cloud Functions เขียนได้แค่ `/tmp` → ไม่ตั้งก็ **ไม่มี order intent เกิดขึ้นเลย** · ให้อภัยเฉพาะข้อ "dir ไม่คงอยู่" ข้อเดียว (ไม่พบ token / status ≠ `NORMAL` / ใกล้หมดอายุ ยังบล็อกเหมือนเดิม) และคำเตือน `token_warning` ยังขึ้นทุก slot |
 | `LEGO_TOKEN_REFRESH_MARGIN_DAYS` | `3` | token อายุ 15 วันและ SDK **ไม่ต่ออายุให้** — เหลือน้อยกว่านี้จะเรียก `token/refresh` เองตอนสร้าง client · refresh ล้มเหลวไม่หยุด slot (token เดิมยังใช้ได้) แค่แจ้งเตือน |
 | `LEGO_MARKET_CATEGORY` | `US_STOCK` | Category ที่ใช้ขอ snapshot · ตั้ง `US_ETF` เมื่อ `LEGO_SYMBOL` เป็น ETF · ค่านอก enum ของ SDK = fail closed |
 | `LEGO_CLIENT_CACHE_TTL_SECONDS` | `3600` | instance ที่ยังอุ่นใช้ client คู่เดิม (สร้างใหม่ 1 ครั้ง = 4 auth request และ token create จำกัด 10/30s) · ครบเวลาแล้วสร้างใหม่เพื่อตรวจ token อีกรอบ |
@@ -477,12 +478,17 @@ gcloud functions deploy lego-order-worker --gen2 --region="$REGION" \
 | 4 | `row_actionable` | สถานะ `READY_BUY`/`READY_SELL` และ quantity > 0 | ไม่ใช่ decision ที่ส่งได้ |
 | 5 | `clock_not_degraded` | resolve slot ได้ (ตั้ง `LEGO_DNA_ORIGIN_UTC` แล้ว) | ไม่มี slot window → คำนวณ `expires_at` ไม่ได้ |
 | 6 | `step_matches_market_ordinal` | `DNA step` = `market_ordinal` ของ slot | order จะตกคนละ slot กับที่ DNA เทรนมา (เกิดใน mode `shadow` เมื่อ scheduler พลาด slot) |
-| 7 | `token_ready` | `token_health()["ok"]` | token dir ไม่คงอยู่ / ใกล้หมดอายุ / ไม่พบ |
+| 7 | `token_ready` | `token_health()["ready"]` | ไม่พบ token file / status ≠ `NORMAL` / ใกล้หมดอายุ · **token dir ไม่คงอยู่** ก็บล็อกเช่นกัน เว้นแต่ตั้ง `LEGO_ALLOW_EPHEMERAL_TOKEN_DIR=true` |
 | 8 | `dna_headroom` | เหลือ ≥ `LEGO_AUTO_SUBMIT_MIN_DNA_REMAINING` | chain ใกล้ `DNA_EXHAUSTED` |
 
 ลำดับที่แนะนำให้ไล่ปิดก่อนเปิดจริง:
 
 1. ย้าย `WEBULL_TOKEN_DIR` ออกจาก `/tmp` ไป volume ที่คงอยู่ (ตาราง env หัวข้อ 6 → check 7)
+   ⚠️ **Cloud Functions มี `/tmp` เป็น path เดียวที่เขียนได้** ถ้าไม่ mount volume ให้ check 7 จะไม่มีวันผ่าน
+   → ทุกแถว `READY_BUY`/`READY_SELL` จะ commit แต่ไม่มี order intent เลยสักใบ และจำนวนถือครองจะไม่ขยับ
+   ถ้ายังไม่พร้อม mount แต่ต้องการเดินต่อ ให้ตั้ง `LEGO_ALLOW_EPHEMERAL_TOKEN_DIR=true`
+   (ยอมรับความเสี่ยงว่า token หายเมื่อ instance ถูกรีไซเคิลและต้องกด 2FA ใหม่ — คำเตือน
+   `webull_lego_warnings/webull_token` ยังขึ้นทุก slot เหมือนเดิม)
 2. `python find_origin.py <dna_step+1>` → ตั้ง `LEGO_DNA_ORIGIN_UTC` → `LEGO_DNA_CLOCK_MODE=market`
    (ข้อ 7.5 → check 5 และ 6) · เปลี่ยนหลัง commit แรก = `CalendarDriftError` ต้องเริ่ม chain ใหม่
 3. ยิง 1 slot แล้วยืนยันว่า response มี `market_slot_id`, `market_step` และ `clock_mode` ไม่มีคำว่า `degraded`
@@ -582,7 +588,17 @@ field เตือนใน response ของแถวที่ commit สำ�
 | `outbox_error` | สร้าง intent ไม่สำเร็จ (แถว commit แล้ว ไม่ rollback) | ดู error แล้วเช็ค RTDB rules/quota · slot ถัดไปยังทำงานปกติ |
 | `clock_warning` | resolve slot ไม่ได้ จึงเดินด้วย legacy step | เหมือน `outbox_skipped` — ต้นเหตุเดียวกัน |
 | `dna_steps_remaining` | DNA เหลือน้อยกว่า `LEGO_DNA_LOW_WATERMARK` | เตรียม DNA ชุดใหม่ก่อนถึง `DNA_EXHAUSTED` |
-| `token_warning` | token ของ Webull ใกล้หมดอายุ / ไม่พบ / เก็บใน dir ที่ไม่คงอยู่ | ดูหัวข้อ `WEBULL_TOKEN_DIR` · นับสะสมที่ `webull_lego_warnings/webull_token` · แถวยัง commit ปกติ ไม่หยุด DNA |
+| `token_warning` | token ของ Webull ใกล้หมดอายุ / ไม่พบ / เก็บใน dir ที่ไม่คงอยู่ | ดูหัวข้อ `WEBULL_TOKEN_DIR` · นับสะสมที่ `webull_lego_warnings/webull_token` · แถวยัง commit ปกติ ไม่หยุด DNA · เห็นคู่กับ `outbox_blocked_checks: ["token_ready"]` = ยังไม่ได้ตั้ง `LEGO_ALLOW_EPHEMERAL_TOKEN_DIR` และยังไม่ mount volume |
+
+> [!WARNING]
+> **อาการ "จำนวนถือครอง (หุ้น) ไม่เปลี่ยนเลย" ทั้งที่แถวเป็น `READY_SELL`/`READY_BUY` ทุก slot**
+> คอลัมน์ที่ 7 อ่าน position สดจาก broker ทุกแถว — ค่าที่ไม่ขยับหมายความว่า **ไม่มี order ไปถึง broker**
+> ไม่ใช่ว่าคอลัมน์ค้าง ไล่ตามลำดับนี้:
+> 1. response ของ `lego-one-row` มี `outbox_blocked_checks` ไหม → preflight บล็อก (ดูตารางหัวข้อ 7.6)
+>    ข้อที่เจอบ่อยที่สุดคือ `token_ready` เพราะ `WEBULL_TOKEN_DIR` default เป็น `/tmp`
+> 2. `webull_lego_order_outbox/{chain_key}` ว่างเปล่า = ไม่เคยมี intent → ปัญหาอยู่ที่ข้อ 1
+> 3. มี intent แต่ status เป็น `EXPIRED_UNSENT` / `SUPPRESSED_*` / `NOT_PLACED` → ปัญหาอยู่ที่ order worker
+> 4. เวลาตอบของ `lego-order-worker` ~0.2 วิ ทุกรอบ = ไม่มีอะไรใน queue ให้ทำ (ยืนยันข้อ 2)
 
 สถานะ outbox ที่ต้องมีคนเข้าไปดู (นอกจาก `RECONCILE_ABANDONED`):
 
