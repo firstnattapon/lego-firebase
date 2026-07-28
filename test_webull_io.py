@@ -582,3 +582,62 @@ def test_broker_sdk_stays_pinned():
              if line.strip() and not line.startswith("#")]
     sdk = [line for line in lines if line.startswith("webull-openapi-python-sdk")]
     assert sdk and "==" in sdk[0], "webull-openapi-python-sdk ต้อง pin เป็น exact version"
+
+
+# ---- the /tmp deadlock: durability warning vs. "can it sign a request now" ---
+
+def test_an_ephemeral_token_dir_alone_never_blocks_the_order_once_accepted(
+        tmp_path, monkeypatch):
+    """The production stall: /tmp is the only writable path on Cloud Functions,
+    so `ok` was False on every slot forever and no READY_* row ever became an
+    order. `ready` is the answer the gate needs, and it separates cleanly."""
+    monkeypatch.setenv("WEBULL_TOKEN_DIR", "/tmp/webull_token")
+    monkeypatch.setattr(webull_io, "read_local_token", lambda: {
+        "token": "tok", "expires": "0", "status": "NORMAL",
+        "expires_at": _now() + timedelta(days=9)})
+
+    monkeypatch.delenv("LEGO_ALLOW_EPHEMERAL_TOKEN_DIR", raising=False)
+    strict = webull_io.token_health()
+    assert strict["ok"] is False and strict["ready"] is False
+
+    monkeypatch.setenv("LEGO_ALLOW_EPHEMERAL_TOKEN_DIR", "true")
+    accepted = webull_io.token_health()
+    assert accepted["ready"] is True
+    # The risk does not stop being reported just because it was accepted:
+    # `ok` and `reasons` are what main.py turns into token_warning.
+    assert accepted["ok"] is False
+    assert accepted["reasons"] == strict["reasons"]
+    assert accepted["ephemeral_token_dir"] is True
+
+
+def test_accepting_the_ephemeral_dir_does_not_excuse_a_missing_token(monkeypatch):
+    """The flag forgives exactly one reason. Nothing else moves."""
+    monkeypatch.setenv("WEBULL_TOKEN_DIR", "/tmp/webull_token")
+    monkeypatch.setenv("LEGO_ALLOW_EPHEMERAL_TOKEN_DIR", "true")
+    monkeypatch.setattr(webull_io, "read_local_token", lambda: None)
+    health = webull_io.token_health()
+    assert health["ok"] is False and health["ready"] is False
+    assert any("2FA" in text for text in health["reasons"])
+
+
+@pytest.mark.parametrize("days,status", [(1, "NORMAL"), (9, "EXPIRED")])
+def test_a_dying_token_still_blocks_even_on_an_accepted_ephemeral_dir(
+        monkeypatch, days, status):
+    monkeypatch.setenv("WEBULL_TOKEN_DIR", "/tmp/webull_token")
+    monkeypatch.setenv("LEGO_ALLOW_EPHEMERAL_TOKEN_DIR", "true")
+    monkeypatch.setattr(webull_io, "read_local_token", lambda: {
+        "token": "tok", "expires": "0", "status": status,
+        "expires_at": _now() + timedelta(days=days)})
+    health = webull_io.token_health()
+    assert health["ok"] is False and health["ready"] is False
+
+
+def test_a_durable_dir_answers_ok_and_ready_together(tmp_path, monkeypatch):
+    """With the token somewhere that survives a recycle there is nothing to
+    forgive, so the flag is irrelevant and both verdicts agree."""
+    _write_token(tmp_path, monkeypatch, "tok", _now() + timedelta(days=9))
+    for flag in ("false", "true"):
+        monkeypatch.setenv("LEGO_ALLOW_EPHEMERAL_TOKEN_DIR", flag)
+        health = webull_io.token_health()
+        assert health["ok"] is True and health["ready"] is True
+        assert health["reasons"] == []

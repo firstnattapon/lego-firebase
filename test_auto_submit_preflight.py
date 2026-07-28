@@ -428,3 +428,44 @@ def test_low_watermark_notice_survived_the_refactor(monkeypatch, auto_submit):
     monkeypatch.setenv("LEGO_DNA_LOW_WATERMARK", "10")
     body, _ = _run(monkeypatch, SLOT_0, 320.0)
     assert body["dna_steps_remaining"] == 2
+
+
+# --- the /tmp deadlock, end to end ------------------------------------------
+
+def test_an_accepted_ephemeral_dir_lets_the_intent_through(monkeypatch, auto_submit):
+    """The production stall of 2026-07-27, fixed.
+
+    Ten consecutive READY_SELL rows committed and the broker position never
+    moved, because token_health's `ok` folded 'the token dir is /tmp' — true on
+    every Cloud Functions deployment — into the same boolean the order gate
+    read. The gate now reads `ready`, so an accepted durability risk stops
+    costing the order while the warning still reaches the response.
+    """
+    monkeypatch.setattr(main, "token_health", lambda: {
+        "ok": False, "ready": True,
+        "reasons": ["token dir /tmp/webull_token อยู่บน storage ที่หายเมื่อ instance ถูกรีไซเคิล"]})
+    body, code = _run(monkeypatch, SLOT_0, 335.55, holdings=PROD_HOLDINGS)
+
+    assert code == 200 and body["committed"] is True
+    assert body["status"] == "READY_SELL"
+    assert [i["run_id"] for i in _intents()] == [body["run_id"]]
+    assert "outbox_blocked" not in body
+    # Accepted, not silenced: the operator still sees the risk every slot.
+    assert "/tmp/webull_token" in body["token_warning"]
+    assert FAKE_DB.reference("webull_lego_warnings/webull_token").get() is not None
+
+
+def test_a_health_report_without_ready_keeps_the_strict_reading(monkeypatch, auto_submit):
+    """Case 3 unchanged: `ok` is still the verdict when there is no `ready`."""
+    monkeypatch.setattr(main, "token_health", lambda: {
+        "ok": False, "reasons": ["token dir /tmp/webull_token"]})
+    body, _ = _run(monkeypatch, SLOT_0, 320.0)
+    assert _intents() == [] and body["outbox_blocked_checks"] == ["token_ready"]
+
+
+def test_ready_false_blocks_whatever_ok_says(monkeypatch, auto_submit):
+    """`ready` is the gate, so a report that lies about `ok` cannot open it."""
+    monkeypatch.setattr(main, "token_health", lambda: {
+        "ok": True, "ready": False, "reasons": ["ไม่พบ token file"]})
+    body, _ = _run(monkeypatch, SLOT_0, 320.0)
+    assert _intents() == [] and body["outbox_blocked_checks"] == ["token_ready"]

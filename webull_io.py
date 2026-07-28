@@ -171,6 +171,25 @@ def _refresh_margin_days() -> float:
     return float(os.environ.get("LEGO_TOKEN_REFRESH_MARGIN_DAYS", "3"))
 
 
+def ephemeral_token_dir_accepted() -> bool:
+    """True when the operator has signed off on a token dir that does not last.
+
+    Cloud Functions gives the container exactly one writable path, /tmp, so
+    `token_dir_is_ephemeral()` is True on every stock deployment. It is a real
+    risk — the token dies with the instance and only a human with the app can
+    replace it — but it is a risk about the *next* recycle, not a statement that
+    the token in hand cannot authenticate right now. Folding it into `ok` made
+    the AUTO_SUBMIT gate unsatisfiable on the platform the bot actually runs on:
+    every row committed READY_BUY/READY_SELL and not one of them ever became an
+    order intent, so the broker position never moved.
+
+    Default False keeps the strict reading. Setting it to true is the operator
+    saying 'I know the token is on /tmp and I accept re-doing 2FA after a
+    recycle' — the warning is still emitted on every slot either way.
+    """
+    return os.environ.get("LEGO_ALLOW_EPHEMERAL_TOKEN_DIR", "false").lower() == "true"
+
+
 def token_health(now: datetime | None = None) -> dict:
     """What the stored token says, without spending a request to ask the broker.
 
@@ -178,6 +197,12 @@ def token_health(now: datetime | None = None) -> dict:
     that ends with the bot silently unable to authenticate: no token file, a
     non-NORMAL status, an expiry inside the refresh margin, or a token kept
     somewhere that does not survive the container.
+
+    `ready` answers the narrower question the order gate needs — 'can this token
+    sign a request now?' — and so it ignores the durability warning once
+    LEGO_ALLOW_EPHEMERAL_TOKEN_DIR accepts it. Every other reason still closes
+    both. With the flag unset the two are always equal, which is why `ok`,
+    `reasons` and the warning text are byte-for-byte what they were.
     """
     now = now or datetime.now(timezone.utc)
     info = {
@@ -188,35 +213,38 @@ def token_health(now: datetime | None = None) -> dict:
         "expires_at": None,
         "days_left": None,
         "ok": True,
+        "ready": True,
         "reasons": [],
     }
-    if info["ephemeral_token_dir"]:
+
+    def fail(reason: str, *, blocks_now: bool = True) -> None:
+        """Record a reason; `blocks_now` False marks it durability-only."""
         info["ok"] = False
-        info["reasons"].append(
-            f"token dir {token_dir()} อยู่บน storage ที่หายเมื่อ instance ถูกรีไซเคิล — "
-            "ตั้ง WEBULL_TOKEN_DIR ไปยัง volume ที่คงอยู่ (เช่น GCS FUSE mount)")
+        if blocks_now:
+            info["ready"] = False
+        info["reasons"].append(reason)
+
+    if info["ephemeral_token_dir"]:
+        fail(f"token dir {token_dir()} อยู่บน storage ที่หายเมื่อ instance ถูกรีไซเคิล — "
+             "ตั้ง WEBULL_TOKEN_DIR ไปยัง volume ที่คงอยู่ (เช่น GCS FUSE mount)",
+             blocks_now=not ephemeral_token_dir_accepted())
     local = read_local_token()
     if local is None:
-        info["ok"] = False
-        info["reasons"].append(
-            f"ไม่พบ token file ที่ {token_file_path()} — ครั้งถัดไปจะต้องยืนยัน 2FA ใหม่")
+        fail(f"ไม่พบ token file ที่ {token_file_path()} — ครั้งถัดไปจะต้องยืนยัน 2FA ใหม่")
         return info
     info["found"] = True
     info["status"] = local["status"] or None
     expires_at = local["expires_at"]
     if expires_at is None:
-        info["ok"] = False
-        info["reasons"].append("token file ไม่มีวันหมดอายุที่อ่านได้")
+        fail("token file ไม่มีวันหมดอายุที่อ่านได้")
         return info
     days_left = (expires_at - now).total_seconds() / 86400.0
     info["expires_at"] = expires_at.strftime("%Y-%m-%dT%H:%M:%SZ")
     info["days_left"] = round(days_left, 3)
     if local["status"] and local["status"] != "NORMAL":
-        info["ok"] = False
-        info["reasons"].append(f"token status={local['status']} (ต้องเป็น NORMAL)")
+        fail(f"token status={local['status']} (ต้องเป็น NORMAL)")
     if days_left <= _refresh_margin_days():
-        info["ok"] = False
-        info["reasons"].append(f"token เหลืออีก {days_left:.2f} วันก่อนหมดอายุ")
+        fail(f"token เหลืออีก {days_left:.2f} วันก่อนหมดอายุ")
     return info
 
 
