@@ -322,6 +322,9 @@ def test_two_concurrent_workers_place_exactly_once(monkeypatch):
         "filled_quantity": row["_meta"]["quantity"],
         "avg_filled_price": 320.0,
     })
+    monkeypatch.setattr(
+        main, "fetch_holdings",
+        lambda _tc, _cfg: 9.0 + float(row["_meta"]["quantity"]))
     placed = []
     placed_lock = threading.Lock()
 
@@ -431,7 +434,7 @@ def test_missing_fill_fields_become_terminal_manual_check():
         "status": "PLACING_UNKNOWN",
         "side": "BUY",
     })
-    result = main._finish_with_realized(intent, {
+    result = main._finish_with_realized(object(), main.load_config(), intent, {
         "status": "FILLED",
         "realized": True,
     })

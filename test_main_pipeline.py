@@ -212,12 +212,17 @@ def test_order_worker_failure_never_blocks_the_row(monkeypatch):
 
 # --- execution-leg safety: the order that never resolves ---------------------
 
-def _stub_broker(monkeypatch, *, place=None, detail=None):
+def _stub_broker(monkeypatch, *, place=None, detail=None, holdings_after=None):
     monkeypatch.setattr(main, "preview_market_order", lambda tc, o: True)
     monkeypatch.setattr(main, "fetch_open_orders", lambda tc, s: [])
     monkeypatch.setattr(main, "place_market_order",
                         place or (lambda tc, o: {"order_status": "FILLED"}))
     monkeypatch.setattr(main, "fetch_order_detail", detail or (lambda tc, r: {}))
+    # The post-execution position read the worker uses to confirm a fill really
+    # moved the account before it books ΔAₙ/Aₙ/Eₙ.
+    monkeypatch.setattr(main, "fetch_holdings",
+                        lambda tc, cfg: 0.0 if holdings_after is None
+                        else float(holdings_after))
 
 
 def _reject(*args, **kwargs):
@@ -256,7 +261,8 @@ def test_a_stuck_intent_never_starves_a_later_decision(monkeypatch, auto_submit)
 
     # broker recovers, a later slot decides to trade
     _stub_broker(monkeypatch, detail=lambda tc, r: {
-        "order_status": "FILLED", "filled_quantity": 1.0, "avg_filled_price": 322.0})
+        "order_status": "FILLED", "filled_quantity": 1.0, "avg_filled_price": 322.0},
+        holdings_after=10.0)
     later, _ = _run(monkeypatch, datetime(2026, 7, 23, 19, 30, 5, tzinfo=UTC), 322.0)
     main._run_order_worker(cfg, limit=1)
     assert FAKE_DB.reference(

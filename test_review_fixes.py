@@ -64,12 +64,19 @@ def _run(monkeypatch, moment: datetime, price: float, holdings: float = 0.0):
     return main.lego_one_row(object())
 
 
-def _stub_broker(monkeypatch, *, place=None, detail=None, preview=True):
+def _stub_broker(monkeypatch, *, place=None, detail=None, preview=True,
+                 holdings_after=None):
     monkeypatch.setattr(main, "preview_market_order", lambda tc, o: preview)
     monkeypatch.setattr(main, "fetch_open_orders", lambda tc, s: [])
     monkeypatch.setattr(main, "place_market_order",
                         place or (lambda tc, o: {"order_status": "FILLED"}))
     monkeypatch.setattr(main, "fetch_order_detail", detail or (lambda tc, r: {}))
+    # The post-execution position read. Default 0.0 means "the position never
+    # moved", which is what these order-path tests need: no fill is confirmed,
+    # so none of them accidentally finalizes a model cashflow.
+    monkeypatch.setattr(main, "fetch_holdings",
+                        lambda tc, cfg: 0.0 if holdings_after is None
+                        else float(holdings_after))
 
 
 # --- F1: a degraded clock must not skip the order in silence ----------------
@@ -243,10 +250,16 @@ def test_a_matching_intent_still_passes_the_gate(monkeypatch, auto_submit):
                      "order_status": "FILLED",
                      "filled_quantity": 1.0,
                      "avg_filled_price": 320.0,
-                 })
-    _run(monkeypatch, SESSION_OPEN_SLOT, 320.0)
+                 },
+                 holdings_after=1.0)          # the position actually moved
+    body, _ = _run(monkeypatch, SESSION_OPEN_SLOT, 320.0)
     result = main._run_order_worker(cfg, limit=1)["results"][0]
     assert result["status"] == "FILLED" and len(placed) == 1
+    # ...and the fill, not the decision, is what booked the model ledger.
+    assert result["cashflow_finalized"] is True
+    row = FAKE_DB.reference(f"webull_lego_rows/{body['run_id']}").get()
+    assert row["cashflow_status"] == "FINALIZED"
+    assert row["execution_price"] == 320.0 and row["post_execution_holdings"] == 1.0
 
 
 def test_a_row_flipped_to_pass_after_commit_blocks_the_order(monkeypatch, auto_submit):

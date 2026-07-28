@@ -26,6 +26,11 @@ TERMINAL = {
     # Terminal for dispatch only — the order audit keeps needs_manual_check so
     # a human still answers whether the order exists.
     "RECONCILE_ABANDONED",
+    # The broker confirmed the fill; only the 17-column model ledger could not
+    # book it. Terminal for the same reason as REALIZED_MATH_ERROR below —
+    # re-sending would duplicate a filled order — and needs_manual_check keeps
+    # the ΔAₙ/Aₙ/Eₙ gap visible instead of retrying arithmetic forever.
+    "CASHFLOW_FINALIZE_ERROR",
     # The broker confirmed the fill; only our realized math could not use it.
     # Nothing is left to dispatch — re-sending would duplicate a filled order —
     # so it must leave the queue, and needs_manual_check keeps the ledger gap

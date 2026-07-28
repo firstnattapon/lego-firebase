@@ -8,9 +8,9 @@ Stack: **Scheduler (เวลา) → Cloud Function (engine) → RTDB (data) �
 
 | module | หน้าที่ |
 |---|---|
-| `main.py` | Cloud Function 3 ตัว: `lego_one_row` (เดิน DNA), `lego_order_worker` (ส่ง/ตาม order), `lego_archive_worker` (ย้าย record ที่จบแล้วออกจาก path ที่ loop สแกน) |
+| `main.py` | Cloud Function 3 ตัว: `lego_one_row` (เดิน DNA + ตัดสินใจ), `lego_order_worker` (ส่ง/ตาม order + finalize ΔAₙ/Aₙ/Eₙ), `lego_archive_worker` (ย้าย record ที่จบแล้วออกจาก path ที่ loop สแกน) |
 | `market_clock.py` | นาฬิกาตลาด: slot, market ordinal, ปฏิทิน NYSE, calendar fingerprint |
-| `lego_one_row.py` | สมการ 17 คอลัมน์: DNA step/signal, decision, recurrence Rₙ/ΔAₙ/Aₙ/Eₙ |
+| `lego_one_row.py` | สมการ 17 คอลัมน์: DNA step/signal, decision, Rₙ และ `finalize_recurrence` (ΔAₙ/Aₙ/Eₙ จาก fill จริง) |
 | `dna_engine.py` | ถอด DNA code เป็น gate array 0/1 |
 | `lego_state.py` | Step 18 persistence: transaction, idempotency, guard ทุกตัว, realized ledger |
 | `lego_outbox.py` | order outbox (1 decision = 1 intent) แยกจาก DNA pointer |
@@ -102,6 +102,37 @@ gcloud functions deploy lego-archive-worker \
 > `webull_lego_order_outbox` / `webull_lego_order_audit` จะโตไม่หยุดและทุก tick ต้องโหลดทั้งก้อน
 
 ตาราง env ครบทุกตัวอยู่ใน [QUICKSTART_TH.md](QUICKSTART_TH.md) หัวข้อ 6
+
+### แบ่งหน้าที่: decision (`lego_one_row`) กับ execution (`lego_order_worker`)
+
+`READY_BUY`/`READY_SELL` คือ **เจตนา** ไม่ใช่การซื้อขายที่สำเร็จ ทั้งสองฝั่งจึงเขียน state
+คนละชุด และไม่มีใครเขียนของอีกฝั่ง:
+
+| ฝั่ง | เขียนอะไร | เงื่อนไข |
+|---|---|---|
+| `lego_one_row` | decision pointer: `version`, `dna_step`, `p0`, `slot_id`, `market_ordinal` + คอลัมน์ตัดสินใจทั้งหมด และ `Rₙ` (live ทุกแถว) | ทุก slot ที่ commit สำเร็จ |
+| `lego_order_worker` | execution cashflow: `execution_cashflow.last_action_price` (P_acted), `execution_cashflow.actual_cumulative` (Aₙ) + คอลัมน์ `ΔAₙ`/`Aₙ`/`Eₙ` ของแถวนั้น | เฉพาะเมื่อ broker ยืนยัน `cumulative_filled_quantity > 0` **และ** อ่าน holdings หลัง fill แล้วเปลี่ยนจริง |
+
+- แถวที่ commit แล้วแต่ยังไม่ fill มี `cashflow_status = PENDING_EXECUTION` และ `ΔAₙ = 0`
+  (`Aₙ` ค้างที่ค่าจาก fill ล่าสุด) — `SUBMITTED`/`PENDING_DISPATCH`/`READY_*` ไม่เคยเพิ่ม `Aₙ`
+- fill แล้ว → `cashflow_status = FINALIZED` พร้อม `execution_price`, `execution_quantity`,
+  `post_execution_holdings` (ทั้งหมดอยู่นอก 17 คอลัมน์)
+- `ΔAₙ` ใช้ **filled_price จริง** ไม่ใช่ `decision_price`; holdings ใช้ค่าที่อ่านกลับจาก broker
+  ไม่ใช่จำนวนที่สั่ง
+- finalize เป็น transaction เดียว idempotent ที่ `run_id` (= `client_order_id`) → retry, poll ซ้ำ
+  ของ partial fill และ worker หลาย instance บันทึกได้ครั้งเดียว
+- fill ที่ broker ยืนยันแต่ holdings ยังไม่ขยับ → `AWAITING_FILL_CONFIRMATION` (ไม่ terminal)
+  แล้วลองใหม่จนถึงเพดาน `LEGO_FILL_CONFIRM_MAX_ATTEMPTS` (default 5) จึงปล่อยออกจากคิว
+  พร้อม `needs_manual_check` — ห้าม book cashflow จากคำพูด broker อย่างเดียว
+
+> **อัปเกรด chain เดิม:** `cashflow_semantics` เปลี่ยนเป็น `execution_confirmed_v1`
+> ความหมายของ `Aₙ` ต่างจาก `gated_theoretical_v2` (อันเดิมนับ decision เป็น act) จึงลากต่อกันไม่ได้
+> — chain เดิมจะ **รีเซ็ต baseline `Aₙ` เป็น 0** ในรอบแรกหลัง deploy โดย DNA/slot/`version` เดินต่อปกติ
+> ส่วน `P_acted` ใช้ `prev_price` เดิมเป็นค่าตั้งต้น (กติกาเดียวกับที่ใช้มาทุกครั้งที่ semantics เปลี่ยน)
+
+> `Eₙ = Aₙ − Rₙ ≥ 0` เป็นจริงเมื่อ `Aₙ` กับ `Rₙ` เดินบนราคาชุดเดียวกัน ตอนนี้ `Aₙ` ใช้ราคา fill
+> ส่วน `Rₙ` ใช้ราคาที่ตัดสินใจ ดังนั้น `Eₙ` ติดลบเล็กน้อยได้เท่ากับ slippage ที่จ่ายจริง —
+> นี่คือสิ่งที่ตั้งใจวัด ไม่ใช่ความผิดพลาด
 
 ### อัปเกรด chain เดิม: runtime identity guard
 
@@ -229,3 +260,9 @@ field เตือนที่จะโผล่ใน response ของแถ�
 19. fill ที่ยืนยันแล้วแต่ไม่มี quantity/price ต้องจบ `REALIZED_MATH_ERROR` +
     `needs_manual_check`; ห้ามปิดเป็น `FILLED` แบบ ledger ไม่ครบ
 20. audit ที่เขียนไม่สำเร็จต้องมี `audit_pending` ใน private outbox และถูกซ่อมก่อน archive
+21. `ΔAₙ`/`Aₙ`/`Eₙ` ขยับได้จาก fill ที่ broker ยืนยันเท่านั้น — `READY_*`, `PENDING_DISPATCH`
+    และ `SUBMITTED` ห้ามเพิ่ม `Aₙ`; PASS ให้ `ΔAₙ = 0` และ `Aₙ` คงเดิม
+22. finalize ต้อง idempotent ที่ `run_id` — partial fill ใช้ cumulative quantity และ finalize
+    ครั้งเดียว, worker หลาย instance ต้องได้ผลเดียวกัน, retry ต้องไม่คำนวณซ้ำ
+23. finalize ห้ามแตะ decision pointer (`version`, `dna_step`, `p0`, `slot_id`, `market_ordinal`)
+    — cashflow อยู่ใต้ `execution_cashflow` และ commit รอบถัดไปต้องพา state นั้นไปต่อ ไม่ทับ

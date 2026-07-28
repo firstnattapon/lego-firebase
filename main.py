@@ -1,7 +1,11 @@
 """Cloud Functions for time-aligned LEGO DNA and independent order execution.
 
 lego_one_row: market clock -> snapshot -> model row -> durable outbox candidate.
+    Decides. Never books a cashflow: READY_BUY/READY_SELL is an intent, so the
+    row it commits carries ΔAₙ/Aₙ/Eₙ forward unchanged.
 lego_order_worker: dispatch/reconcile outbox intents without blocking DNA time.
+    Executes and finalizes. Once the broker confirms a fill and the position has
+    actually moved, it books ΔAₙ/Aₙ/Eₙ from the filled price onto that row.
 lego_archive_worker: move finished order records out of the live paths.
 """
 from __future__ import annotations
@@ -17,9 +21,10 @@ import functions_framework
 from firebase_admin import credentials, db
 
 from lego_archive import archive_terminal_records
-from lego_one_row import (READY_BUY, READY_SELL, DNAExhausted, HoldingsAnomaly,
-                          check_holdings_continuity, compute_row, dna_step_for,
-                          dna_steps_remaining)
+from lego_one_row import (READY_BUY, READY_SELL, DNAExhausted, ExecutionFill,
+                          HoldingsAnomaly, check_holdings_continuity,
+                          compute_row, dna_step_for, dna_steps_remaining,
+                          position_vanished)
 from lego_orders import (TERMINAL_STATUSES, UAT, evaluate_submit_gate,
                          normalize_status, order_confirmation_phrase,
                          summarize_order_result)
@@ -28,30 +33,51 @@ from lego_outbox import (begin_place_attempt, claim_intent,
                          list_audit_pending, put_intent, read_committed_row,
                          release_intent_claim, update_intent)
 from lego_preflight import DEFAULT_MIN_DNA_REMAINING, auto_submit_preflight
-from lego_state import (CalendarDriftError, DNADriftError, OrdinalRegression,
+from lego_state import (CalendarDriftError, DNADriftError,
+                         ExecutionFinalizeError, OrdinalRegression,
                          RuntimeIdentityError, SlotAlreadyConsumed,
                          StaleAnchorError, apply_realized_fill, chain_key,
                          chain_runtime_identity_is_verified, commit_final_row,
-                         mark_order_intent_materialized, pending_order_intents,
-                         read_anchor, read_chain_state, UNREAD_STATE,
-                         update_order_audit, verify_runtime_identity,
-                         write_order_audit)
+                         finalize_execution_fill, mark_order_intent_materialized,
+                         pending_order_intents, read_anchor, read_chain_state,
+                         UNREAD_STATE, update_order_audit,
+                         verify_runtime_identity, write_order_audit)
 from market_clock import (MarketClockError, clock_mode, fallback_slot_id,
                           is_regular_session, resolve_dna_step, resolve_market_slot,
                           slot_seconds)
 from webull_io import (IncompleteOpenOrdersError, build_clients,
                         build_order_payload, environment_label,
-                        fetch_open_orders, fetch_order_detail, fetch_snapshot,
-                        is_transient_exception, load_config, market_category,
-                        place_market_order, preview_market_order,
-                        redact_sensitive_text, runtime_identity_fingerprint,
-                        token_health)
+                        fetch_holdings, fetch_open_orders, fetch_order_detail,
+                        fetch_snapshot, is_transient_exception, load_config,
+                        market_category, place_market_order,
+                        preview_market_order, redact_sensitive_text,
+                        runtime_identity_fingerprint, token_health)
 
 ORDER_POLL_ATTEMPTS = 3
 ORDER_POLL_DELAY_S = 2.0
 UTC = timezone.utc
 WARNINGS_PATH = "webull_lego_warnings"
 ERRORS_PATH = "webull_lego_errors"
+# Non-terminal: the broker has answered with a fill, but the position has not
+# caught up yet, so the model ledger cannot be finalized on this tick. Kept out
+# of lego_outbox.TERMINAL on purpose — the intent has to come back — and bounded
+# below so an account whose position feed never moves cannot hold the queue.
+AWAITING_FILL_CONFIRMATION = "AWAITING_FILL_CONFIRMATION"
+DEFAULT_FILL_CONFIRM_MAX_ATTEMPTS = 5
+RECONCILE_STATUSES = {
+    "PLACING_UNKNOWN", "PLACING", "SUBMITTED", "UNKNOWN",
+    "PARTIAL_FILLED", "PARTIALLY_FILLED", AWAITING_FILL_CONFIRMATION,
+}
+
+
+class FillNotConfirmed(RuntimeError):
+    """The broker reports a fill the account position has not shown yet.
+
+    Not an error about the order — the order is fine. It says only that the two
+    witnesses required before the model ledger may move (a cumulative filled
+    quantity, and a position read back after execution) do not yet agree, so
+    this tick must wait rather than book a cashflow on the broker's word alone.
+    """
 
 
 class RealizedMathError(RuntimeError):
@@ -327,12 +353,191 @@ def _persist_realized_math_error(intent: dict, summary: dict, exc: Exception) ->
     return {"run_id": intent["run_id"], **fields}
 
 
-def _finish_with_realized(intent: dict, summary: dict) -> dict:
-    """The broker has answered; the only failure left belongs to us."""
+def _holdings_drift_tolerance() -> float:
+    """Below this a holdings difference is noise, not a position that moved."""
+    try:
+        return abs(float(os.environ.get("LEGO_HOLDINGS_DRIFT_TOLERANCE",
+                                        "0.000001")))
+    except (TypeError, ValueError):
+        return 0.000001
+
+
+def _fill_confirm_max_attempts() -> int:
+    try:
+        return max(1, int(os.environ.get("LEGO_FILL_CONFIRM_MAX_ATTEMPTS",
+                                         str(DEFAULT_FILL_CONFIRM_MAX_ATTEMPTS))))
+    except (TypeError, ValueError):
+        return DEFAULT_FILL_CONFIRM_MAX_ATTEMPTS
+
+
+def _positive_float(value) -> float | None:
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return None
+    return number if number > 0 and number == number and number != float("inf") else None
+
+
+def _holdings_moved(side: str, before: float, after: float, tolerance: float) -> bool:
+    """Did the position move the way this side of the trade requires?
+
+    Direction, not just difference: a BUY whose position went *down* between the
+    decision and the fill is somebody else's trade landing in the same account,
+    and booking our ΔAₙ against it would be inventing a cashflow.
+    """
+    if side == "BUY":
+        return after > before + tolerance
+    if side == "SELL":
+        return after < before - tolerance
+    return False
+
+
+def _finalize_model_ledger(trade_client, cfg, intent: dict, summary: dict) -> dict:
+    """Book ΔAₙ/Aₙ/Eₙ for this row, once the broker proves the shares moved.
+
+    Both inputs come from the broker and neither from what we asked for: the
+    cumulative filled quantity and price of this client_order_id, and the
+    position read back after execution. The ordered quantity is never used to
+    guess the resulting holdings, and the decision price is never used in place
+    of the filled price.
+    """
+    quantity = _positive_float(summary.get("filled_quantity"))
+    price = _positive_float(summary.get("filled_price"))
+    if quantity is None or price is None:
+        raise RealizedMathError(
+            "fill confirmed but quantity/price unavailable — needs manual check")
+    try:
+        holdings_after = fetch_holdings(trade_client, cfg)
+    except Exception as exc:
+        # Could not read the position — a network blip, or a positions response
+        # this adapter refuses to interpret. Neither says anything about the
+        # fill, so it defers on the bounded budget instead of ending the intent
+        # the way an arithmetic failure does.
+        raise FillNotConfirmed(
+            f"อ่าน holdings หลัง fill ไม่สำเร็จ: {_error_text(exc)}") from exc
+    before = float(intent.get("decision_holdings", 0.0) or 0.0)
+    # Same rule as the pre-decision guard, applied to the same reading: a
+    # rebalance SELL targets value fix_c and always leaves shares behind, so a
+    # position that reads exactly zero is a positions response that lost the
+    # symbol, not a confirmation. Booking it would move P_acted onto that fill
+    # *and* write prev_holdings = 0, which disarms the guard for every slot
+    # after it — the compounding this system already refuses on the way in.
+    if (os.environ.get("LEGO_ALLOW_ZERO_HOLDINGS", "false").lower() != "true"
+            and position_vanished(before, holdings_after)):
+        raise FillNotConfirmed(
+            f"chain เคยถือ {before} หุ้น แต่ post-execution holdings อ่านได้ 0 — "
+            "อาจเป็น positions response ที่ไม่ครบ จึงยังไม่ finalize cashflow")
+    if not _holdings_moved(str(intent.get("side", "")).upper(), before,
+                           holdings_after, _holdings_drift_tolerance()):
+        raise FillNotConfirmed(
+            f"broker แจ้ง filled {quantity} แต่ holdings หลังส่งยังเป็น {holdings_after} "
+            f"(ตอนตัดสินใจ {before}) — ยังไม่ยืนยันว่าจำนวนถือครองเปลี่ยน")
+    return finalize_execution_fill(
+        cfg, str(intent["run_id"]),
+        ExecutionFill(filled_price=price, filled_quantity=quantity,
+                      holdings_after=holdings_after),
+        runtime_identity=intent.get("runtime_identity_fingerprint"))
+
+
+def _defer_fill_confirmation(intent: dict, summary: dict, exc: Exception) -> dict:
+    """Come back for a fill whose position has not landed yet — but not forever.
+
+    The intent stays actionable under its own non-terminal status so the next
+    tick asks the broker again. Past the bound it stops asking and carries the
+    broker's own status out of the queue with needs_manual_check, for the same
+    reason RECONCILE_ABANDONED exists: an intent that can never resolve must not
+    keep a dispatch slot from every decision behind it.
+    """
+    attempts = int(intent.get("fill_confirm_attempts", 0) or 0) + 1
+    broker_status = normalize_status(summary.get("status"))
+    fields = {
+        **summary,
+        "broker_status": broker_status,
+        "cashflow_finalized": False,
+        "fill_confirm_attempts": attempts,
+        "last_error": _error_text(exc)[:500],
+    }
+    if attempts < _fill_confirm_max_attempts():
+        fields["status"] = AWAITING_FILL_CONFIRMATION
+        _persist(intent["chain_key"], intent["run_id"], fields)
+        return {"run_id": intent["run_id"], **fields}
+    fields.update({
+        "status": broker_status,
+        "cashflow_abandoned": True,
+        "needs_manual_check": True,
+        "terminal_reason": (f"broker แจ้ง fill แต่ holdings ไม่ยืนยันครบ {attempts} ครั้ง "
+                            "— ΔAₙ/Aₙ/Eₙ ของแถวนี้ยังไม่ finalize ต้องกระทบยอดเอง"),
+    })
+    _persist(intent["chain_key"], intent["run_id"], fields)
+    _record_warning(
+        "cashflow_unconfirmed",
+        "fill ยืนยันจาก broker แล้วแต่ holdings ไม่ขยับ — model ledger ยังไม่ finalize",
+        {"run_id": intent["run_id"], "chain_key": intent["chain_key"]})
+    return {"run_id": intent["run_id"], **fields}
+
+
+def _persist_cashflow_error(intent: dict, summary: dict, exc: Exception) -> dict:
+    """End an intent whose fill is real but whose model ledger refused it.
+
+    Same shape as _persist_realized_math_error and for the same reason: the
+    broker has answered, so re-sending would duplicate a filled order. Retrying
+    cannot fix arithmetic or a missing chain state, so it ends here and the
+    ledger gap stays visible instead of being retried forever.
+    """
+    fields = {
+        **summary,
+        "status": "CASHFLOW_FINALIZE_ERROR",
+        "broker_status": normalize_status(summary.get("status")),
+        "cashflow_finalized": False,
+        "cashflow_abandoned": True,
+        "needs_manual_check": True,
+        "last_error": _error_text(exc)[:500],
+        "terminal_reason": ("fill จริงแต่ finalize ΔAₙ/Aₙ/Eₙ ไม่ได้ — "
+                            "ห้ามส่ง order ซ้ำ ต้องกระทบยอด model ledger เอง"),
+    }
+    _persist(intent["chain_key"], intent["run_id"], fields)
+    _record_warning("cashflow_finalize_error",
+                    "fill ยืนยันแล้วแต่ finalize model ledger ไม่ได้ — ต้องกระทบยอดเอง",
+                    {"run_id": intent["run_id"], "chain_key": intent["chain_key"]})
+    return {"run_id": intent["run_id"], **fields}
+
+
+def _finish_with_realized(trade_client, cfg, intent: dict, summary: dict) -> dict:
+    """The broker has answered; the only failure left belongs to us.
+
+    Two ledgers move here and they are independent: the realized ledger from
+    matched broker legs, and the 17-column model ledger this function finalizes
+    from the same confirmed fill. A decision never reaches either one.
+    """
     try:
         summary = _apply_realized_if_available(intent, summary)
     except RealizedMathError as exc:
         return _persist_realized_math_error(intent, summary, exc)
+    # Acted is a cumulative filled quantity above zero and nothing else — not the
+    # status, which is only a label on top of it. So a DAY order that fills 30 of
+    # 70 and is cancelled at the close still finalizes those 30, while a REJECTED
+    # or CANCELLED order that moved no shares leaves ΔAₙ = 0 and Aₙ exactly where
+    # the last confirmed fill left it. (_apply_realized_if_available has already
+    # refused a claimed fill with no readable quantity or price.)
+    filled = _positive_float(summary.get("filled_quantity"))
+    if filled is not None and not intent.get("cashflow_abandoned"):
+        try:
+            finalized = _finalize_model_ledger(trade_client, cfg, intent, summary)
+        except FillNotConfirmed as exc:
+            return _defer_fill_confirmation(intent, summary, exc)
+        except RealizedMathError as exc:
+            return _persist_realized_math_error(intent, summary, exc)
+        except (ExecutionFinalizeError, ValueError, TypeError) as exc:
+            return _persist_cashflow_error(intent, summary, exc)
+        summary = {
+            **summary,
+            "cashflow_finalized": True,
+            "cashflow_applied_now": finalized["applied"],
+            "delta_actual": finalized["delta_actual"],
+            "actual_cumulative": finalized["actual_cumulative"],
+            "excess": finalized["excess"],
+            "post_execution_holdings": finalized["holdings_after"],
+        }
     _persist_summary(intent, summary)
     return {"run_id": intent["run_id"], **summary}
 
@@ -380,18 +585,17 @@ def _dispatch_or_reconcile_one(trade_client, data_client, cfg, intent: dict) -> 
         return _stop(ck, run_id, "NOT_PLACED",
                      {"terminal_reason": "source row was not committed"})
 
-    if status in {"PLACING_UNKNOWN", "PLACING", "SUBMITTED", "UNKNOWN",
-                  "PARTIAL_FILLED", "PARTIALLY_FILLED"}:
+    if status in RECONCILE_STATUSES:
         try:
             summary = summarize_order_result({}, fetch_order_detail(trade_client, run_id))
             if normalize_status(summary.get("status")) == "UNKNOWN":
                 raise RuntimeError("broker order detail still UNKNOWN")
         except Exception as exc:
             # Everything inside this try is 'can we reach and read the broker?'.
-            # The realized ledger is applied outside it so its failures are not
-            # reported as an unresolved order.
+            # The realized and model ledgers are applied outside it so their
+            # failures are not reported as an unresolved order.
             return _persist_reconcile_failure(intent, exc)
-        return _finish_with_realized(intent, summary)
+        return _finish_with_realized(trade_client, cfg, intent, summary)
 
     if status != "PENDING_DISPATCH":
         return {"run_id": run_id, "status": status}
@@ -465,7 +669,7 @@ def _dispatch_or_reconcile_one(trade_client, data_client, cfg, intent: dict) -> 
         # Same open question as a failed reconcile — "does this order exist?" —
         # so it draws on the same bounded budget.
         return _persist_reconcile_failure(intent, exc)
-    return _finish_with_realized(intent, summary)
+    return _finish_with_realized(trade_client, cfg, intent, summary)
 
 
 def _outbox_intent(cfg, row: dict, snapshot: dict, slot, decision_time: datetime) -> dict:

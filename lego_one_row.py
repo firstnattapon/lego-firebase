@@ -1,9 +1,22 @@
 """Pure LEGO row engine for the fixed 17-column contract.
 
-The 17-column recurrence is a model ledger, not broker-realized P&L. An act
-occurs only when the final decision is READY_BUY/READY_SELL. DNA progression is
-supplied by the market clock in production; legacy anchor+1 remains available
-for shadow mode and backward-compatible tests.
+The 17-column recurrence is a model ledger, not broker-realized P&L, and it is
+now split across the two machines that own it:
+
+* This module (driven by lego_one_row) decides. It reads the price and the
+  holdings, walks the DNA, and produces the decision columns plus Rₙ, which is
+  live on every row. A READY_BUY/READY_SELL is an *intent to trade*, so the
+  cashflow columns ΔAₙ/Aₙ/Eₙ are carried forward unchanged — the same values a
+  PASS row gets. Nothing here may advance them.
+* lego_order_worker finalizes. Once the broker confirms a real fill and the
+  post-execution holdings, `finalize_recurrence` computes ΔAₙ/Aₙ/Eₙ from the
+  filled price and the worker patches them onto the committed row.
+
+`compute_recurrence` still implements both branches: the act branch is what the
+worker's finalization reduces to once a fill is confirmed, and it stays here so
+the two paths cannot drift apart. DNA progression is supplied by the market
+clock in production; legacy anchor+1 remains available for shadow mode and
+backward-compatible tests.
 """
 from __future__ import annotations
 
@@ -26,6 +39,10 @@ COLUMN_ORDER = [
     "Rₙ อ้างอิง (USD)", "ΔAₙ ต่อสเต็ป (USD)", "Aₙ สะสม (USD)",
     "Eₙ ส่วนเกินสะสม (USD)",
 ]
+
+# The four cashflow columns, named off the contract itself so the worker that
+# finalizes three of them can never patch a column the engine stopped writing.
+REFERENCE_COLUMN, DELTA_COLUMN, ACTUAL_COLUMN, EXCESS_COLUMN = COLUMN_ORDER[13:17]
 
 
 class DNAExhausted(RuntimeError):
@@ -70,6 +87,16 @@ class Config:
             raise ValueError("decimal_precision ต้อง 0..5")
 
 
+def position_vanished(prev_holdings: float | None, holdings: float) -> bool:
+    """The predicate behind check_holdings_continuity, on plain numbers.
+
+    Shared so the post-execution read in lego_order_worker applies exactly the
+    same rule as the pre-decision one, rather than a second opinion about what
+    'the position disappeared' means.
+    """
+    return prev_holdings is not None and prev_holdings > 0 and holdings == 0
+
+
 def check_holdings_continuity(anchor: Anchor | None, holdings: float) -> None:
     """Refuse a snapshot that says the position vanished.
 
@@ -89,9 +116,9 @@ def check_holdings_continuity(anchor: Anchor | None, holdings: float) -> None:
     the chain remembers a position is therefore not a market event, and only
     that case is refused — a partial drop is ordinary and stays silent.
     """
-    if anchor is None or anchor.prev_holdings is None:
-        return                       # genesis, or state written before the field
-    if anchor.prev_holdings > 0 and holdings == 0:
+    if anchor is None:
+        return                       # genesis: no reference to contradict
+    if position_vanished(anchor.prev_holdings, holdings):
         raise HoldingsAnomaly(
             f"chain เคยถือ {anchor.prev_holdings} หุ้น แต่ snapshot นี้อ่านได้ 0 — "
             "อาจเป็น positions response ที่ไม่ครบ ไม่ใช่การถือ 0 จริง จึงไม่ commit")
@@ -195,6 +222,67 @@ def compute_recurrence(cfg: Config, price: float, anchor: Anchor | None,
     return Recurrence(R, 0.0, A, A - R_acted, float(anchor.prev_price))
 
 
+@dataclass(frozen=True)
+class ExecutionFill:
+    """The broker-confirmed facts, and the only inputs allowed to move Aₙ.
+
+    `filled_quantity` is cumulative for one client_order_id, so a partial fill
+    and the poll that observes it again carry the same number; `holdings_after`
+    is read back from the broker, never derived from the ordered quantity.
+    """
+    filled_price: float
+    filled_quantity: float
+    holdings_after: float
+
+    @property
+    def acted(self) -> bool:
+        """Shares moved. No status, and no READY_*, can substitute for this."""
+        return (math.isfinite(self.filled_quantity) and self.filled_quantity > 0
+                and math.isfinite(self.filled_price) and self.filled_price > 0)
+
+
+@dataclass(frozen=True)
+class Finalization:
+    dA: float
+    A: float
+    E: float
+    acted_price_next: float
+
+
+def finalize_recurrence(cfg: Config, fill: ExecutionFill, *,
+                        last_action_price: float, actual_cumulative: float,
+                        reference_R: float) -> Finalization:
+    """ΔAₙ/Aₙ/Eₙ for a row whose order the broker confirmed as filled.
+
+    Identical arithmetic to `compute_recurrence`'s act branch, with the executed
+    price in place of the decision price: the decision price is what the engine
+    saw when it chose, and using it here would book a cashflow the account never
+    experienced. Rₙ is not recomputed — it is the row's own reference column,
+    already committed by the engine, and only ΔAₙ/Aₙ/Eₙ move to this side.
+
+    One consequence worth naming: Aₙ is now built from executed prices while Rₙ
+    is still built from quoted ones, so `Eₙ = Aₙ − Rₙ ≥ 0` — which holds exactly
+    when both walk the same price path — now holds up to execution slippage and
+    can sit slightly below zero after an unlucky fill. That is the difference
+    being measured, not an error in it: the surplus is reported net of what the
+    executions actually cost. The same applies to a chain's first fill, whose
+    P_acted seed is the genesis row's own decision price.
+    """
+    if not fill.acted:
+        raise ValueError(
+            "finalize ต้องมี fill จริง: filled_quantity > 0 และ filled_price > 0")
+    if not (math.isfinite(last_action_price) and last_action_price > 0):
+        raise ValueError("last_action_price (P_acted) ต้อง finite และ > 0")
+    if not (math.isfinite(actual_cumulative) and math.isfinite(reference_R)):
+        raise ValueError("actual_cumulative และ Rₙ ต้อง finite")
+    if not (math.isfinite(fill.holdings_after) and fill.holdings_after >= 0):
+        raise ValueError("holdings หลัง fill ต้อง finite และ >= 0")
+    price = float(fill.filled_price)
+    dA = cfg.fix_c * (price / last_action_price - 1.0)
+    A = actual_cumulative + dA
+    return Finalization(dA, A, A - reference_R, price)
+
+
 def compute_row(cfg: Config, snapshot: dict, anchor: Anchor | None,
                 dna_step: int | None = None) -> dict:
     step = dna_step_for(anchor, dna_step)
@@ -202,7 +290,12 @@ def compute_row(cfg: Config, snapshot: dict, anchor: Anchor | None,
     price = float(snapshot["price"])
     holdings = float(snapshot.get("holdings", 0.0) or 0.0)
     dec = build_decision(cfg, price, holdings, signal)
-    rec = compute_recurrence(cfg, price, anchor, acted=dec.acted)
+    # acted=False on every row, including READY_BUY/READY_SELL. A decision is
+    # not an execution: the order may be suppressed, expire unsent, be rejected,
+    # or fill at another price entirely, and each of those would leave a booked
+    # ΔAₙ that never happened. The engine therefore commits the carried-forward
+    # ledger and lego_order_worker finalizes it against the broker's fill.
+    rec = compute_recurrence(cfg, price, anchor, acted=False)
     row = {
         "เวลา (UTC)": snapshot["captured_at"],
         "สินทรัพย์": cfg.symbol,
@@ -227,9 +320,15 @@ def compute_row(cfg: Config, snapshot: dict, anchor: Anchor | None,
         "step": step,
         "price": price,
         "p0_next": anchor.p0 if anchor else price,
+        # The decision's own verdict, unchanged: it is what decides whether an
+        # order intent is created. It no longer decides the cashflow columns.
         "acted": dec.acted,
+        # Carried forward, never advanced here. They seed the execution cashflow
+        # at genesis and are the values a PASS row keeps forever.
         "acted_price_next": rec.acted_price_next,
         "actual_next": rec.A,
+        # True while the row is waiting for a broker fill to finalize ΔAₙ/Aₙ/Eₙ.
+        "execution_pending": dec.acted,
         "status": dec.status,
         "side": dec.side,
         "quantity": dec.quantity,

@@ -558,7 +558,12 @@ def test_commit_stale_anchor_fail_closed(fake_db):
     assert len(fake_db["webull_lego_rows"]) == 1               # orphan ถูกลบแล้ว
 
 
-def test_commit_second_row_advances_pointer_act(fake_db):
+def test_commit_advances_the_decision_pointer_but_never_the_cashflow(fake_db):
+    """A committed READY_* moves DNA time and nothing else.
+
+    P_acted and Aₙ belong to lego_order_worker now, so the second commit leaves
+    them exactly where genesis put them until a fill is finalized.
+    """
     from lego_state import commit_final_row, read_anchor
     row0 = compute_row(CFG, SNAP, anchor=None)
     commit_final_row(CFG, SNAP, None, row0)
@@ -566,13 +571,43 @@ def test_commit_second_row_advances_pointer_act(fake_db):
 
     snap2 = {**SNAP, "captured_at": "2026-07-20T15:00:00Z", "price": 13.0}
     row2 = compute_row(CFG, snap2, anchor=a1)
+    assert row2["สถานะ"] == READY_SELL          # a decision, not an execution
     r = commit_final_row(CFG, snap2, a1, row2)
     assert r["version"] == 2
 
     a2 = read_anchor(CFG)
-    assert a2.dna_step == 1 and a2.p0 == 12.0 and a2.prev_price == 13.0
-    # act (bypass DNA ทุก slot = 1): ΔA = 1500×(13/12 − 1) สะสมเข้า A
+    assert a2.dna_step == 1 and a2.p0 == 12.0
+    assert a2.prev_price == 12.0                # P_acted แช่แข็งจนกว่าจะมี fill
+    assert a2.prev_actual == 0.0
+
+
+def test_finalized_fill_advances_the_cashflow_pointer(fake_db):
+    from lego_one_row import ExecutionFill
+    from lego_state import commit_final_row, finalize_execution_fill, read_anchor
+    row0 = compute_row(CFG, SNAP, anchor=None)
+    commit_final_row(CFG, SNAP, None, row0)
+    a1 = read_anchor(CFG)
+
+    snap2 = {**SNAP, "captured_at": "2026-07-20T15:00:00Z", "price": 13.0}
+    row2 = compute_row(CFG, snap2, anchor=a1)
+    r = commit_final_row(CFG, snap2, a1, row2)
+
+    out = finalize_execution_fill(
+        CFG, r["run_id"],
+        ExecutionFill(filled_price=13.0, filled_quantity=25.0, holdings_after=125.0))
+    assert out["applied"] is True
+    # ΔA = 1500×(13/12 − 1) เท่ากับสมการเดิม แต่คิดหลัง broker ยืนยัน fill
+    assert out["delta_actual"] == pytest.approx(1500.0 * (13.0 / 12.0 - 1.0))
+
+    a2 = read_anchor(CFG)
+    assert a2.dna_step == 1 and a2.p0 == 12.0     # decision pointer ไม่ถูกแตะ
+    assert a2.version == 2
+    assert a2.prev_price == 13.0                  # P_acted = ราคาที่ fill จริง
     assert a2.prev_actual == pytest.approx(1500.0 * (13.0 / 12.0 - 1.0))
+    assert a2.prev_holdings == pytest.approx(125.0)
+    doc = fake_db["webull_lego_rows"][r["run_id"]]
+    assert doc["cashflow_status"] == "FINALIZED"
+    assert doc["ΔAₙ ต่อสเต็ป (USD)"] == pytest.approx(out["delta_actual"])
 
 
 def test_commit_pass_row_freezes_acted_price(fake_db):
@@ -644,7 +679,9 @@ def test_retry_replay_idempotent_no_double_count(fake_db):
     retry = commit_final_row(CFG, snap, anchor, row)
     assert first["committed"] is True and retry.get("idempotent") is True
     state = fake_db["webull_lego_state"][chain_key(CFG)]
-    assert state["prev_actual"] == pytest.approx(150.0)    # 1500×0.1 ครั้งเดียว ไม่ซ้ำ
+    # ไม่มี fill -> cashflow ไม่ขยับ (ทั้งครั้งแรกและ replay), version ไม่เดินซ้ำ
+    assert state["prev_actual"] == 0.0
+    assert state["prev_price"] == pytest.approx(100.0)
     assert state["version"] == first["version"]
 
 
@@ -687,9 +724,11 @@ def test_semantics_migration_old_state_resets_baseline(fake_db):
 def test_read_anchor_prev_holdings_none_safe(monkeypatch):
     import lego_state
 
+    from lego_state import CASHFLOW_SEMANTICS
+
     state = {"version": 3, "dna_step": 2, "p0": 333.74,
              "prev_price": 326.51, "prev_actual": -43.56,
-             "cashflow_semantics": "gated_theoretical_v2"}
+             "cashflow_semantics": CASHFLOW_SEMANTICS}
 
     class _Ref:
         def get(self):
@@ -711,7 +750,7 @@ def test_row_doc_tagged_with_semantics(fake_db):
     _round(CFG, "2026-07-20T14:30:00Z", 100.0, 15.0)
     from lego_state import CASHFLOW_SEMANTICS
     doc = next(iter(fake_db["webull_lego_rows"].values()))
-    assert doc["semantics"] == CASHFLOW_SEMANTICS == "gated_theoretical_v2"
+    assert doc["semantics"] == CASHFLOW_SEMANTICS == "execution_confirmed_v1"
 
 
 # --- vanished-position predicate and gate-array fingerprint ------------------
