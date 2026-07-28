@@ -58,6 +58,7 @@ def _movable(doc, terminal: set[str], cutoff: datetime) -> bool:
     return (isinstance(doc, dict)
             and normalize_status(doc.get("status")) in terminal
             and not doc.get("needs_manual_check")
+            and not doc.get("audit_pending")
             and _finished_before(doc, cutoff))
 
 

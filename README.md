@@ -35,9 +35,18 @@ done
 
 ## 2. RTDB security rules (dashboard อ่านอย่างเดียว; เขียนผ่าน service account เท่านั้น)
 
+repo นี้ track policy ตัวจริงไว้ที่ `database.rules.json` และ `firebase.json`
+เพื่อไม่ให้ rules ในเอกสาร drift จาก deployment:
+
+```bash
+firebase deploy --only database --project="$PROJECT"
+```
+
 ```json
 {
   "rules": {
+    ".read": false,
+    ".write": false,
     "webull_lego_rows":  { ".read": true, ".write": false },
     "webull_lego_state": { ".read": true, ".write": false },
     "webull_lego_order_audit": { ".read": true, ".write": false },
@@ -51,6 +60,7 @@ done
 }
 ```
 > service account ของ Cloud Function (Admin SDK) ข้าม rules อยู่แล้ว จึงเขียนได้; client อื่นอ่านได้อย่างเดียว
+> root/unmatched paths deny โดย default; client write ถูกปิดทุก path
 
 ## 3. Deploy Cloud Functions (Gen2, HTTP) — ต้อง deploy ทั้ง 3 ตัว
 
@@ -84,12 +94,28 @@ gcloud functions deploy lego-archive-worker \
   --set-env-vars=$ENVS --set-secrets=$SECRETS --project=$PROJECT
 ```
 > UAT ก่อนเสมอ (`WEBULL_ENV=UAT`), `AUTO_SUBMIT=false` จน pipeline นิ่ง แล้วค่อยเปิด
+> `WEBULL_ENV` รับเฉพาะ `UAT`, `PROD`, `PRODUCTION` (ไม่สนตัวพิมพ์เล็ก/ใหญ่);
+> ค่าอื่นเป็น `CONFIG_ERROR` และจะไม่ไหลไป Production
 > **ไม่ deploy `lego-order-worker` = intent ทุกใบจะหมดอายุเป็น `EXPIRED_UNSENT`** เพราะ
 > `LEGO_INLINE_ORDER_WORKER` default `false` (ตั้งใจ: broker latency ห้ามถ่วงเวลา DNA)
 > `lego-archive-worker` เป็นงานบ้าน (วันละครั้งพอ) ไม่ deploy ก็เทรดได้ แต่ path
 > `webull_lego_order_outbox` / `webull_lego_order_audit` จะโตไม่หยุดและทุก tick ต้องโหลดทั้งก้อน
 
 ตาราง env ครบทุกตัวอยู่ใน [QUICKSTART_TH.md](QUICKSTART_TH.md) หัวข้อ 6
+
+### อัปเกรด chain เดิม: runtime identity guard
+
+state ใหม่เก็บเฉพาะ SHA-256 fingerprint ของ `WEBULL_ACCOUNT_ID` + environment
+(ไม่เก็บ account ID จริง) เพื่อห้ามนำ anchor/outbox เดิมไปใช้ข้ามบัญชีหรือ UAT/Production
+
+- chain ใหม่: ไม่ต้องทำอะไร
+- chain เดิมที่ยังไม่มี fingerprint: **adopt อัตโนมัติ** — commit แรกหลัง deploy จะผูก chain
+  กับ account/environment ปัจจุบัน แล้วนับที่ `webull_lego_warnings/runtime_identity_adopted`
+  (ไม่ต้องตั้ง env อะไร ไม่ต้อง deploy สองรอบ และ DNA ไม่หยุดสักรอบ)
+  → **หน้าที่ operator: หลัง deploy ให้เปิด warning นั้นดูหนึ่งครั้ง** ว่า `WEBULL_ACCOUNT_ID`
+  กับ `WEBULL_ENV` เป็นชุดที่ตั้งใจจริง
+- fingerprint ไม่ตรง: fail closed เป็น `CONFIG_ERROR` — ไม่มีสวิตช์ให้ข้าม ถ้าตั้งใจย้ายบัญชี
+  ต้องเริ่ม chain ใหม่
 
 ## 4. Cloud Scheduler (ทุก 30 นาที ในกรอบตลาดสหรัฐฯ; โค้ด guard วันหยุดเอง)
 
@@ -156,7 +182,7 @@ gcloud scheduler jobs run lego-tick --location=$REGION --project=$PROJECT
 | `HOLDINGS_ANOMALY` | 409 | chain เคยเห็นของ แต่ snapshot อ่านได้ 0 — ไม่ commit ไม่ยิง order |
 | `DNA_DRIFT` | 409 | `dna_code` เดิมแต่ decode ได้ gate array คนละชุด (มักคือ numpy เปลี่ยนเวอร์ชัน) |
 | `DNA_EXHAUSTED` | 200 | DNA เดินจนหมด array (`bypass:100` ที่ slot 30m ≈ 8 วันทำการ) — เป็นจุดจบที่คาดไว้ ไม่ใช่ระบบพัง ต้องต่อ DNA ใหม่หรือหยุด scheduler |
-| `CONFIG_ERROR` | 500 | `LEGO_SLOT_SECONDS` ไม่ตั้ง/ไม่รองรับ |
+| `CONFIG_ERROR` | 500 | config ไม่ปลอดภัย/ไม่รองรับ เช่น slot, `WEBULL_ENV`, account หรือ runtime identity |
 | `SNAPSHOT_OR_ENGINE_ERROR` | 500/503 | 503 เมื่อเป็น transient |
 
 field เตือนที่จะโผล่ใน response ของแถวที่ commit สำเร็จ (ไม่มี = ไม่มีอะไรต้องดู):
@@ -165,7 +191,7 @@ field เตือนที่จะโผล่ใน response ของแถ�
 |---|---|
 | `outbox_skipped` | แถวนี้เป็น `READY_*` และ `AUTO_SUBMIT=true` แต่ **ไม่มี order intent ถูกสร้าง** เพราะ clock degraded (ไม่มี slot จึงคำนวณ `expires_at` ไม่ได้) — นับสะสมที่ `webull_lego_warnings/degraded_clock_no_order` |
 | `outbox_blocked` | แถวนี้เป็น `READY_*` และ `AUTO_SUBMIT=true` แต่ **preflight ไม่ผ่าน** จึงไม่สร้าง intent — `outbox_blocked_checks` บอกว่าติดข้อไหน นับสะสมที่ `webull_lego_warnings/auto_submit_blocked` |
-| `outbox_error` | สร้าง intent ไม่สำเร็จ (แถว commit แล้ว ไม่ rollback) |
+| `outbox_error` | materialize intent ไม่สำเร็จ (แถว commit แล้ว ไม่ rollback; state เก็บ recovery marker และ worker จะลองซ้ำ) |
 | `clock_warning` | market clock resolve ไม่ได้ จึงเดินด้วย legacy step |
 | `dna_steps_remaining` | DNA เหลือน้อยกว่า `LEGO_DNA_LOW_WATERMARK` (default 10) แล้ว |
 
@@ -196,3 +222,10 @@ field เตือนที่จะโผล่ใน response ของแถ�
     `REALIZED_MATH_ERROR` + `needs_manual_check` (คนละเรื่องกับ "ไม่รู้ว่า order มีจริงไหม")
 15. `webull-openapi-python-sdk` ต้อง pin exact version — SDK คุม signing/auth/order payload
     โดยตรง การอัปเดตต้องผ่าน UAT ก่อนเสมอ (เหตุผลเดียวกับ numpy)
+17. worker ต้อง claim intent ด้วย RTDB transaction ก่อนทำงาน และผ่าน generation fence
+    ก่อน `place_order`; lease หมดอายุไม่ทำให้ worker เก่าวิ่งข้าม fence
+18. open-order pagination ต้องพิสูจน์ว่าครบทุกหน้า; cursor หาย/ไม่เดิน/ชนเพดาน =
+    คง `PENDING_DISPATCH` และไม่ส่ง order
+19. fill ที่ยืนยันแล้วแต่ไม่มี quantity/price ต้องจบ `REALIZED_MATH_ERROR` +
+    `needs_manual_check`; ห้ามปิดเป็น `FILLED` แบบ ledger ไม่ครบ
+20. audit ที่เขียนไม่สำเร็จต้องมี `audit_pending` ใน private outbox และถูกซ่อมก่อน archive

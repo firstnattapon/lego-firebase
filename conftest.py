@@ -1,9 +1,12 @@
 from __future__ import annotations
 
 import copy
+import os
 import sys
 import types
 import uuid
+
+import pytest
 
 
 class FakeReference:
@@ -74,6 +77,13 @@ class FakeDB:
 
 
 FAKE_DB = FakeDB()
+
+
+@pytest.fixture(autouse=True)
+def _runtime_identity_test_default(monkeypatch):
+    """HTTP pipeline tests use an opaque, non-production account identity."""
+    if not os.environ.get("WEBULL_ACCOUNT_ID"):
+        monkeypatch.setenv("WEBULL_ACCOUNT_ID", "codex-test-account")
 
 firebase_admin = types.ModuleType('firebase_admin')
 firebase_admin._apps = []

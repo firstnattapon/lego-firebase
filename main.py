@@ -9,6 +9,7 @@ from __future__ import annotations
 import os
 import time
 import traceback
+import uuid
 from datetime import datetime, timedelta, timezone
 
 import firebase_admin
@@ -22,20 +23,29 @@ from lego_one_row import (READY_BUY, READY_SELL, DNAExhausted, HoldingsAnomaly,
 from lego_orders import (TERMINAL_STATUSES, UAT, evaluate_submit_gate,
                          normalize_status, order_confirmation_phrase,
                          summarize_order_result)
-from lego_outbox import (expire_unsent_before, list_actionable, put_intent,
-                         read_committed_row, update_intent)
+from lego_outbox import (begin_place_attempt, claim_intent,
+                         expire_unsent_before, list_actionable,
+                         list_audit_pending, put_intent, read_committed_row,
+                         release_intent_claim, update_intent)
 from lego_preflight import DEFAULT_MIN_DNA_REMAINING, auto_submit_preflight
 from lego_state import (CalendarDriftError, DNADriftError, OrdinalRegression,
-                        SlotAlreadyConsumed, StaleAnchorError, apply_realized_fill,
-                        chain_key, commit_final_row, read_anchor,
-                        update_order_audit, write_order_audit)
+                         RuntimeIdentityError, SlotAlreadyConsumed,
+                         StaleAnchorError, apply_realized_fill, chain_key,
+                         chain_runtime_identity_is_verified, commit_final_row,
+                         mark_order_intent_materialized, pending_order_intents,
+                         read_anchor, read_chain_state, UNREAD_STATE,
+                         update_order_audit, verify_runtime_identity,
+                         write_order_audit)
 from market_clock import (MarketClockError, clock_mode, fallback_slot_id,
                           is_regular_session, resolve_dna_step, resolve_market_slot,
                           slot_seconds)
-from webull_io import (build_clients, build_order_payload, environment_label,
-                       fetch_open_orders, fetch_order_detail, fetch_snapshot,
-                       is_transient_exception, load_config, market_category,
-                       place_market_order, preview_market_order, token_health)
+from webull_io import (IncompleteOpenOrdersError, build_clients,
+                        build_order_payload, environment_label,
+                        fetch_open_orders, fetch_order_detail, fetch_snapshot,
+                        is_transient_exception, load_config, market_category,
+                        place_market_order, preview_market_order,
+                        redact_sensitive_text, runtime_identity_fingerprint,
+                        token_health)
 
 ORDER_POLL_ATTEMPTS = 3
 ORDER_POLL_DELAY_S = 2.0
@@ -63,6 +73,11 @@ def _init_firebase():
 
 def _iso(dt: datetime) -> str:
     return dt.astimezone(UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def _error_text(exc: Exception, *, with_type: bool = True) -> str:
+    text = redact_sensitive_text(exc)
+    return f"{type(exc).__name__}: {text}" if with_type else text
 
 
 def _poll_order_status(trade_client, client_order_id: str, place_res: dict) -> dict:
@@ -110,9 +125,8 @@ def _apply_realized_if_available(intent: dict, summary: dict) -> dict:
     qty = summary.get("filled_quantity")
     price = summary.get("filled_price")
     if qty is None or price is None:
-        out = dict(summary)
-        out["realized_warning"] = "fill confirmed but quantity/price unavailable"
-        return out
+        raise RealizedMathError(
+            "fill confirmed but quantity/price unavailable — needs manual check")
     try:
         realized = apply_realized_fill(
             intent["chain_key"], intent["run_id"], intent["side"],
@@ -130,10 +144,96 @@ def _apply_realized_if_available(intent: dict, summary: dict) -> dict:
 
 
 def _persist(chain_key_: str, run_id: str, fields: dict) -> dict:
-    """Outbox and audit always move together; never write only one of them."""
-    update_intent(chain_key_, run_id, fields)
-    update_order_audit(run_id, fields)
+    """Keep the outbox authoritative and make an interrupted audit repairable."""
+    update_intent(chain_key_, run_id, {**fields, "audit_pending": True})
+    _mirror_order_audit(chain_key_, run_id, fields)
     return {"run_id": run_id, **fields}
+
+
+def _mirror_order_audit(chain_key_: str, run_id: str, fields: dict) -> None:
+    """Best-effort audit mirror; the outbox marker makes failure recoverable."""
+    try:
+        update_order_audit(run_id, fields)
+    except Exception as exc:
+        _record_warning(
+            "order_audit_repair",
+            "outbox อัปเดตแล้วแต่ audit ยังไม่สำเร็จ — worker จะซ่อมซ้ำ",
+            {"run_id": run_id, "error_type": type(exc).__name__},
+        )
+    else:
+        # If this clear fails the marker safely remains and the repair pass writes
+        # the same audit payload again.
+        try:
+            update_intent(chain_key_, run_id, {"audit_pending": False})
+        except Exception as exc:
+            _record_warning(
+                "order_audit_repair",
+                "audit เขียนแล้วแต่ล้าง repair marker ไม่สำเร็จ — "
+                "รอบถัดไปเขียนซ้ำได้อย่างปลอดภัย",
+                {"run_id": run_id, "error_type": type(exc).__name__},
+            )
+
+
+_AUDIT_INTERNAL_FIELDS = {
+    "audit_pending", "claim_owner", "claim_until", "claim_generation",
+    "place_fence",
+}
+
+
+def _repair_pending_audits(chain_key_: str) -> int:
+    repaired = 0
+    for intent in list_audit_pending(chain_key_):
+        run_id = str(intent["run_id"])
+        fields = {
+            key: value for key, value in intent.items()
+            if key not in _AUDIT_INTERNAL_FIELDS
+        }
+        try:
+            update_order_audit(run_id, fields)
+            update_intent(chain_key_, run_id, {"audit_pending": False})
+            repaired += 1
+        except Exception as exc:
+            _record_warning(
+                "order_audit_repair",
+                "audit repair ยังไม่สำเร็จ — เก็บ marker ไว้ลองรอบถัดไป",
+                {"run_id": run_id, "error_type": type(exc).__name__},
+            )
+    return repaired
+
+
+def _announce_identity_adoption(adopted: bool, runtime_identity: str) -> None:
+    """Say once that a pre-guard chain was bound to this account/environment."""
+    if not adopted:
+        return
+    _record_warning(
+        "runtime_identity_adopted",
+        "chain เดิมไม่มี runtime identity — ผูกกับ account/environment ปัจจุบัน "
+        "อัตโนมัติ ตรวจว่า WEBULL_ACCOUNT_ID และ WEBULL_ENV ถูกต้อง",
+        {"identity_prefix": runtime_identity[:8]},
+    )
+
+
+def _recover_pending_order_intents(cfg, runtime_identity: str,
+                                   state=UNREAD_STATE) -> int:
+    """Materialize state-transaction markers into the idempotent private outbox."""
+    recovered = 0
+    for run_id, payload in pending_order_intents(
+            cfg, runtime_identity=runtime_identity, state=state).items():
+        try:
+            put_intent(chain_key(cfg), run_id, payload)
+            mark_order_intent_materialized(
+                cfg, run_id, runtime_identity=runtime_identity)
+            recovered += 1
+        except RuntimeIdentityError:
+            raise
+        except Exception as exc:
+            _record_warning(
+                "outbox_recovery",
+                "committed row ยัง materialize เข้า outbox ไม่สำเร็จ — "
+                "marker ยังอยู่และจะลองใหม่",
+                {"run_id": run_id, "error_type": type(exc).__name__},
+            )
+    return recovered
 
 
 def _persist_summary(intent: dict, summary: dict) -> None:
@@ -143,7 +243,7 @@ def _persist_summary(intent: dict, summary: dict) -> None:
 
 def _persist_error(chain_key_: str, run_id: str, status: str, exc: Exception,
                    extra: dict | None = None) -> dict:
-    err = f"{type(exc).__name__}: {exc}"
+    err = _error_text(exc)
     _persist(chain_key_, run_id,
              {"status": status, "last_error": err[:500], **(extra or {})})
     return {"run_id": run_id, "status": status, "error": err}
@@ -188,7 +288,7 @@ def _persist_reconcile_failure(intent: dict, exc: Exception) -> dict:
     # generic one. Keep the first failure, which is the one that explains why.
     extra = {"reconcile_attempts": attempts}
     if not intent.get("first_error"):
-        extra["first_error"] = f"{type(exc).__name__}: {exc}"[:500]
+        extra["first_error"] = _error_text(exc)[:500]
     if attempts < _reconcile_max_attempts():
         return _persist_error(ck, run_id, "PLACING_UNKNOWN", exc, extra)
     return _persist_error(ck, run_id, "RECONCILE_ABANDONED", exc, {
@@ -213,7 +313,7 @@ def _persist_realized_math_error(intent: dict, summary: dict, exc: Exception) ->
         "needs_manual_check": True,
         "realized": False,
         "broker_status": normalize_status(summary.get("status")),
-        "last_error": f"{type(exc).__name__}: {exc}"[:500],
+        "last_error": _error_text(exc)[:500],
         "terminal_reason": ("broker ยืนยัน fill แล้ว แต่คำนวณ realized ไม่ได้ — "
                             "ห้ามส่ง order ซ้ำ ต้องกระทบยอด realized ledger เอง"),
     }
@@ -300,7 +400,13 @@ def _dispatch_or_reconcile_one(trade_client, data_client, cfg, intent: dict) -> 
     if datetime.now(UTC) >= expiry:
         return _stop(ck, run_id, "EXPIRED_UNSENT")
 
-    open_orders = fetch_open_orders(trade_client, cfg.symbol)
+    try:
+        open_orders = fetch_open_orders(trade_client, cfg.symbol)
+    except IncompleteOpenOrdersError as exc:
+        return _persist_error(
+            ck, run_id, "PENDING_DISPATCH", exc,
+            {"pagination_complete": False},
+        )
     if open_orders:
         return _stop(ck, run_id, "SUPPRESSED_ACTIVE_ORDER",
                      {"terminal_reason": f"{len(open_orders)} active broker order(s)"})
@@ -318,6 +424,10 @@ def _dispatch_or_reconcile_one(trade_client, data_client, cfg, intent: dict) -> 
     if env != UAT:
         return _stop(ck, run_id, "NOT_PLACED", {"terminal_reason": f"environment={env}"})
 
+    # Audit-only on purpose: the outbox already holds every one of these fields
+    # from put_intent, and begin_place_attempt below is the authoritative outbox
+    # write for this step. Mirroring them here too would spend three extra RTDB
+    # transactions on the hot money path to restate what is already there.
     write_order_audit(run_id, {
         "run_id": run_id, "chain_key": ck, "side": intent["side"],
         "quantity": float(intent["quantity"]), "symbol": cfg.symbol,
@@ -339,7 +449,15 @@ def _dispatch_or_reconcile_one(trade_client, data_client, cfg, intent: dict) -> 
     except Exception as exc:
         return _persist_error(ck, run_id, "NOT_PLACED", exc)
 
-    _persist(ck, run_id, {"status": "PLACING_UNKNOWN", "place_attempted": True})
+    place_fields = {"status": "PLACING_UNKNOWN", "place_attempted": True}
+    started = begin_place_attempt(
+        ck, run_id, str(intent.get("claim_owner") or ""),
+        int(intent.get("claim_generation", 0) or 0))
+    if started is None:
+        # The lease expired and another generation won before this worker reached
+        # the irreversible call.  Do not place; that winner owns reconciliation.
+        return {"run_id": run_id, "status": normalize_status(intent.get("status"))}
+    _mirror_order_audit(ck, run_id, place_fields)
     try:
         place_res = place_market_order(trade_client, order)
         summary = _poll_order_status(trade_client, run_id, place_res)
@@ -369,13 +487,41 @@ def _outbox_intent(cfg, row: dict, snapshot: dict, slot, decision_time: datetime
     }
 
 
-def _run_order_worker(cfg, limit: int = 3) -> dict:
-    trade_client, data_client = build_clients()
+def _run_order_worker(cfg, limit: int = 3,
+                      runtime_identity: str | None = None) -> dict:
+    runtime_identity = runtime_identity or runtime_identity_fingerprint()
     ck = chain_key(cfg)
+    # Both guards below read the same document, so read it once and hand it down.
+    state = read_chain_state(cfg)
+    state_verified = chain_runtime_identity_is_verified(
+        cfg, runtime_identity, state=state)
+    _announce_identity_adoption(
+        verify_runtime_identity(state, runtime_identity), runtime_identity)
+    _recover_pending_order_intents(cfg, runtime_identity, state=state)
+    _repair_pending_audits(ck)
+    trade_client, data_client = build_clients()
     expire_unsent_before(ck, datetime.now(UTC))
     results = []
-    for intent in list_actionable(ck, limit=limit):
-        results.append(_dispatch_or_reconcile_one(trade_client, data_client, cfg, intent))
+    worker_id = uuid.uuid4().hex
+    candidates = list_actionable(ck, limit=limit)
+    if candidates and not state_verified:
+        raise RuntimeIdentityError(
+            "พบ outbox แต่ไม่พบ chain state สำหรับยืนยัน account/environment")
+    for intent in candidates:
+        claimed = claim_intent(ck, intent["run_id"], worker_id)
+        if claimed is None:
+            continue
+        try:
+            intent_identity = claimed.get("runtime_identity_fingerprint")
+            if (intent_identity is not None
+                    and str(intent_identity) != runtime_identity):
+                raise RuntimeIdentityError(
+                    "outbox runtime identity ไม่ตรงกับ worker "
+                    "(account/environment คนละชุด)")
+            results.append(
+                _dispatch_or_reconcile_one(trade_client, data_client, cfg, claimed))
+        finally:
+            release_intent_claim(ck, intent["run_id"], worker_id)
     return {"processed": len(results), "results": results}
 
 
@@ -383,7 +529,6 @@ def _run_order_worker(cfg, limit: int = 3) -> dict:
 def lego_one_row(request):
     """Commit the current model slot first. Order failures never block DNA time."""
     _init_firebase()
-    cfg = load_config()
     decision_time = datetime.now(UTC)
 
     try:
@@ -393,12 +538,28 @@ def lego_one_row(request):
         # resolved up front instead of surfacing later as an engine failure —
         # the market category included, since a typo there reaches the broker as
         # a query parameter and comes back as an unhelpful snapshot error.
+        cfg = load_config()
         slot_seconds()
         mode = clock_mode()
         market_category()
-    except (MarketClockError, ValueError) as exc:
+        env = environment_label()
+        runtime_identity = runtime_identity_fingerprint()
+    except (KeyError, MarketClockError, ValueError) as exc:
         return {"status": "CONFIG_ERROR", "committed": False,
-                "pipeline_status": "CONFIG_ERROR", "error": str(exc)}, 500
+                "pipeline_status": "CONFIG_ERROR",
+                "error": _error_text(exc, with_type=False)}, 500
+
+    try:
+        # Recovery and the anchor read both need this chain's state, so it is
+        # fetched once here and passed to both instead of once each.
+        state = read_chain_state(cfg)
+        _announce_identity_adoption(
+            verify_runtime_identity(state, runtime_identity), runtime_identity)
+        _recover_pending_order_intents(cfg, runtime_identity, state=state)
+    except RuntimeIdentityError as exc:
+        return {"status": "CONFIG_ERROR", "committed": False,
+                "pipeline_status": "CONFIG_ERROR",
+                "error": _error_text(exc, with_type=False)}, 500
 
     # One calendar for every path: the same session rules the ordinal uses, so a
     # holiday or early close also blocks a degraded (clock-less) commit.
@@ -407,7 +568,7 @@ def lego_one_row(request):
                 "pipeline_status": "MARKET_CLOSED"}, 200
 
     try:
-        anchor = read_anchor(cfg)
+        anchor = read_anchor(cfg, runtime_identity=runtime_identity, state=state)
         legacy_step = dna_step_for(anchor)
         slot = None
         clock_error = None
@@ -451,16 +612,7 @@ def lego_one_row(request):
             mode = f"{mode}:degraded"
         row = compute_row(cfg, snapshot, anchor, dna_step=effective_step)
 
-        # Invariant #10: commit the slot first, then touch the outbox. A rejected
-        # commit must not leave an intent behind, and the committed run_id is the
-        # only client_order_id the worker may use.
-        result = commit_final_row(
-            cfg, snapshot, anchor, row, slot_id=slot_id, clock_mode=mode,
-            market_ordinal=None if slot is None else slot.market_ordinal)
-
-        env = environment_label()
         auto = os.environ.get("AUTO_SUBMIT", "false").lower() == "true"
-        row_durable = bool(result["committed"] or result.get("idempotent"))
         # Warn while extending the DNA is still possible; also one of the
         # preflight inputs, so it is resolved once and read twice.
         remaining = dna_steps_remaining(cfg.dna_code, row["DNA step"])
@@ -468,30 +620,46 @@ def lego_one_row(request):
         outbox_skipped = None
         outbox_blocked = None
         preflight = None
+        pending_intent = None
 
-        # Validation first and separately: AUTO_SUBMIT used to be the whole gate,
-        # so every condition the deploy checklist asked for — a durable token, a
-        # non-degraded clock, a step that is really the market ordinal, DNA left
-        # to spend — was a silent fail-open. auto_submit_preflight answers all of
-        # them without writing anything, and only an `ok` report reaches
-        # put_intent below.
+        # Evaluate a candidate before the state transaction so the exact payload
+        # can be stored in that same transaction.  row_durable=True here means
+        # "activate only if commit succeeds"; no broker/outbox write happens yet.
         if auto and row["สถานะ"] in (READY_BUY, READY_SELL):
             preflight = auto_submit_preflight(
-                auto_submit=auto, environment=env, row=row, row_durable=row_durable,
+                auto_submit=auto, environment=env, row=row, row_durable=True,
                 slot=slot, token=health, dna_remaining=remaining,
                 min_dna_remaining=_min_dna_remaining())
+            if preflight["ok"]:
+                pending_intent = _outbox_intent(
+                    cfg, row, snapshot, slot, decision_time)
+                pending_intent["runtime_identity_fingerprint"] = runtime_identity
+
+        # A rejected commit leaves no outbox candidate.  A successful state
+        # transaction carries a deterministic recovery marker, closing the crash
+        # window between advancing DNA and materializing the private outbox.
+        result = commit_final_row(
+            cfg, snapshot, anchor, row, slot_id=slot_id, clock_mode=mode,
+            market_ordinal=None if slot is None else slot.market_ordinal,
+            runtime_identity=runtime_identity,
+            pending_intent=pending_intent)
 
         if preflight is None:
             pass                                    # nothing to submit this slot
         elif preflight["ok"]:
-            # The slot is already durable at this point, so a failed intent may
-            # only cost this row its order — reporting it as a DNA failure would
-            # be a lie and would invite a retry that finds the slot consumed.
             try:
-                put_intent(chain_key(cfg), result["run_id"],
-                           _outbox_intent(cfg, row, snapshot, slot, decision_time))
+                put_intent(chain_key(cfg), result["run_id"], pending_intent)
+                mark_order_intent_materialized(
+                    cfg, result["run_id"], runtime_identity=runtime_identity)
             except Exception as exc:
-                outbox_error = f"{type(exc).__name__}: {exc}"
+                outbox_error = _error_text(exc)
+                _record_warning(
+                    "outbox_recovery",
+                    "committed row ยัง materialize เข้า outbox ไม่สำเร็จ — "
+                    "marker ยังอยู่และจะลองใหม่",
+                    {"run_id": result["run_id"],
+                     "error_type": type(exc).__name__},
+                )
         else:
             # Blocked, and said out loud on both channels. Deciding this silently
             # was the worst of both worlds: the row still read READY_BUY with
@@ -543,9 +711,14 @@ def lego_one_row(request):
             try:
                 out["order_worker"] = _run_order_worker(cfg, limit=1)
             except Exception as exc:
-                out["order_worker"] = {"processed": 0, "error": f"{type(exc).__name__}: {exc}"}
+                out["order_worker"] = {
+                    "processed": 0, "error": _error_text(exc)}
         return out, 200
 
+    except RuntimeIdentityError as exc:
+        return {"status": "CONFIG_ERROR", "committed": False,
+                "pipeline_status": "CONFIG_ERROR",
+                "error": _error_text(exc, with_type=False)}, 500
     except SlotAlreadyConsumed as exc:
         return {"status": "PASS_SLOT_CONSUMED", "committed": False,
                 "pipeline_status": "SLOT_CONSUMED", "note": str(exc)}, 200
@@ -578,28 +751,47 @@ def lego_one_row(request):
     except Exception as exc:
         try:
             db.reference(ERRORS_PATH).push({
-                "error": str(exc), "type": type(exc).__name__,
-                "trace": traceback.format_exc()[:2000],
+                "error": _error_text(exc, with_type=False),
+                "type": type(exc).__name__,
+                "trace": redact_sensitive_text(traceback.format_exc())[:2000],
             })
         except Exception:
             pass
         code = 503 if is_transient_exception(exc) else 500
         return {"status": "ERROR", "committed": False,
                 "pipeline_status": "SNAPSHOT_OR_ENGINE_ERROR",
-                "error": str(exc), "type": type(exc).__name__}, code
+                "error": _error_text(exc, with_type=False),
+                "type": type(exc).__name__}, code
 
 
 @functions_framework.http
 def lego_order_worker(request):
     """Independent worker; schedule separately when inline mode is disabled."""
     _init_firebase()
-    cfg = load_config()
     try:
+        cfg = load_config()
+        environment_label()
+        runtime_identity = runtime_identity_fingerprint()
         limit = int(os.environ.get("LEGO_ORDER_WORKER_LIMIT", "3"))
-        return {"pipeline_status": "ORDER_WORKER_OK", **_run_order_worker(cfg, limit)}, 200
+    except (KeyError, ValueError) as exc:
+        return {
+            "pipeline_status": "CONFIG_ERROR",
+            "error": _error_text(exc, with_type=False),
+        }, 500
+    try:
+        return {
+            "pipeline_status": "ORDER_WORKER_OK",
+            **_run_order_worker(
+                cfg, limit, runtime_identity=runtime_identity),
+        }, 200
+    except RuntimeIdentityError as exc:
+        return {
+            "pipeline_status": "CONFIG_ERROR",
+            "error": _error_text(exc, with_type=False),
+        }, 500
     except Exception as exc:
         return {"pipeline_status": "ORDER_WORKER_ERROR",
-                "error": f"{type(exc).__name__}: {exc}"}, 503
+                "error": _error_text(exc)}, 503
 
 
 @functions_framework.http
@@ -611,4 +803,4 @@ def lego_archive_worker(request):
                 **archive_terminal_records(datetime.now(UTC))}, 200
     except Exception as exc:
         return {"pipeline_status": "ARCHIVE_ERROR",
-                "error": f"{type(exc).__name__}: {exc}"}, 503
+                "error": _error_text(exc)}, 503

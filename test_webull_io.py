@@ -29,6 +29,57 @@ def account(monkeypatch):
     monkeypatch.setenv("WEBULL_ENV", "UAT")
 
 
+@pytest.mark.parametrize(("raw", "expected"), [
+    ("UAT", webull_io.UAT),
+    ("uat", webull_io.UAT),
+    ("PROD", webull_io.PROD),
+    ("prod", webull_io.PROD),
+    ("PRODUCTION", webull_io.PROD),
+    (" PrOdUcTiOn ", webull_io.PROD),
+])
+def test_environment_label_accepts_only_supported_values(monkeypatch, raw, expected):
+    monkeypatch.setenv("WEBULL_ENV", raw)
+    assert webull_io.environment_label() == expected
+
+
+def test_missing_environment_defaults_safely_to_uat(monkeypatch):
+    monkeypatch.delenv("WEBULL_ENV", raising=False)
+    assert webull_io.environment_label() == webull_io.UAT
+
+
+@pytest.mark.parametrize("raw", ["", "DEV", "STAGING", "PRODUCTION-US"])
+def test_invalid_environment_never_falls_through_to_production(monkeypatch, raw):
+    monkeypatch.setenv("WEBULL_ENV", raw)
+    with pytest.raises(webull_io.WebullConfigError, match="WEBULL_ENV"):
+        webull_io._endpoint()
+
+
+@pytest.mark.parametrize(("path", "expected"), [
+    ("/tmp", True),
+    ("/tmp/", True),
+    ("/tmp/webull_token", True),
+    ("/tmp2/webull_token", False),
+    ("/tmp/../var/lib/webull", False),
+])
+def test_posix_tmp_detection_is_host_independent(monkeypatch, path, expected):
+    native_root = webull_io.os.path.abspath(
+        webull_io.os.path.join(webull_io.os.path.sep, "__native_tmp__"))
+    monkeypatch.setattr(webull_io.tempfile, "gettempdir", lambda: native_root)
+    monkeypatch.setenv("WEBULL_TOKEN_DIR", path)
+    assert webull_io.token_dir_is_ephemeral() is expected
+
+
+def test_native_temp_directory_and_not_its_prefix_are_ephemeral(monkeypatch):
+    native_root = webull_io.os.path.abspath(
+        webull_io.os.path.join(webull_io.os.path.sep, "__native_tmp__"))
+    monkeypatch.setattr(webull_io.tempfile, "gettempdir", lambda: native_root)
+    monkeypatch.setenv(
+        "WEBULL_TOKEN_DIR", webull_io.os.path.join(native_root, "webull_token"))
+    assert webull_io.token_dir_is_ephemeral() is True
+    monkeypatch.setenv("WEBULL_TOKEN_DIR", native_root + "-durable")
+    assert webull_io.token_dir_is_ephemeral() is False
+
+
 # ---- _extract_price: the price must belong to the symbol we asked for -------
 
 def test_price_of_another_symbol_is_refused():
@@ -134,11 +185,12 @@ def test_open_orders_follow_the_broker_paging(monkeypatch):
     assert client.order_v3.get_order_open.calls[1][1]["last_client_order_id"] == "b"
 
 
-def test_open_order_paging_stops_without_a_usable_cursor(monkeypatch):
-    """A full page whose entries carry no id must end the walk, not repeat it."""
+def test_open_order_paging_fails_closed_without_a_usable_cursor(monkeypatch):
+    """A full page without a cursor cannot prove that no later order exists."""
     monkeypatch.setenv("LEGO_OPEN_ORDER_PAGE_SIZE", "2")
     client = fake_trade_client(open_orders={"orders": [{"symbol": "TSLA"}, {"symbol": "TSLA"}]})
-    assert fetch_open_orders(client, "FFWM") == []
+    with pytest.raises(webull_io.IncompleteOpenOrdersError, match="cursor"):
+        fetch_open_orders(client, "FFWM")
     assert len(client.order_v3.get_order_open.calls) == 1
 
 
@@ -156,7 +208,7 @@ def test_open_order_paging_reads_the_cursor_out_of_a_group_order(monkeypatch):
     assert client.order_v3.get_order_open.calls[1][1]["last_client_order_id"] == "b2"
 
 
-def test_open_order_paging_is_bounded(monkeypatch):
+def test_open_order_paging_bound_blocks_instead_of_returning_partial_data(monkeypatch):
     monkeypatch.setenv("LEGO_OPEN_ORDER_PAGE_SIZE", "1")
     monkeypatch.setenv("LEGO_OPEN_ORDER_MAX_PAGES", "3")
     seq = {"n": 0}
@@ -166,7 +218,8 @@ def test_open_order_paging_is_bounded(monkeypatch):
         return {"orders": [{"symbol": "TSLA", "client_order_id": f"id-{seq['n']}"}]}
 
     client = fake_trade_client(open_orders=page)
-    assert fetch_open_orders(client, "FFWM") == []
+    with pytest.raises(webull_io.IncompleteOpenOrdersError, match="fail-closed"):
+        fetch_open_orders(client, "FFWM")
     assert len(client.order_v3.get_order_open.calls) == 3
 
 
@@ -580,8 +633,11 @@ def test_broker_sdk_stays_pinned():
     lines = [line.strip() for line in
              open("requirements.txt", encoding="utf-8").read().splitlines()
              if line.strip() and not line.startswith("#")]
-    sdk = [line for line in lines if line.startswith("webull-openapi-python-sdk")]
-    assert sdk and "==" in sdk[0], "webull-openapi-python-sdk ต้อง pin เป็น exact version"
+    sdk = [line for line in lines if "webull_openapi_python_sdk-2.0.15-1lego" in line]
+    assert sdk == [
+        "./vendor/webull_openapi_python_sdk-2.0.15-1lego-py3-none-any.whl"
+    ], "the reviewed, locally vendored Webull 2.0.15 wheel must stay exact"
+    assert "cryptography==48.0.1" in lines
 
 
 # ---- the /tmp deadlock: durability warning vs. "can it sign a request now" ---
