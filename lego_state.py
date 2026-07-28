@@ -4,13 +4,16 @@ from __future__ import annotations
 import hashlib
 import hmac
 import json
+import math
 import uuid
 from datetime import datetime, timezone
 
 from firebase_admin import db
 
 from dna_engine import dna_fingerprint
-from lego_one_row import Anchor, Config, validate_row_columns
+from lego_one_row import (ACTUAL_COLUMN, DELTA_COLUMN, EXCESS_COLUMN,
+                          REFERENCE_COLUMN, Anchor, Config, ExecutionFill,
+                          finalize_recurrence, validate_row_columns)
 from lego_orders import apply_fill, normalize_status
 from market_clock import calendar_fingerprint, market_ordinal_for_slot_id
 from webull_io import redact_sensitive_text
@@ -19,7 +22,26 @@ ROWS_PATH = "webull_lego_rows"
 STATE_PATH = "webull_lego_state"
 AUDIT_PATH = "webull_lego_order_audit"
 REALIZED_PATH = "webull_lego_realized"
-CASHFLOW_SEMANTICS = "gated_theoretical_v2"
+# Bumped from gated_theoretical_v2: under that name a READY_* decision advanced
+# Aₙ by itself, so an Aₙ written then and an Aₙ written now do not mean the same
+# thing and must not be chained. read_anchor restarts the cashflow baseline of a
+# chain carrying the old name, exactly as it does for any other semantics change.
+CASHFLOW_SEMANTICS = "execution_confirmed_v1"
+
+# Execution cashflow state, owned by lego_order_worker and nested under its own
+# key so the decision pointer (version, dna_step, p0, slot_id, market_ordinal)
+# and the money that has actually moved are never written by the same author.
+EXECUTION_STATE_KEY = "execution_cashflow"
+# How many finalized run_ids to remember. Only re-finalization of the *same*
+# run_id has to be refused, and an intent leaves the actionable queue the moment
+# it finalizes, so the window only has to outlive one intent — this outlives
+# weeks of them.
+FINALIZED_RUN_HISTORY = 200
+
+# Row-level provenance, stored beside run_id/version and never as an 18th column.
+CASHFLOW_NO_ACTION = "NO_ACTION"           # PASS row: nothing to execute
+CASHFLOW_PENDING = "PENDING_EXECUTION"     # READY_*: waiting for a broker fill
+CASHFLOW_FINALIZED = "FINALIZED"           # fill confirmed, ΔAₙ/Aₙ/Eₙ written
 
 
 class StaleAnchorError(RuntimeError):
@@ -58,6 +80,10 @@ class RuntimeIdentityError(RuntimeError):
 
 class RuntimeIdentityMismatch(RuntimeIdentityError):
     """The chain was created under another opaque runtime identity."""
+
+
+class ExecutionFinalizeError(RuntimeError):
+    """A confirmed fill could not be booked against this chain's cashflow."""
 
 
 class _Idempotent(Exception):
@@ -172,6 +198,30 @@ def _resolve_state(cfg: Config, state) -> dict | None:
     return read_chain_state(cfg) if state is UNREAD_STATE else state
 
 
+def execution_cashflow(state: dict) -> dict:
+    """This chain's confirmed cashflow: the only source of P_acted and Aₙ.
+
+    Both values move on a broker-confirmed fill and on nothing else, so they
+    live under their own key with the worker as sole author. A chain written
+    before the split still holds them in the flat prev_price/prev_actual
+    fields; they are read once here as the seed and stored under the new key by
+    the next commit. prev_actual only survives that migration when the chain
+    already used this module's semantics — the previous name counted a decision
+    as an act, so its Aₙ is a different quantity and must not be chained onto.
+    """
+    stored = (state or {}).get(EXECUTION_STATE_KEY)
+    if isinstance(stored, dict) and stored.get("last_action_price") is not None:
+        return {
+            "last_action_price": float(stored["last_action_price"]),
+            "actual_cumulative": float(stored.get("actual_cumulative", 0.0) or 0.0),
+        }
+    same_semantics = state.get("cashflow_semantics") == CASHFLOW_SEMANTICS
+    return {
+        "last_action_price": float(state["prev_price"]),
+        "actual_cumulative": float(state["prev_actual"]) if same_semantics else 0.0,
+    }
+
+
 def read_anchor(cfg: Config, *, runtime_identity: str | None = None,
                 state=UNREAD_STATE) -> Anchor | None:
     state = _resolve_state(cfg, state)
@@ -179,13 +229,13 @@ def read_anchor(cfg: Config, *, runtime_identity: str | None = None,
         return None
     verify_runtime_identity(state, runtime_identity)
     ph = state.get("prev_holdings")
-    same_semantics = state.get("cashflow_semantics") == CASHFLOW_SEMANTICS
+    cashflow = execution_cashflow(state)
     return Anchor(
         version=int(state["version"]),
         dna_step=int(state["dna_step"]),
         p0=float(state["p0"]),
-        prev_price=float(state["prev_price"]),
-        prev_actual=float(state["prev_actual"]) if same_semantics else 0.0,
+        prev_price=cashflow["last_action_price"],
+        prev_actual=cashflow["actual_cumulative"],
         prev_holdings=None if ph is None else float(ph),
     )
 
@@ -208,6 +258,11 @@ def commit_final_row(cfg: Config, snapshot: dict, anchor: Anchor | None, row: di
                      runtime_identity: str | None = None,
                      pending_intent: dict | None = None) -> dict:
     """Commit one row and advance the DNA pointer.
+
+    Advances the *decision* pointer only. The execution cashflow (P_acted, Aₙ)
+    is carried through untouched, read from `current` inside the transaction so
+    a fill finalized by the worker between this caller's anchor read and its
+    commit is preserved rather than overwritten with the pre-fill value.
 
     Order execution is not part of this transaction: intents live in the
     outbox, so a broker failure can never roll back a committed slot. The row
@@ -245,6 +300,11 @@ def commit_final_row(cfg: Config, snapshot: dict, anchor: Anchor | None, row: di
         "version": expected_version,
         "committed": False,
         "semantics": CASHFLOW_SEMANTICS,
+        # Outside the 17 columns, like run_id and market_slot_id: says whether
+        # the three cashflow columns are final or still waiting on a fill.
+        "cashflow_status": CASHFLOW_PENDING
+                           if meta.get("execution_pending", meta.get("acted"))
+                           else CASHFLOW_NO_ACTION,
     })
     if slot_id is not None:
         doc["market_slot_id"] = slot_id
@@ -276,12 +336,28 @@ def commit_final_row(cfg: Config, snapshot: dict, anchor: Anchor | None, row: di
                     f"market_ordinal ต้องเดินหน้า: chain อยู่ที่ {int(last_ordinal)} "
                     f"แต่ slot นี้ได้ {int(market_ordinal)} — DNA เดินถอยไม่ได้")
 
+        # Read inside the transaction, so a fill the worker finalized after this
+        # caller read its anchor is carried forward, not rolled back. Only an
+        # absent cashflow is seeded — genesis, or the first commit of a chain
+        # written before the split, where meta holds what read_anchor resolved.
+        cashflow = dict((current or {}).get(EXECUTION_STATE_KEY) or {})
+        if cashflow.get("last_action_price") is None:
+            cashflow.update({
+                "last_action_price": float(meta["acted_price_next"]),
+                "actual_cumulative": float(meta["actual_next"]),
+            })
+            cashflow.setdefault("finalized_seq", 0)
+
         next_state = {
             "version": expected_version,
             "dna_step": int(meta["step"]),
             "p0": float(meta["p0_next"]),
-            "prev_price": float(meta["acted_price_next"]),
-            "prev_actual": float(meta["actual_next"]),
+            EXECUTION_STATE_KEY: cashflow,
+            # Mirrors of the cashflow above, kept for readers written before the
+            # split. Sourced from the cashflow and never from this decision, so
+            # a READY_* row cannot move them.
+            "prev_price": float(cashflow["last_action_price"]),
+            "prev_actual": float(cashflow["actual_cumulative"]),
             "prev_holdings": float(snapshot.get("holdings", 0.0) or 0.0),
             "last_run_id": run_id,
             "updated_at": snapshot["captured_at"],
@@ -334,6 +410,160 @@ def commit_final_row(cfg: Config, snapshot: dict, anchor: Anchor | None, row: di
     row_ref.update({"committed": True})
     return {"committed": True, "run_id": run_id, "version": expected_version,
             "market_slot_id": slot_id, "market_ordinal": market_ordinal}
+
+
+def _utc_stamp() -> str:
+    return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def read_committed_row_for_chain(cfg: Config, run_id: str) -> dict:
+    """The committed row a fill belongs to, refusing anything else."""
+    doc = db.reference(f"{ROWS_PATH}/{run_id}").get()
+    if not isinstance(doc, dict) or doc.get("committed") is not True:
+        raise ExecutionFinalizeError(
+            f"row {run_id} ยังไม่ committed — ห้าม finalize cashflow")
+    ck = chain_key(cfg)
+    if doc.get("chain_key") not in (None, ck):
+        raise ExecutionFinalizeError(
+            f"row {run_id} เป็นของ chain {doc.get('chain_key')} ไม่ใช่ {ck}")
+    reference = doc.get(REFERENCE_COLUMN)
+    if reference is None or not math.isfinite(float(reference)):
+        raise ExecutionFinalizeError(f"row {run_id} ไม่มี Rₙ ที่ใช้ได้ — finalize ไม่ได้")
+    return doc
+
+
+def finalize_execution_fill(cfg: Config, run_id: str, fill: ExecutionFill, *,
+                            runtime_identity: str | None = None) -> dict:
+    """Book ΔAₙ/Aₙ/Eₙ for one broker-confirmed fill — once, atomically.
+
+    This is the whole point of the split: the engine committed the row with the
+    cashflow carried forward, and only here — with a filled price, a cumulative
+    filled quantity and the holdings read back after execution — does the model
+    ledger move.
+
+    Idempotent on run_id, which is also the client_order_id, so a worker retry,
+    a second poll of a partial fill, and a second worker instance racing the
+    first all reduce to the first result. The state transaction is the fence:
+    whoever loses sees the run_id already recorded and applies nothing. The row
+    patch is repeated on that losing path too, because the failure it recovers
+    from is a transaction that committed while the row write did not.
+
+    Touches no field of the decision pointer: version, dna_step, p0, slot_id and
+    market_ordinal all stay exactly where the engine left them, so finalizing
+    can never present a stale anchor or consume a slot.
+    """
+    if not isinstance(fill, ExecutionFill):
+        raise TypeError("fill ต้องเป็น ExecutionFill จาก broker จริง")
+    run_id = str(run_id)
+    ck = chain_key(cfg)
+    row_doc = read_committed_row_for_chain(cfg, run_id)
+    reference_R = float(row_doc[REFERENCE_COLUMN])
+    # The row's own record of having been finalized. Second fence behind
+    # finalized_runs, and the one that still holds after the run_id ages out of
+    # that bounded history: a poll of a very old fill then reads as the no-op it
+    # is, instead of booking the same ΔAₙ a second time.
+    row_already_final = row_doc.get("cashflow_status") == CASHFLOW_FINALIZED
+    state_ref = db.reference(f"{STATE_PATH}/{ck}")
+    outcome: dict = {}
+
+    def txn(current):
+        if not isinstance(current, dict) or not current:
+            raise ExecutionFinalizeError(
+                "ไม่พบ chain state — finalize fill ไม่ได้")
+        state = dict(current)
+        verify_runtime_identity(state, runtime_identity)
+        cashflow = dict(state.get(EXECUTION_STATE_KEY) or {})
+        if cashflow.get("last_action_price") is None:
+            cashflow.update(execution_cashflow(state))
+        finalized = dict(cashflow.get("finalized_runs") or {})
+        already = finalized.get(run_id)
+        if isinstance(already, dict):
+            outcome.update({"applied": False, **already})
+            return state                       # absorbing: never counted twice
+        if row_already_final:
+            outcome.update({
+                "applied": False,
+                "delta_actual": float(row_doc[DELTA_COLUMN]),
+                "actual_cumulative": float(row_doc[ACTUAL_COLUMN]),
+                "excess": float(row_doc[EXCESS_COLUMN]),
+                "reference": reference_R,
+                "filled_price": float(row_doc.get("execution_price")
+                                      or fill.filled_price),
+                "filled_quantity": float(row_doc.get("execution_quantity")
+                                         or fill.filled_quantity),
+                "holdings_after": float(row_doc.get("post_execution_holdings")
+                                        if row_doc.get("post_execution_holdings")
+                                        is not None else fill.holdings_after),
+                "at": str(row_doc.get("cashflow_finalized_at") or ""),
+            })
+            return state
+
+        result = finalize_recurrence(
+            cfg, fill,
+            last_action_price=float(cashflow["last_action_price"]),
+            actual_cumulative=float(cashflow.get("actual_cumulative", 0.0) or 0.0),
+            reference_R=reference_R)
+        seq = int(cashflow.get("finalized_seq", 0) or 0) + 1
+        record = {
+            "delta_actual": result.dA,
+            "actual_cumulative": result.A,
+            "excess": result.E,
+            "reference": reference_R,
+            "previous_action_price": float(cashflow["last_action_price"]),
+            "filled_price": float(fill.filled_price),
+            "filled_quantity": float(fill.filled_quantity),
+            "holdings_after": float(fill.holdings_after),
+            "seq": seq,
+            "at": _utc_stamp(),
+        }
+        finalized[run_id] = record
+        if len(finalized) > FINALIZED_RUN_HISTORY:
+            ordered = sorted(finalized.items(),
+                             key=lambda kv: int((kv[1] or {}).get("seq", 0) or 0))
+            finalized = dict(ordered[-FINALIZED_RUN_HISTORY:])
+        cashflow.update({
+            "last_action_price": result.acted_price_next,
+            "actual_cumulative": result.A,
+            "finalized_seq": seq,
+            "last_finalized_run_id": run_id,
+            "finalized_runs": finalized,
+            "updated_at": record["at"],
+        })
+        state[EXECUTION_STATE_KEY] = cashflow
+        state["prev_price"] = result.acted_price_next
+        state["prev_actual"] = result.A
+        # The post-execution reading, from the broker, replacing the decision's.
+        state["prev_holdings"] = float(fill.holdings_after)
+        outcome.update({"applied": True, **record})
+        return state
+
+    state_ref.transaction(txn)
+    if not outcome:                            # pragma: no cover - defensive
+        raise ExecutionFinalizeError("finalize transaction ไม่ได้คืนผลลัพธ์")
+
+    # Always written, including on the idempotent path: the one crash this
+    # repeats through is a committed transaction whose row patch never landed,
+    # and rewriting the recorded numbers is exactly the repair.
+    db.reference(f"{ROWS_PATH}/{run_id}").update({
+        DELTA_COLUMN: outcome["delta_actual"],
+        ACTUAL_COLUMN: outcome["actual_cumulative"],
+        EXCESS_COLUMN: outcome["excess"],
+        "cashflow_status": CASHFLOW_FINALIZED,
+        "execution_price": outcome["filled_price"],
+        "execution_quantity": outcome["filled_quantity"],
+        "post_execution_holdings": outcome["holdings_after"],
+        "cashflow_finalized_at": outcome["at"],
+    })
+    return {"run_id": run_id, "chain_key": ck, **outcome}
+
+
+def execution_finalization(cfg: Config, run_id: str, *,
+                           state=UNREAD_STATE) -> dict | None:
+    """What was booked for *run_id*, or None if this chain never finalized it."""
+    state = _resolve_state(cfg, state) or {}
+    cashflow = state.get(EXECUTION_STATE_KEY) or {}
+    record = (cashflow.get("finalized_runs") or {}).get(str(run_id))
+    return dict(record) if isinstance(record, dict) else None
 
 
 def pending_order_intents(cfg: Config, *,

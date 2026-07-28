@@ -15,9 +15,11 @@ from lego_one_row import (
     Anchor,
     COLUMN_ORDER,
     Config,
+    ExecutionFill,
     build_decision,
     compute_recurrence,
     compute_row,
+    finalize_recurrence,
 )
 
 
@@ -180,6 +182,13 @@ def test_representative_recurrence_matches_f8388a_baseline():
 
 
 def test_representative_row_output_matches_f8388a_baseline():
+    """Every decision column is byte-for-byte the f8388a baseline.
+
+    The three cashflow columns are the deliberate exception: a READY_BUY is an
+    intent, so the row now commits them carried forward and lego_order_worker
+    books the baseline numbers once the fill is confirmed — which the test below
+    checks against the very same golden values.
+    """
     row = compute_row(CFG, SNAPSHOT, ANCHOR, dna_step=5)
     assert list(row) == [*EXPECTED_COLUMNS, "_meta"]
     assert {
@@ -206,10 +215,13 @@ def test_representative_row_output_matches_f8388a_baseline():
         "มูลค่าพอร์ต (USD)": 1300.0,
         "ส่วนต่างเป้าหมาย (USD)": 200.0,
     }
+    # Rₙ is unchanged: it is live on every row and never moved to the worker.
     assert row["Rₙ อ้างอิง (USD)"] == pytest.approx(-85.22471256549127)
-    assert row["ΔAₙ ต่อสเต็ป (USD)"] == pytest.approx(-82.8488372093023)
-    assert row["Aₙ สะสม (USD)"] == pytest.approx(-82.8488372093023)
-    assert row["Eₙ ส่วนเกินสะสม (USD)"] == pytest.approx(2.3758753561889705)
+    # Carried forward until a fill is confirmed. P_acted is still P₀ here, so
+    # the pass form of Eₙ (Aₙ − fix·ln(P_acted/P₀)) is 0.
+    assert row["ΔAₙ ต่อสเต็ป (USD)"] == 0.0
+    assert row["Aₙ สะสม (USD)"] == pytest.approx(ANCHOR.prev_actual)
+    assert row["Eₙ ส่วนเกินสะสม (USD)"] == pytest.approx(0.0)
 
     meta = dict(row["_meta"])
     actual_next = meta.pop("actual_next")
@@ -218,13 +230,38 @@ def test_representative_row_output_matches_f8388a_baseline():
         "price": 6.5,
         "p0_next": 6.88,
         "acted": True,
-        "acted_price_next": 6.5,
+        "execution_pending": True,
+        "acted_price_next": 6.88,
         "status": "READY_BUY",
         "side": "BUY",
         "quantity": 30.76923,
         "action": "TRIGGER_ACTION",
     }
-    assert actual_next == pytest.approx(-82.8488372093023)
+    assert actual_next == pytest.approx(ANCHOR.prev_actual)
+
+
+def test_confirmed_fill_reproduces_the_f8388a_cashflow_baseline():
+    """The moved arithmetic, unchanged: same inputs, same three numbers.
+
+    finalize_recurrence at the decision price must land exactly where the f8388a
+    act branch of compute_recurrence did — the only difference in production is
+    that the price is the broker's fill, not the decision's quote.
+    """
+    row = compute_row(CFG, SNAPSHOT, ANCHOR, dna_step=5)
+    final = finalize_recurrence(
+        CFG,
+        ExecutionFill(filled_price=SNAPSHOT["price"],
+                      filled_quantity=row["จำนวนสั่ง (หุ้น)"],
+                      holdings_after=SNAPSHOT["holdings"] + row["จำนวนสั่ง (หุ้น)"]),
+        last_action_price=ANCHOR.prev_price,
+        actual_cumulative=ANCHOR.prev_actual,
+        reference_R=row["Rₙ อ้างอิง (USD)"])
+    assert dataclasses.asdict(final) == pytest.approx({
+        "dA": -82.8488372093023,
+        "A": -82.8488372093023,
+        "E": 2.3758753561889705,
+        "acted_price_next": 6.5,
+    })
 
 
 def test_learning_guide_normalized_source_hash_matches_f8388a():

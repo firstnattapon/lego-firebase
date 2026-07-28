@@ -225,6 +225,7 @@ gcloud functions deploy lego-one-row \
 | `LEGO_ORDER_EXPIRY_MARGIN_SECONDS` | `15` | กันส่ง order คาบเกี่ยว slot ถัดไป |
 | `LEGO_HOLDINGS_DRIFT_TOLERANCE` | `0.000001` | holdings เปลี่ยนเกินนี้ระหว่างรอส่ง = `SUPPRESSED_STATE_CHANGED` |
 | `LEGO_RECONCILE_MAX_ATTEMPTS` | `20` | ถาม broker ซ้ำได้กี่ครั้งก่อนยอมแพ้เป็น `RECONCILE_ABANDONED` (ที่ `*/5` = ~100 นาที) — กัน order ที่ broker ไม่เคยรับ วนถามไม่รู้จบจนเบียด intent ใหม่ทั้งหมด |
+| `LEGO_FILL_CONFIRM_MAX_ATTEMPTS` | `5` | broker บอก fill แล้วแต่ position ยังไม่ขยับ = `AWAITING_FILL_CONFIRMATION` แล้วถามใหม่ได้กี่ครั้งก่อนปล่อยออกจากคิวพร้อม `needs_manual_check` · ระหว่างนี้ `ΔAₙ`/`Aₙ`/`Eₙ` ยังไม่ถูกบันทึก (ห้าม book cashflow จากคำพูด broker อย่างเดียว) |
 | `LEGO_OPEN_ORDER_PAGE_SIZE` | `50` | `get_order_open` ตอบเป็น "หน้า" (default ของ broker = 10) · การกันส่งซ้ำอ่านจากรายการนี้ ถ้าหน้าเดียวไม่ครบจะมองไม่เห็น order ของเราเอง |
 | `LEGO_OPEN_ORDER_MAX_PAGES` | `5` | เพดานจำนวนหน้าที่ไล่ต่อการตรวจ 1 ครั้ง · ชนเพดาน/cursor ไม่ครบ = fail closed คง intent รอและไม่ส่ง order |
 

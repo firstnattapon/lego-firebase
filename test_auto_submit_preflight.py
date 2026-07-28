@@ -18,13 +18,13 @@ import pytest
 
 import main
 from conftest import FAKE_DB
-from lego_one_row import COLUMN_ORDER, columns_presented
+from lego_one_row import COLUMN_ORDER, ExecutionFill, columns_presented
 from lego_orders import PROD, UAT
 from lego_outbox import OUTBOX_PATH, list_actionable
 from lego_preflight import (CHECK_IDS, DEGRADED_CLOCK_MESSAGE,
                             auto_submit_preflight,
                             evaluate_auto_submit_preflight)
-from lego_state import STATE_PATH, chain_key
+from lego_state import STATE_PATH, chain_key, finalize_execution_fill
 
 UTC = timezone.utc
 SLOT_0 = datetime(2026, 7, 23, 18, 0, 5, tzinfo=UTC)      # ordinal 0 on a 30m grid
@@ -370,20 +370,36 @@ def test_column_contract_is_untouched(monkeypatch, auto_submit):
     assert [k for k in doc if k in COLUMN_ORDER] == COLUMN_ORDER
     assert set(doc) - set(COLUMN_ORDER) == {
         "run_id", "chain_key", "version", "committed", "semantics",
-        "market_slot_id", "market_ordinal", "clock_mode"}
+        "market_slot_id", "market_ordinal", "clock_mode", "cashflow_status"}
     assert columns_presented({k: doc[k] for k in COLUMN_ORDER})["ราคา Pₙ (USD)"] == 335.55
 
 
 def test_recurrence_matches_the_production_rows(monkeypatch, auto_submit):
     """Case 13 — calculation. Three real slots, replayed: Rₙ, ΔAₙ, Aₙ, Eₙ and the
-    quantity must still land on the numbers the live chain committed."""
+    quantity must still land on the numbers the live chain committed.
+
+    The arithmetic is unchanged; what moved is *when* it runs. lego_one_row now
+    commits each row with the cashflow carried forward, and the same numbers
+    appear once each order is confirmed filled at its decision price — which is
+    what this replay simulates, one finalize per committed slot."""
     fix_c, p0 = 3000.0, PROD_PRICES[0]
     rows = []
     for moment, price in zip((SLOT_0, SLOT_1, SLOT_2), PROD_PRICES):
         body, code = _run(monkeypatch, moment, price, holdings=PROD_HOLDINGS)
         assert code == 200 and body["status"] == "READY_SELL"
+        committed = FAKE_DB.reference(f"webull_lego_rows/{body['run_id']}").get()
+        # Committed on decision alone: no fill yet, so no cashflow yet.
+        assert committed["cashflow_status"] == "PENDING_EXECUTION"
+        assert committed["ΔAₙ ต่อสเต็ป (USD)"] == 0.0
+        # Then the broker fills it at that price and the position moves.
+        quantity = committed["จำนวนสั่ง (หุ้น)"]
+        finalize_execution_fill(
+            main.load_config(), body["run_id"],
+            ExecutionFill(filled_price=price, filled_quantity=quantity,
+                          holdings_after=PROD_HOLDINGS - quantity))
         rows.append(FAKE_DB.reference(f"webull_lego_rows/{body['run_id']}").get())
 
+    assert [r["cashflow_status"] for r in rows] == ["FINALIZED"] * 3
     presented = [columns_presented({k: r[k] for k in COLUMN_ORDER}) for r in rows]
     assert [p["มูลค่าพอร์ต (USD)"] for p in presented] == [3068.58, 3064.92, 3079.19]
     assert [p["ส่วนต่างเป้าหมาย (USD)"] for p in presented] == [-68.58, -64.92, -79.19]

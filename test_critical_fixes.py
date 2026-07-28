@@ -3,8 +3,9 @@ from __future__ import annotations
 import pytest
 
 from conftest import FAKE_DB
-from lego_one_row import (Anchor, Config, PASS_THRESHOLD, READY_BUY,
-                          compute_recurrence, compute_row)
+from lego_one_row import (Anchor, Config, ExecutionFill, PASS_THRESHOLD,
+                          READY_BUY, compute_recurrence, compute_row,
+                          finalize_recurrence)
 from lego_orders import apply_fill
 from lego_outbox import list_actionable, put_intent, update_intent
 from lego_state import apply_realized_fill, commit_final_row, read_anchor
@@ -33,7 +34,8 @@ def test_critical_1_pass_threshold_signal_one_freezes_model_ledger():
     assert row["_meta"]["acted_price_next"] == pytest.approx(320.64)
 
 
-def test_ready_decision_is_the_only_model_act():
+def test_ready_decision_alone_never_moves_the_model_ledger():
+    """A READY_* is an intent. Only a confirmed fill may book ΔAₙ."""
     cfg = Config(symbol="AAPL", fix_c=3000.0, diff=5.0,
                  dna_code="bypass:10", decimal_precision=2)
     anchor = Anchor(version=2, dna_step=1, p0=320.64,
@@ -42,8 +44,19 @@ def test_ready_decision_is_the_only_model_act():
             "price": 320.32, "holdings": 9.34492}
     row = compute_row(cfg, snap, anchor)
     assert row["สถานะ"] == READY_BUY
-    expected = 3000.0 * (320.32 / 320.64 - 1.0)
-    assert row["ΔAₙ ต่อสเต็ป (USD)"] == pytest.approx(expected)
+    assert row["ΔAₙ ต่อสเต็ป (USD)"] == 0.0
+    assert row["Aₙ สะสม (USD)"] == pytest.approx(anchor.prev_actual)
+    assert row["_meta"]["execution_pending"] is True
+
+    # ...and the same arithmetic, once the broker fills it at that price.
+    final = finalize_recurrence(
+        cfg,
+        ExecutionFill(filled_price=320.32, filled_quantity=row["จำนวนสั่ง (หุ้น)"],
+                      holdings_after=9.4),
+        last_action_price=anchor.prev_price,
+        actual_cumulative=anchor.prev_actual,
+        reference_R=row["Rₙ อ้างอิง (USD)"])
+    assert final.dA == pytest.approx(3000.0 * (320.32 / 320.64 - 1.0))
 
 
 def test_compute_recurrence_requires_boolean_acted():

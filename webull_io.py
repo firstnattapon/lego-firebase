@@ -483,11 +483,22 @@ def build_clients():
     return trade, data
 
 
-def fetch_snapshot(trade_client, data_client, cfg: Config) -> dict:
+def fetch_holdings(trade_client, cfg: Config) -> float:
+    """Shares of cfg.symbol the broker says the account holds, right now.
+
+    Split out of fetch_snapshot for the post-execution read: confirming a fill
+    needs the position and nothing else, and going through the snapshot would
+    also spend a market-data call — the one call that can answer 403 for a
+    subscription reason that has nothing to do with the fill being confirmed.
+    """
     account_id = os.environ["WEBULL_ACCOUNT_ID"]
     positions = _retry_transient(
         lambda: trade_client.account_v2.get_account_position(account_id).json())
-    holdings = _extract_qty(positions, cfg.symbol)
+    return float(_extract_qty(positions, cfg.symbol))
+
+
+def fetch_snapshot(trade_client, data_client, cfg: Config) -> dict:
+    holdings = fetch_holdings(trade_client, cfg)
     category = market_category()
     try:
         snap = _retry_transient(
