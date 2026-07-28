@@ -10,9 +10,9 @@ firebase-admin==6.*
 # The SDK is pinned for the same reason as numpy, on a shorter fuse: it owns the
 # HMAC signing, the auth flow, and the exact order payload that reaches the
 # broker, so an unplanned upgrade at deploy time changes the money path with
-# nothing in this repo to notice. 2.0.15 is the version whose surface this
-# adapter is written against (account_v2.get_account_position, order_v3.preview/
-# place/get_order_detail/get_order_open, market_data.get_snapshot with
-# extend_hour_required/overnight_required). Move it only after a UAT run.
-webull-openapi-python-sdk==2.0.15
+# nothing in this repo to notice. Runtime code remains Webull 2.0.15 byte-for-
+# byte; the local wheel changes only dependency metadata so Python 3.12 can use
+# the audited cryptography floor. See vendor/README.md and its provenance tests.
+cryptography==48.0.1
+./vendor/webull_openapi_python_sdk-2.0.15-1lego-py3-none-any.whl
 tzdata>=2024.1

@@ -1,0 +1,42 @@
+{
+  "rules": {
+    ".read": false,
+    ".write": false,
+    "webull_lego_rows": {
+      ".read": true,
+      ".write": false
+    },
+    "webull_lego_state": {
+      ".read": true,
+      ".write": false
+    },
+    "webull_lego_order_audit": {
+      ".read": true,
+      ".write": false
+    },
+    "webull_lego_order_audit_archive": {
+      ".read": true,
+      ".write": false
+    },
+    "webull_lego_warnings": {
+      ".read": true,
+      ".write": false
+    },
+    "webull_lego_order_outbox": {
+      ".read": false,
+      ".write": false
+    },
+    "webull_lego_order_outbox_archive": {
+      ".read": false,
+      ".write": false
+    },
+    "webull_lego_realized": {
+      ".read": false,
+      ".write": false
+    },
+    "webull_lego_errors": {
+      ".read": false,
+      ".write": false
+    }
+  }
+}

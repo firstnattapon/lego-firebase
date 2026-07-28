@@ -239,7 +239,11 @@ def test_a_matching_intent_still_passes_the_gate(monkeypatch, auto_submit):
     cfg = main.load_config()
     placed = []
     _stub_broker(monkeypatch, place=lambda tc, o: placed.append(o) or {"order_status": "FILLED"},
-                 detail=lambda tc, r: {"order_status": "FILLED"})
+                 detail=lambda tc, r: {
+                     "order_status": "FILLED",
+                     "filled_quantity": 1.0,
+                     "avg_filled_price": 320.0,
+                 })
     _run(monkeypatch, SESSION_OPEN_SLOT, 320.0)
     result = main._run_order_worker(cfg, limit=1)["results"][0]
     assert result["status"] == "FILLED" and len(placed) == 1

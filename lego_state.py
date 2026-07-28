@@ -2,7 +2,9 @@
 from __future__ import annotations
 
 import hashlib
+import hmac
 import json
+import uuid
 from datetime import datetime, timezone
 
 from firebase_admin import db
@@ -11,6 +13,7 @@ from dna_engine import dna_fingerprint
 from lego_one_row import Anchor, Config, validate_row_columns
 from lego_orders import apply_fill, normalize_status
 from market_clock import calendar_fingerprint, market_ordinal_for_slot_id
+from webull_io import redact_sensitive_text
 
 ROWS_PATH = "webull_lego_rows"
 STATE_PATH = "webull_lego_state"
@@ -49,6 +52,14 @@ class OrdinalRegression(RuntimeError):
     """
 
 
+class RuntimeIdentityError(RuntimeError):
+    """The persisted chain cannot safely be used by this account/environment."""
+
+
+class RuntimeIdentityMismatch(RuntimeIdentityError):
+    """The chain was created under another opaque runtime identity."""
+
+
 class _Idempotent(Exception):
     pass
 
@@ -64,6 +75,32 @@ def config_hash(cfg: Config) -> str:
 
 def chain_key(cfg: Config) -> str:
     return f"{cfg.symbol}_{config_hash(cfg)}"
+
+
+def verify_runtime_identity(state: dict | None,
+                            runtime_identity: str | None) -> bool:
+    """Guard a chain against another account/environment; adopt a legacy one.
+
+    A chain written before this guard existed carries no fingerprint. Refusing it
+    buys nothing — the account that wrote it is unknowable either way — while a
+    hard failure would stop the DNA clock every slot until an operator noticed.
+    So a missing fingerprint is adopted (the caller stamps it on the next commit)
+    and reported; only a fingerprint that is present and different is a real
+    cross-account collision, and that still fails closed.
+
+    Returns True when this is the first adoption, so the caller can say it out
+    loud once. Never logs or persists the raw broker account id.
+    """
+    if not state or runtime_identity is None:
+        return False
+    stored = state.get("runtime_identity_fingerprint")
+    if not stored:
+        return True
+    if not hmac.compare_digest(str(stored), str(runtime_identity)):
+        raise RuntimeIdentityMismatch(
+            "runtime identity ไม่ตรงกับ chain ที่บันทึกไว้ "
+            "(account/environment คนละชุด; account id ไม่ถูกเปิดเผย)")
+    return False
 
 
 def make_run_id(ck: str, anchor_version: int | None, snapshot: dict) -> str:
@@ -112,10 +149,35 @@ def verify_dna_continuity(cfg: Config, state: dict | None) -> None:
             "— chain นี้จะกลายเป็นคนละกลยุทธ์ ต้องคืน numpy เดิมหรือเริ่ม chain ใหม่")
 
 
-def read_anchor(cfg: Config) -> Anchor | None:
-    state = db.reference(f"{STATE_PATH}/{chain_key(cfg)}").get()
+class _Unread:
+    """Distinguishes 'caller passed no state' from a real empty/absent state."""
+
+    def __repr__(self) -> str:                # pragma: no cover - debug aid only
+        return "UNREAD_STATE"
+
+
+UNREAD_STATE = _Unread()
+
+
+def read_chain_state(cfg: Config) -> dict | None:
+    """The one place a caller fetches this chain's state document.
+
+    Every guard on the read path needs the same document, so callers fetch it
+    once and hand it down instead of paying a round trip per guard.
+    """
+    return db.reference(f"{STATE_PATH}/{chain_key(cfg)}").get()
+
+
+def _resolve_state(cfg: Config, state) -> dict | None:
+    return read_chain_state(cfg) if state is UNREAD_STATE else state
+
+
+def read_anchor(cfg: Config, *, runtime_identity: str | None = None,
+                state=UNREAD_STATE) -> Anchor | None:
+    state = _resolve_state(cfg, state)
     if not state:
         return None
+    verify_runtime_identity(state, runtime_identity)
     ph = state.get("prev_holdings")
     same_semantics = state.get("cashflow_semantics") == CASHFLOW_SEMANTICS
     return Anchor(
@@ -142,7 +204,9 @@ def _repair_pending_row(state: dict | None) -> None:
 
 def commit_final_row(cfg: Config, snapshot: dict, anchor: Anchor | None, row: dict,
                      *, slot_id: str | None = None, market_ordinal: int | None = None,
-                     clock_mode: str | None = None) -> dict:
+                     clock_mode: str | None = None,
+                     runtime_identity: str | None = None,
+                     pending_intent: dict | None = None) -> dict:
     """Commit one row and advance the DNA pointer.
 
     Order execution is not part of this transaction: intents live in the
@@ -163,6 +227,7 @@ def commit_final_row(cfg: Config, snapshot: dict, anchor: Anchor | None, row: di
     state_ref = db.reference(f"{STATE_PATH}/{ck}")
     meta = row["_meta"]
     state_before = state_ref.get()
+    verify_runtime_identity(state_before, runtime_identity)
     verify_dna_continuity(cfg, state_before)
     if slot_id is not None:
         verify_calendar_continuity(state_before)
@@ -191,6 +256,7 @@ def commit_final_row(cfg: Config, snapshot: dict, anchor: Anchor | None, row: di
 
     def txn(current):
         current = current or None
+        verify_runtime_identity(current, runtime_identity)
         if current is None:
             if anchor_version is not None:
                 raise StaleAnchorError("state ว่างแต่ anchor ไม่ใช่ genesis")
@@ -224,6 +290,13 @@ def commit_final_row(cfg: Config, snapshot: dict, anchor: Anchor | None, row: di
             "symbol": cfg.symbol,
             "cashflow_semantics": CASHFLOW_SEMANTICS,
         }
+        if runtime_identity is not None:
+            next_state["runtime_identity_fingerprint"] = runtime_identity
+        pending = dict((current or {}).get("pending_order_intents") or {})
+        if pending_intent is not None:
+            pending[run_id] = dict(pending_intent)
+        if pending:
+            next_state["pending_order_intents"] = pending
         if slot_id is not None:
             next_state["slot_id"] = slot_id
         if slot_id is not None and not slot_id.startswith("epoch:"):
@@ -263,9 +336,84 @@ def commit_final_row(cfg: Config, snapshot: dict, anchor: Anchor | None, row: di
             "market_slot_id": slot_id, "market_ordinal": market_ordinal}
 
 
+def pending_order_intents(cfg: Config, *,
+                          runtime_identity: str | None = None,
+                          state=UNREAD_STATE) -> dict[str, dict]:
+    """Durable intent payloads committed atomically with the state pointer."""
+    state = _resolve_state(cfg, state) or {}
+    verify_runtime_identity(state, runtime_identity)
+    raw = state.get("pending_order_intents") or {}
+    return {
+        str(run_id): dict(payload)
+        for run_id, payload in raw.items()
+        if isinstance(payload, dict)
+    }
+
+
+def chain_runtime_identity_is_verified(
+        cfg: Config, runtime_identity: str | None, *, state=UNREAD_STATE) -> bool:
+    """Return whether a state exists after applying the identity guard."""
+    state = _resolve_state(cfg, state)
+    if not state:
+        return False
+    verify_runtime_identity(state, runtime_identity)
+    return True
+
+
+def mark_order_intent_materialized(cfg: Config, run_id: str, *,
+                                   runtime_identity: str | None = None) -> None:
+    """Clear a recovery marker only after idempotent outbox creation succeeds."""
+    ref = db.reference(f"{STATE_PATH}/{chain_key(cfg)}")
+
+    def txn(current):
+        if not isinstance(current, dict) or not current:
+            raise RuntimeIdentityError(
+                "state หายระหว่าง materialize outbox — หยุดเพื่อไม่สร้าง state ไม่ครบ")
+        state = dict(current or {})
+        verify_runtime_identity(state, runtime_identity)
+        pending = dict(state.get("pending_order_intents") or {})
+        pending.pop(run_id, None)
+        if pending:
+            state["pending_order_intents"] = pending
+        else:
+            state.pop("pending_order_intents", None)
+        if runtime_identity is not None and not state.get("runtime_identity_fingerprint"):
+            state["runtime_identity_fingerprint"] = runtime_identity
+        return state
+
+    ref.transaction(txn)
+
+
+_AUDIT_SECRET_FIELDS = {
+    "app_key", "app_secret", "access_token", "x-signature",
+    "x-access-token", "x-app-key", "account_id", "webull_account_id",
+    "authorization",
+}
+
+
+def _redact_audit_payload(payload: dict) -> dict:
+    def clean(value):
+        if isinstance(value, str):
+            return redact_sensitive_text(value)
+        if isinstance(value, dict):
+            return {
+                key: clean(item)
+                for key, item in value.items()
+                if str(key).lower() not in _AUDIT_SECRET_FIELDS
+            }
+        if isinstance(value, list):
+            return [clean(item) for item in value]
+        return value
+
+    return {
+        key: clean(value)
+        for key, value in payload.items()
+        if str(key).lower() not in _AUDIT_SECRET_FIELDS
+    }
+
+
 def write_order_audit(event_id: str, payload: dict) -> None:
-    redacted = {k: v for k, v in payload.items()
-                if k not in {"app_key", "app_secret", "access_token", "x-signature"}}
+    redacted = _redact_audit_payload(payload)
     ref = db.reference(f"{AUDIT_PATH}/{event_id}")
     def txn(current):
         merged = dict(current or {})
@@ -275,8 +423,7 @@ def write_order_audit(event_id: str, payload: dict) -> None:
 
 
 def update_order_audit(event_id: str, fields: dict) -> None:
-    safe = {k: v for k, v in fields.items()
-            if k not in {"app_key", "app_secret", "access_token", "x-signature"}}
+    safe = _redact_audit_payload(fields)
     db.reference(f"{AUDIT_PATH}/{event_id}").update(safe)
 
 
@@ -307,6 +454,7 @@ def apply_realized_fill(ck: str, event_id: str, side: str,
     if cumulative_qty < 0 or cumulative_fee < 0:
         raise ValueError("cumulative fill/fee ติดลบไม่ได้")
     ref = db.reference(f"{REALIZED_PATH}/{ck}")
+    apply_token = uuid.uuid4().hex
 
     def txn(current):
         state = dict(current or {})
@@ -316,8 +464,43 @@ def apply_realized_fill(ck: str, event_id: str, side: str,
         prev_fee = float(prev.get("fee", 0.0) or 0.0)
         prev_avg_price = float(prev.get("average_price", prev.get("price", 0.0)) or 0.0)
         delta_qty = cumulative_qty - prev_qty
-        delta_fee = max(0.0, cumulative_fee - prev_fee)
+        delta_fee = cumulative_fee - prev_fee
+        if delta_qty < -1e-9:
+            raise ValueError("cumulative filled quantity ถอยหลังไม่ได้")
+        if delta_fee < -1e-9:
+            raise ValueError("cumulative filled fee ถอยหลังไม่ได้")
+        delta_qty = max(0.0, delta_qty)
+        delta_fee = max(0.0, delta_fee)
+        if (delta_qty <= 1e-9 and prev_qty > 1e-9
+                and abs(price - prev_avg_price) > 1e-9):
+            raise ValueError(
+                "average fill price เปลี่ยนโดย quantity ไม่เพิ่ม — ต้องตรวจด้วยมือ")
+        if delta_qty <= 1e-9 and delta_fee <= 1e-9:
+            return state
         if delta_qty <= 1e-9:
+            # Some brokers publish fees after the final quantity.  Recognizing
+            # the fee now keeps cumulative P&L correct without inventing another
+            # share fill or charging it twice on replay.
+            realized_delta = -delta_fee
+            cumulative = (
+                float(state.get("cumulative_realized", 0.0) or 0.0)
+                + realized_delta
+            )
+            applied[event_id] = {
+                "quantity": cumulative_qty,
+                "fee": cumulative_fee,
+                "average_price": price,
+                "side": str(side).upper(),
+            }
+            state.update({
+                "applied_fills": applied,
+                "cumulative_realized": cumulative,
+                "last_realized_delta": realized_delta,
+                "last_event_id": event_id,
+                "last_apply_token": apply_token,
+                "updated_at": datetime.now(timezone.utc).strftime(
+                    "%Y-%m-%dT%H:%M:%SZ"),
+            })
             return state
         cumulative_notional = cumulative_qty * price
         previous_notional = prev_qty * prev_avg_price
@@ -335,13 +518,18 @@ def apply_realized_fill(ck: str, event_id: str, side: str,
             "cumulative_realized": cumulative,
             "last_realized_delta": realized_delta,
             "last_event_id": event_id,
+            "last_apply_token": apply_token,
             "updated_at": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
         })
         return state
 
     result = ref.transaction(txn) or {}
+    applied_this_call = result.get("last_apply_token") == apply_token
     return {
-        "realized_delta": float(result.get("last_realized_delta", 0.0) or 0.0),
+        "realized_delta": (
+            float(result.get("last_realized_delta", 0.0) or 0.0)
+            if applied_this_call else 0.0
+        ),
         "realized_cumulative": float(result.get("cumulative_realized", 0.0) or 0.0),
         "open_legs": result.get("open_legs") or {"buys": [], "sells": []},
     }

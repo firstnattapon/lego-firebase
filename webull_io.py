@@ -1,10 +1,13 @@
 """Webull OpenAPI adapter: fail-closed parsing, cached clients, token upkeep."""
 from __future__ import annotations
 
+import hashlib
 import logging
 import os
+import posixpath
 import re
 import sys
+import tempfile
 import time
 from datetime import datetime, timezone
 
@@ -33,6 +36,14 @@ _PREVIEW_ERROR_KEYS = ("error", "error_code", "errorCode")
 # webull/data/common/category.py of the pinned SDK 2.0.15.
 CATEGORIES = ("US_STOCK", "US_ETF", "US_OPTION", "US_CRYPTO", "US_FUTURES",
               "US_EVENT", "HK_STOCK", "HK_ETF", "HK_FUTURES", "CN_STOCK")
+
+
+class WebullConfigError(ValueError):
+    """A deployment value is unsafe or unsupported."""
+
+
+class IncompleteOpenOrdersError(RuntimeError):
+    """The broker's open-order pagination could not prove the scan complete."""
 
 
 class MarketDataForbidden(RuntimeError):
@@ -102,7 +113,22 @@ def market_category() -> str:
 
 
 def environment_label() -> str:
-    return UAT if os.environ.get("WEBULL_ENV", "UAT").upper() == "UAT" else PROD
+    value = os.environ.get("WEBULL_ENV", "UAT").strip().upper()
+    if value == "UAT":
+        return UAT
+    if value in {"PROD", "PRODUCTION"}:
+        return PROD
+    raise WebullConfigError(
+        f"WEBULL_ENV={value!r} ไม่รองรับ — ใช้ได้เฉพาะ UAT, PROD หรือ PRODUCTION")
+
+
+def runtime_identity_fingerprint() -> str:
+    """Opaque account/environment identity used to guard a persisted chain."""
+    account_id = os.environ.get("WEBULL_ACCOUNT_ID", "").strip()
+    if not account_id:
+        raise WebullConfigError("WEBULL_ACCOUNT_ID ว่างหรือไม่ได้ตั้งค่า")
+    raw = f"webull-runtime-v1\0{environment_label()}\0{account_id}"
+    return hashlib.sha256(raw.encode("utf-8")).hexdigest()
 
 
 def _endpoint() -> str:
@@ -126,7 +152,22 @@ def token_dir_is_ephemeral() -> bool:
     is nobody to do that on a scheduler, so it ends in ERROR_INIT_TOKEN and the
     bot stops until someone notices.
     """
-    return os.path.abspath(token_dir()).startswith("/tmp")
+    raw_dir = token_dir()
+    # Deployment configuration is a POSIX path even when validation/tests run
+    # on Windows.  Do this check before os.path.abspath can turn "/tmp" into a
+    # drive-relative Windows path.
+    posix_dir = posixpath.normpath(raw_dir.replace("\\", "/"))
+    if posix_dir == "/tmp" or posix_dir.startswith("/tmp/"):
+        return True
+
+    # Also recognize the host's real temporary directory without accepting a
+    # lexical prefix such as C:\Temp-durable.
+    native_dir = os.path.normcase(os.path.abspath(raw_dir))
+    native_tmp = os.path.normcase(os.path.abspath(tempfile.gettempdir()))
+    try:
+        return os.path.commonpath((native_dir, native_tmp)) == native_tmp
+    except ValueError:                    # paths live on different Windows drives
+        return False
 
 
 def _expires_datetime(raw) -> datetime | None:
@@ -294,7 +335,8 @@ def ensure_token_fresh(api_client) -> dict:
             logger.info("adopted a token refreshed by another instance")
             return {"refreshed": False, "adopted_external_refresh": True,
                     **token_health()}
-        out["refresh_error"] = f"{type(exc).__name__}: {exc}"
+        out["refresh_error"] = (
+            f"{type(exc).__name__}: {redact_sensitive_text(exc)}")
         logger.warning("webull token refresh failed: %s", out["refresh_error"])
         return out
     token = (response or {}).get("token")
@@ -336,12 +378,31 @@ def _sdk_log_level() -> int:
     return getattr(logging, name, logging.INFO)
 
 
-_SECRET_FIELDS = ("x-signature", "x-access-token", "x-app-key", "app_secret",
-                  "app_key_secret", "access_token")
+_SECRET_FIELDS = (
+    "x-signature", "x-access-token", "x-app-key", "app_secret",
+    "app_key_secret", "access_token", "account_id", "webull_account_id",
+    "authorization",
+)
 _SECRET_PATTERN = re.compile(
     r"(?P<label>%s)(?P<sep>\"?\s*[:=]\s*\"?)(?P<value>[^\"',\s}\]]+)"
     % "|".join(re.escape(f) for f in _SECRET_FIELDS), re.IGNORECASE)
 _REDACTED = "<redacted>"
+
+
+def redact_sensitive_text(value) -> str:
+    """Remove credentials/account identity from exceptions and persisted text."""
+    text = str(value)
+    text = _SECRET_PATTERN.sub(
+        lambda m: f"{m.group('label')}{m.group('sep')}{_REDACTED}", text)
+    for name in (
+        "WEBULL_APP_KEY",
+        "WEBULL_APP_SECRET",
+        "WEBULL_ACCOUNT_ID",
+    ):
+        secret = os.environ.get(name, "")
+        if len(secret) >= 4:
+            text = text.replace(secret, _REDACTED)
+    return text
 
 
 class _RedactSecrets(logging.Filter):
@@ -360,8 +421,7 @@ class _RedactSecrets(logging.Filter):
             text = record.getMessage()
         except Exception:                # a broken format string is not our call
             return True
-        redacted = _SECRET_PATTERN.sub(
-            lambda m: f"{m.group('label')}{m.group('sep')}{_REDACTED}", text)
+        redacted = redact_sensitive_text(text)
         if redacted != text:
             record.msg, record.args = redacted, ()
         return True
@@ -586,12 +646,18 @@ def fetch_open_orders(trade_client, symbol: str) -> list[dict]:
                 if isinstance(c, dict) and str(c.get("symbol", "")).upper() == symbol.upper():
                     out.append(c)
         if len(items) < page_size:
-            break
+            return out
         next_cursor = _page_cursor(items)
-        if not next_cursor or next_cursor == cursor:
-            break                        # no usable cursor: stop rather than loop
+        if not next_cursor:
+            raise IncompleteOpenOrdersError(
+                "open-orders page เต็มแต่ไม่มี cursor — ยืนยันรายการทั้งหมดไม่ได้")
+        if next_cursor == cursor:
+            raise IncompleteOpenOrdersError(
+                "open-orders cursor ไม่เดินหน้า — ยืนยันรายการทั้งหมดไม่ได้")
         cursor = next_cursor
-    return out
+    raise IncompleteOpenOrdersError(
+        f"open-orders ยังมีหน้าถัดไปหลังครบ {_open_order_max_pages()} หน้า — "
+        "block order แบบ fail-closed")
 
 
 def _extract_qty(positions, symbol: str) -> float:

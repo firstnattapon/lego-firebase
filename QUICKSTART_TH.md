@@ -135,20 +135,16 @@ printf "%s" "<NEW_VALUE>" | gcloud secrets versions add webull-account-id --data
 
 ## 5) 🔥 ตั้งค่า Firebase Realtime Database Rules
 
-ใน Firebase Console ไปที่ **Realtime Database → Rules** แล้ววาง rules แบบ read-only สำหรับ dashboard:
+rules ตัวจริงถูก track ที่ `database.rules.json` และชี้จาก `firebase.json`
+ให้ deploy ไฟล์นี้แทนการ copy หลายชุดจากเอกสาร:
 
-```json
-{
-  "rules": {
-    "webull_lego_rows": { ".read": true, ".write": false },
-    "webull_lego_state": { ".read": true, ".write": false },
-    "webull_lego_order_audit": { ".read": true, ".write": false },
-    "webull_lego_errors": { ".read": false, ".write": false }
-  }
-}
+```bash
+firebase deploy --only database --project="$PROJECT"
 ```
 
-> 🛡️ ไม่ต้องห่วงว่า Function จะเขียนข้อมูลไม่ได้ — Cloud Function ใช้ Firebase Admin SDK เขียนผ่าน service account ได้อยู่แล้ว rules นี้แค่กันไม่ให้คนนอกมาแก้ข้อมูลของเรา
+public read มีเฉพาะ rows, state, order audit, audit archive และ warnings;
+outbox, outbox archive, realized, errors, root และ path อื่น deny read.
+client write ถูกปิดทั้งหมด ส่วน Cloud Function ใช้ Admin SDK จึงเขียนผ่าน service account ได้
 
 ---
 
@@ -198,7 +194,7 @@ gcloud functions deploy lego-one-row \
 | `LEGO_DNA_CODE` | `bypass:100` | โค้ด DNA (`bypass:N` / `[1, N]` / stream ตัวเลขล้วน) |
 | `LEGO_DECIMAL_PRECISION` | `5` | ทศนิยมของจำนวนสั่ง (0–5) · `0` = สั่งเป็นจำนวนเต็มหุ้น · ต้องเท่ากันทั้ง 2 ฟังก์ชัน (อยู่ใน `config_hash`) |
 | `LEGO_STRATEGY_ID` | `shannon_demon_lego` | ป้ายกำกับกลยุทธ์ (อยู่ใน `config_hash`) |
-| `WEBULL_ENV` | `UAT` | `UAT` = ส่ง order ได้ · อย่างอื่น = Production (read-only) |
+| `WEBULL_ENV` | `UAT` | รับเฉพาะ `UAT`, `PROD`, `PRODUCTION` (case-insensitive) · ค่าอื่น = `CONFIG_ERROR` และไม่ไหลไป Production |
 | `AUTO_SUBMIT` | `false` | `true` = **ขอ**สร้าง order intent อัตโนมัติเมื่อแถวเป็น `READY_*` · ไม่ใช่สวิตช์เดียว — ต้องผ่าน preflight ครบ 8 ข้อก่อน (ดูหัวข้อ 7.6) |
 | `LEGO_AUTO_SUBMIT_MIN_DNA_REMAINING` | `1` | preflight บล็อกการสร้าง intent ใหม่เมื่อ DNA เหลือน้อยกว่านี้ |
 | `WEBULL_TOKEN_DIR` | `/tmp/webull_token` | ที่เก็บ token ของ SDK · ⚠️ `/tmp` หายทุกครั้งที่ instance ถูกรีไซเคิล → SDK จะสร้าง token ใหม่และรอคนกด 2FA ในแอป 300 วิ ถ้าไม่มีคนกด = `ERROR_INIT_TOKEN` · ชี้ไป volume ที่คงอยู่ (เช่น GCS FUSE mount) จะเห็นคำเตือนที่ `webull_lego_warnings/webull_token` จนกว่าจะย้าย |
@@ -225,11 +221,18 @@ gcloud functions deploy lego-one-row \
 |---|---|---|
 | `LEGO_INLINE_ORDER_WORKER` | `false` | `true` = ส่ง order ต่อท้ายการ commit เลย (เพิ่ม latency ให้ฟังก์ชัน DNA — ไม่แนะนำ) |
 | `LEGO_ORDER_WORKER_LIMIT` | `3` | จำนวน intent สูงสุดต่อการเรียก 1 ครั้ง |
+| `LEGO_ORDER_CLAIM_LEASE_SECONDS` | `120` | lease ของ transactional worker claim; generation fence ก่อน `place_order` กัน worker เก่าหลัง lease หมด |
 | `LEGO_ORDER_EXPIRY_MARGIN_SECONDS` | `15` | กันส่ง order คาบเกี่ยว slot ถัดไป |
 | `LEGO_HOLDINGS_DRIFT_TOLERANCE` | `0.000001` | holdings เปลี่ยนเกินนี้ระหว่างรอส่ง = `SUPPRESSED_STATE_CHANGED` |
 | `LEGO_RECONCILE_MAX_ATTEMPTS` | `20` | ถาม broker ซ้ำได้กี่ครั้งก่อนยอมแพ้เป็น `RECONCILE_ABANDONED` (ที่ `*/5` = ~100 นาที) — กัน order ที่ broker ไม่เคยรับ วนถามไม่รู้จบจนเบียด intent ใหม่ทั้งหมด |
 | `LEGO_OPEN_ORDER_PAGE_SIZE` | `50` | `get_order_open` ตอบเป็น "หน้า" (default ของ broker = 10) · การกันส่งซ้ำอ่านจากรายการนี้ ถ้าหน้าเดียวไม่ครบจะมองไม่เห็น order ของเราเอง |
-| `LEGO_OPEN_ORDER_MAX_PAGES` | `5` | เพดานจำนวนหน้าที่ไล่ต่อการตรวจ 1 ครั้ง (order query จำกัด 40/2s) |
+| `LEGO_OPEN_ORDER_MAX_PAGES` | `5` | เพดานจำนวนหน้าที่ไล่ต่อการตรวจ 1 ครั้ง · ชนเพดาน/cursor ไม่ครบ = fail closed คง intent รอและไม่ส่ง order |
+
+> 🔐 state บันทึกเฉพาะ fingerprint ของ account/environment ไม่บันทึก account ID.
+> chain เดิมที่ยังไม่มี fingerprint จะถูก **adopt อัตโนมัติ** ใน commit แรกหลัง deploy
+> (DNA ไม่หยุด ไม่ต้องตั้ง env) แล้วนับที่ `webull_lego_warnings/runtime_identity_adopted`
+> — operator เปิดดู warning นั้นหนึ่งครั้งเพื่อยืนยันว่า account/`WEBULL_ENV` ถูกชุด.
+> ส่วน fingerprint ที่มีแล้วแต่ไม่ตรง = `CONFIG_ERROR` และไม่มีสวิตช์ให้ข้าม
 
 **archive worker** (`lego_archive_worker` — งานบ้าน ยิงวันละครั้งพอ):
 
