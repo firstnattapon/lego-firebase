@@ -28,7 +28,8 @@ from lego_preflight import DEFAULT_MIN_DNA_REMAINING, auto_submit_preflight
 from lego_state import (CalendarDriftError, DNADriftError, OrdinalRegression,
                         SlotAlreadyConsumed, StaleAnchorError, apply_realized_fill,
                         chain_key, commit_final_row, read_anchor,
-                        update_order_audit, write_order_audit)
+                        slot_already_consumed, update_order_audit,
+                        write_order_audit)
 from market_clock import (MarketClockError, clock_mode, fallback_slot_id,
                           is_regular_session, resolve_dna_step, resolve_market_slot,
                           slot_seconds)
@@ -422,6 +423,19 @@ def lego_one_row(request):
                 raise
             effective_step, alignment_error = legacy_step, None
             clock_error = str(exc)
+
+        # Before the broker, for the same reason MARKET_CLOSED is: a slot the
+        # chain has already consumed cannot produce a row no matter what the
+        # snapshot says, so buying one is pure cost. commit_final_row still owns
+        # the decision — this only short-circuits the case its own state already
+        # settled, and it runs the drift guards and the pending-row repair on the
+        # way so the answer is the one it would have given.
+        #
+        # Clock-resolved slots only: a degraded slot_id is derived from
+        # snapshot["captured_at"], so it cannot be known until after the call this
+        # is trying to avoid. That path keeps the guard it always had.
+        if slot is not None and slot_already_consumed(cfg, slot.slot_id):
+            raise SlotAlreadyConsumed(f"slot {slot.slot_id} commit ไปแล้ว")
 
         trade_client, data_client = build_clients()
         # The token dies of old age silently: nothing in the SDK renews it, and

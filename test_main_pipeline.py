@@ -368,3 +368,65 @@ def test_same_dna_code_decoding_differently_fails_closed(monkeypatch):
     assert code == 409 and body["pipeline_status"] == "DNA_DRIFT"
     assert body["committed"] is False
     assert state_ref.get()["version"] == before
+
+
+# ---- the consumed slot must not cost broker calls ---------------------------
+
+def test_a_consumed_slot_answers_before_touching_the_broker(monkeypatch):
+    """The 2026-07-27 waste: a 15-minute slot on a 5-minute scheduler makes two
+    of every three invocations end as SLOT_CONSUMED, and each one used to buy a
+    positions call and a snapshot call first. All ten gateway timeouts that
+    session landed on exactly those ticks."""
+    _run(monkeypatch, SESSION_OPEN_SLOT, 320.0)
+
+    calls = []
+    monkeypatch.setattr(main, "datetime",
+                        _fixed_now(datetime(2026, 7, 23, 18, 12, 41, tzinfo=UTC)))
+    monkeypatch.setattr(main, "build_clients",
+                        lambda: calls.append("build_clients") or (object(), object()))
+    monkeypatch.setattr(main, "fetch_snapshot",
+                        lambda t, d, cfg: calls.append("fetch_snapshot"))
+    body, code = main.lego_one_row(object())
+
+    assert code == 200 and body["pipeline_status"] == "SLOT_CONSUMED"
+    assert body["committed"] is False
+    assert calls == []                        # nothing reached Webull
+
+
+def test_the_short_circuit_answers_exactly_like_the_transaction_did(monkeypatch):
+    """Same body, same note, same code — the response is the contract here."""
+    _run(monkeypatch, SESSION_OPEN_SLOT, 320.0)
+    consumed = datetime(2026, 7, 23, 18, 12, 41, tzinfo=UTC)
+
+    short_circuit, code_a = _run(monkeypatch, consumed, 320.9)
+    # Re-run with the pre-broker guard disabled so commit_final_row's own
+    # transaction is what raises, and compare the two answers.
+    monkeypatch.setattr(main, "slot_already_consumed", lambda cfg, slot_id: False)
+    from_txn, code_b = _run(monkeypatch, consumed, 320.9)
+
+    assert (code_a, code_b) == (200, 200)
+    assert short_circuit == from_txn
+
+
+def test_a_fresh_slot_still_reaches_the_broker(monkeypatch):
+    """The short circuit must not swallow the slot the chain has not consumed."""
+    _run(monkeypatch, SESSION_OPEN_SLOT, 320.0)
+    body, code = _run(monkeypatch, datetime(2026, 7, 23, 18, 30, 5, tzinfo=UTC), 321.0)
+    assert code == 200 and body["committed"] is True
+    assert body["market_slot_id"] == "2026-07-23:10"
+
+
+def test_a_drifted_calendar_still_wins_over_a_consumed_slot(monkeypatch):
+    """The prelude runs inside the short circuit, so drift keeps its 409 instead
+    of being deferred to whichever later tick happens to commit."""
+    _run(monkeypatch, SESSION_OPEN_SLOT, 320.0)
+    state_ref = FAKE_DB.reference(f"{STATE_PATH}/{chain_key(main.load_config())}")
+    state_ref.update({"calendar_fingerprint": "someone-changed-the-slot-grid"})
+
+    calls = []
+    monkeypatch.setattr(main, "build_clients",
+                        lambda: calls.append("build_clients") or (object(), object()))
+    body, code = _run(monkeypatch, datetime(2026, 7, 23, 18, 12, 41, tzinfo=UTC), 320.9)
+
+    assert code == 409 and body["pipeline_status"] == "CALENDAR_DRIFT"
+    assert calls == []

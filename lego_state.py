@@ -128,6 +128,32 @@ def read_anchor(cfg: Config) -> Anchor | None:
     )
 
 
+def slot_already_consumed(cfg: Config, slot_id: str | None) -> bool:
+    """Answer the SLOT_CONSUMED question before anyone pays the broker for it.
+
+    commit_final_row is still the authority — its transaction is the only thing
+    that can decide the race — but it only gets to speak after fetch_snapshot has
+    already spent a positions call and a snapshot call. A 15-minute slot on a
+    5-minute scheduler means two of every three invocations can only ever end as
+    SLOT_CONSUMED, and each one paid full price: in the 2026-07-27 session all
+    ten /openapi/assets/positions gateway timeouts landed on exactly those ticks,
+    turning a 2.5s no-op into 16s of retries.
+
+    This runs the same prelude commit_final_row runs, in the same order, so a
+    short circuit built on it answers identically: a drifted calendar or DNA
+    still raises here rather than being deferred to the next committing tick, and
+    a row left at committed=false is still repaired. Only the broker calls and
+    the row build are skipped, which is what MARKET_CLOSED already does one guard
+    earlier.
+    """
+    state_before = db.reference(f"{STATE_PATH}/{chain_key(cfg)}").get()
+    verify_dna_continuity(cfg, state_before)
+    if slot_id is not None:
+        verify_calendar_continuity(state_before)
+    _repair_pending_row(state_before)
+    return bool(state_before) and state_before.get("slot_id") == slot_id
+
+
 def _repair_pending_row(state: dict | None) -> None:
     if not state:
         return
