@@ -110,9 +110,22 @@ def test_all_client_writes_are_denied(path):
     assert _allowed(path, ".write") is False
 
 
+def _emulator_namespace() -> str:
+    """The instance the emulator actually loaded database.rules.json into.
+
+    The default Realtime Database instance of project X is named
+    'X-default-rtdb', and that is the only namespace firebase.json's rules
+    apply to. Asking for any other namespace does not fail — the emulator
+    creates it on demand with wide-open default rules — so a wrong name here
+    turns the whole matrix below into a test of nothing.
+    """
+    project = os.environ.get("GCLOUD_PROJECT") or "demo-lego-firebase"
+    return f"{project}-default-rtdb"
+
+
 def _emulator_request(path: str, method: str = "GET") -> int:
     host = os.environ["FIREBASE_DATABASE_EMULATOR_HOST"]
-    url = f"http://{host}/{path.strip('/')}.json?ns=demo-lego-firebase"
+    url = f"http://{host}/{path.strip('/')}.json?ns={_emulator_namespace()}"
     request = Request(
         url,
         method=method,
@@ -131,6 +144,13 @@ def _emulator_request(path: str, method: str = "GET") -> int:
     reason="set FIREBASE_DATABASE_EMULATOR_HOST to run the real rules matrix",
 )
 def test_emulator_enforces_anonymous_read_write_matrix():
+    # Canary first: under the shipped rules the root denies anonymous reads. If
+    # this answers 200 the request reached a namespace the rules were never
+    # loaded into, and every allow-assertion below would pass for that reason
+    # rather than because the ruleset says so.
+    assert _emulator_request("") in {401, 403}, (
+        f"namespace {_emulator_namespace()!r} is running default-open rules, "
+        "not database.rules.json")
     for path in PUBLIC_READ_PATHS:
         assert _emulator_request(path) == 200
         assert _emulator_request(f"{path}/record") == 200
