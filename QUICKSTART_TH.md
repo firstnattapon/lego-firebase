@@ -163,16 +163,23 @@ gcloud functions deploy lego-one-row \
   --no-allow-unauthenticated \
   --memory=512Mi \
   --timeout=120s \
-  --set-env-vars="FIREBASE_DB_URL=$DB_URL,WEBULL_ENV=UAT,LEGO_SYMBOL=APLS,LEGO_FIX_C=1500,LEGO_DIFF=60,LEGO_DNA_CODE=bypass:100,LEGO_DECIMAL_PRECISION=5,LEGO_SLOT_SECONDS=1800,LEGO_DNA_ORIGIN_UTC=2026-07-23T13:30:00Z,LEGO_DNA_CLOCK_MODE=market,AUTO_SUBMIT=false" \
+  --set-env-vars="FIREBASE_DB_URL=$DB_URL,WEBULL_ENV=UAT,LEGO_SYMBOL=AAPL,LEGO_FIX_C=3000,LEGO_DIFF=5,LEGO_DNA_CODE=bypass:100,LEGO_DECIMAL_PRECISION=3,LEGO_SLOT_SECONDS=900,LEGO_DNA_ORIGIN_UTC=2026-07-27T13:30:00Z,LEGO_DNA_CLOCK_MODE=market,AUTO_SUBMIT=true" \
   --set-secrets="WEBULL_APP_KEY=webull-app-key:latest,WEBULL_APP_SECRET=webull-app-secret:latest,WEBULL_ACCOUNT_ID=webull-account-id:latest"
 ```
 
-🐣 **มือใหม่เริ่มแบบปลอดภัยไว้ก่อน** ด้วยค่า 2 ตัวนี้:
+🐣 **ตัวกันพลาดตัวจริงคือ `WEBULL_ENV=UAT`** — สนามซ้อม ไม่ยิงเงินจริง
+ตราบใดที่ยังเป็น `UAT` การเปิด `AUTO_SUBMIT=true` มาตั้งแต่ deploy แรกจึงปลอดภัย
+และเป็นวิธีเดียวที่จะเห็นวงจร order ครบจริง (`preflight → outbox → worker → fill →
+finalize ΔAₙ/Aₙ/Eₙ`) ก่อนแตะเงินจริง
 
-- `WEBULL_ENV=UAT` — ใช้สนามซ้อม ไม่ยิงเงินจริง
-- `AUTO_SUBMIT=false` — ยังไม่ส่ง order จริงอัตโนมัติ
+- `WEBULL_ENV=UAT` — สนามซ้อม · `Production` = read-only ส่ง order ไม่ได้เลย
+- `AUTO_SUBMIT=true` — **ขอ**สร้าง order intent เมื่อแถวเป็น `READY_*` เท่านั้น
+  ยังต้องผ่าน `auto_submit_preflight` ครบ 8 ข้อ (หัวข้อ 7.6) ไม่ผ่าน = แถว commit ปกติ
+  แต่ไม่มี intent เกิดขึ้น และ response บอกเหตุผลทุกครั้ง
 
-เมื่อระบบนิ่งและมั่นใจแล้ว ค่อยพิจารณาเปิด production / auto submit ทีหลัง
+ถ้ายังไม่อยากให้มี order intent เลยแม้แต่ใบเดียวระหว่างทดสอบ ตั้ง `AUTO_SUBMIT=false`
+แทนได้ (ค่า default ของโค้ดคือ `false` อยู่แล้ว) แล้วค่อยเปิดทีหลัง
+ส่วนการย้ายไป production เป็นคนละเรื่อง — เปลี่ยน `WEBULL_ENV` เมื่อมั่นใจแล้วเท่านั้น
 
 ### ตาราง env ทั้งหมดที่โค้ดอ่านจริง
 
@@ -181,21 +188,25 @@ gcloud functions deploy lego-one-row \
 | env | ตัวอย่าง | ความหมาย |
 |---|---|---|
 | `FIREBASE_DB_URL` | `https://...firebasedatabase.app` | RTDB ที่จะเขียนแถว |
-| `LEGO_SYMBOL` | `APLS` | สินทรัพย์ที่เทรด |
-| `LEGO_FIX_C` | `1500` | มูลค่าพอร์ตเป้าหมาย (ต้อง > 0) |
-| `LEGO_SLOT_SECONDS` | `1800` | ขนาด slot ต้องตรง timeframe ที่เทรน DNA — รับเฉพาะ `900` (15m), `1800` (30m), `3600` (1h), `14400` (4h), `86400` (1d) · ค่าอื่น = `CONFIG_ERROR` 500 |
+| `LEGO_SYMBOL` | `AAPL` | สินทรัพย์ที่เทรด |
+| `LEGO_FIX_C` | `3000` | มูลค่าพอร์ตเป้าหมาย (ต้อง > 0) |
+| `LEGO_SLOT_SECONDS` | `900` | ขนาด slot ต้องตรง timeframe ที่เทรน DNA — รับเฉพาะ `900` (15m), `1800` (30m), `3600` (1h), `14400` (4h), `86400` (1d) · ค่าอื่น = `CONFIG_ERROR` 500 |
 | `WEBULL_APP_KEY` / `WEBULL_APP_SECRET` / `WEBULL_ACCOUNT_ID` | (secret) | credential ของ Webull OpenAPI |
 
 **ค่าเริ่มต้นมีให้แล้ว** (ตั้งเมื่ออยากเปลี่ยน):
 
+> คอลัมน์ `default` คือค่าที่ **โค้ด** ใช้เมื่อไม่ตั้ง env ไม่ใช่ค่าในคำสั่ง deploy ข้างบน
+> — ตัวอย่างในคู่มือนี้ตั้งทับ 3 ตัว: `LEGO_DIFF=5`, `LEGO_DECIMAL_PRECISION=3`,
+> `AUTO_SUBMIT=true`
+
 | env | default | ความหมาย |
 |---|---|---|
-| `LEGO_DIFF` | `0` | ครึ่งความกว้างแถบ no-trade · `|gap| ≤ DIFF` → `PASS_THRESHOLD` |
-| `LEGO_DNA_CODE` | `bypass:100` | โค้ด DNA (`bypass:N` / `[1, N]` / stream ตัวเลขล้วน) |
-| `LEGO_DECIMAL_PRECISION` | `5` | ทศนิยมของจำนวนสั่ง (0–5) · `0` = สั่งเป็นจำนวนเต็มหุ้น · ต้องเท่ากันทั้ง 2 ฟังก์ชัน (อยู่ใน `config_hash`) |
+| `LEGO_DIFF` | `0` | ครึ่งความกว้างแถบ no-trade · `|gap| ≤ DIFF` → `PASS_THRESHOLD` · ตัวอย่างใช้ `5` = ห่างเป้าไม่ถึง $5 ให้ `PASS_THRESHOLD` |
+| `LEGO_DNA_CODE` | `bypass:100` | โค้ด DNA (`bypass:N` / `[1, N]` / stream ตัวเลขล้วน) · ⚠️ ความยาว DNA คือ**จำนวน slot ที่ chain นี้มีชีวิตอยู่ได้** — ที่ `LEGO_SLOT_SECONDS=900` มี 26 slot ต่อวันทำการ (early close 14) ดังนั้น `bypass:100` หมดใน **~4 วันทำการ** แล้วตอบ `DNA_EXHAUSTED` · ตั้ง `LEGO_DNA_LOW_WATERMARK` ให้เห็นล่วงหน้าและเตรียม DNA ที่ยาวพอ |
+| `LEGO_DECIMAL_PRECISION` | `5` | ทศนิยมของจำนวนสั่ง (0–5) · `0` = สั่งเป็นจำนวนเต็มหุ้น · ตัวอย่างใช้ `3` · ต้องเท่ากันทั้ง 2 ฟังก์ชัน (อยู่ใน `config_hash`) |
 | `LEGO_STRATEGY_ID` | `shannon_demon_lego` | ป้ายกำกับกลยุทธ์ (อยู่ใน `config_hash`) |
 | `WEBULL_ENV` | `UAT` | รับเฉพาะ `UAT`, `PROD`, `PRODUCTION` (case-insensitive) · ค่าอื่น = `CONFIG_ERROR` และไม่ไหลไป Production |
-| `AUTO_SUBMIT` | `false` | `true` = **ขอ**สร้าง order intent อัตโนมัติเมื่อแถวเป็น `READY_*` · ไม่ใช่สวิตช์เดียว — ต้องผ่าน preflight ครบ 8 ข้อก่อน (ดูหัวข้อ 7.6) |
+| `AUTO_SUBMIT` | `false` | `true` = **ขอ**สร้าง order intent อัตโนมัติเมื่อแถวเป็น `READY_*` · ตัวอย่างใช้ `true` (ปลอดภัยเพราะอยู่บน `WEBULL_ENV=UAT`) · ไม่ใช่สวิตช์เดียว — ต้องผ่าน preflight ครบ 8 ข้อก่อน (ดูหัวข้อ 7.6) |
 | `LEGO_AUTO_SUBMIT_MIN_DNA_REMAINING` | `1` | preflight บล็อกการสร้าง intent ใหม่เมื่อ DNA เหลือน้อยกว่านี้ |
 | `WEBULL_TOKEN_DIR` | `/tmp/webull_token` | ที่เก็บ token ของ SDK · ⚠️ `/tmp` หายทุกครั้งที่ instance ถูกรีไซเคิล → SDK จะสร้าง token ใหม่และรอคนกด 2FA ในแอป 300 วิ ถ้าไม่มีคนกด = `ERROR_INIT_TOKEN` · ชี้ไป volume ที่คงอยู่ (เช่น GCS FUSE mount) จะเห็นคำเตือนที่ `webull_lego_warnings/webull_token` จนกว่าจะย้าย |
 | `LEGO_ALLOW_EPHEMERAL_TOKEN_DIR` | `false` | `true` = ยอมรับว่า token dir อยู่บน `/tmp` แล้วให้ preflight `token_ready` ผ่านได้ · จำเป็นเมื่อยัง mount volume ไม่ได้ เพราะ Cloud Functions เขียนได้แค่ `/tmp` → ไม่ตั้งก็ **ไม่มี order intent เกิดขึ้นเลย** · ให้อภัยเฉพาะข้อ "dir ไม่คงอยู่" ข้อเดียว (ไม่พบ token / status ≠ `NORMAL` / ใกล้หมดอายุ ยังบล็อกเหมือนเดิม) และคำเตือน `token_warning` ยังขึ้นทุก slot |
@@ -249,7 +260,9 @@ gcloud functions deploy lego-one-row \
 
 ## 6.0) ⏱️ ตั้ง `LEGO_DNA_ORIGIN_UTC` ตั้งแต่ deploy แรก
 
-คำสั่ง deploy ข้างบนใส่ `LEGO_DNA_ORIGIN_UTC` + `LEGO_DNA_CLOCK_MODE=market` มาให้แล้ว —
+คำสั่ง deploy ข้างบนใส่ `LEGO_DNA_ORIGIN_UTC=2026-07-27T13:30:00Z` +
+`LEGO_DNA_CLOCK_MODE=market` มาให้แล้ว (13:30Z = เวลาเปิดตลาด 09:30 ET ของวันจันทร์ที่
+2026-07-27 → `slot_id 2026-07-27:0`, `market_ordinal 0` บนกริด 15 นาที) —
 **ค่า origin ในตัวอย่างเป็นแค่ตัวอย่าง ต้องหาของตัวเองก่อน** ด้วย
 `python find_origin.py <dna_step ถัดไป>` (อธิบายเต็มที่ข้อ 7.5)
 
@@ -263,7 +276,7 @@ gcloud functions deploy lego-one-row \
 
 ## 6.1) 📮 Deploy function ตัวที่สอง — `lego-order-worker`
 
-> ⚠️ **ข้ามข้อนี้ไม่ได้ถ้าจะเปิด `AUTO_SUBMIT=true`**
+> ⚠️ **ข้ามข้อนี้ไม่ได้** — ตัวอย่างในคู่มือนี้ตั้ง `AUTO_SUBMIT=true` มาแล้ว
 > `lego_one_row` แค่ **จด order intent** ลง outbox แล้วจบ (ตั้งใจ: ถ้าไปรอ broker
 > ฟังก์ชันจะช้าจน scheduler timeout แล้ว retry จนกิน DNA step) ตัวที่ส่ง order จริงคือ
 > `lego_order_worker` — **ไม่ deploy = intent ทุกใบหมดอายุเป็น `EXPIRED_UNSENT` ไม่มี order
@@ -282,7 +295,7 @@ gcloud functions deploy lego-order-worker \
   --no-allow-unauthenticated \
   --memory=512Mi \
   --timeout=300s \
-  --set-env-vars="FIREBASE_DB_URL=$DB_URL,WEBULL_ENV=UAT,LEGO_SYMBOL=APLS,LEGO_FIX_C=1500,LEGO_DIFF=60,LEGO_DNA_CODE=bypass:100,LEGO_DECIMAL_PRECISION=5,LEGO_SLOT_SECONDS=1800,LEGO_DNA_ORIGIN_UTC=2026-07-23T13:30:00Z,LEGO_DNA_CLOCK_MODE=market,AUTO_SUBMIT=false" \
+  --set-env-vars="FIREBASE_DB_URL=$DB_URL,WEBULL_ENV=UAT,LEGO_SYMBOL=AAPL,LEGO_FIX_C=3000,LEGO_DIFF=5,LEGO_DNA_CODE=bypass:100,LEGO_DECIMAL_PRECISION=3,LEGO_SLOT_SECONDS=900,LEGO_DNA_ORIGIN_UTC=2026-07-27T13:30:00Z,LEGO_DNA_CLOCK_MODE=market,AUTO_SUBMIT=true" \
   --set-secrets="WEBULL_APP_KEY=webull-app-key:latest,WEBULL_APP_SECRET=webull-app-secret:latest,WEBULL_ACCOUNT_ID=webull-account-id:latest"
 ```
 
@@ -315,7 +328,7 @@ gcloud functions deploy lego-archive-worker \
   --no-allow-unauthenticated \
   --memory=512Mi \
   --timeout=300s \
-  --set-env-vars="FIREBASE_DB_URL=$DB_URL,WEBULL_ENV=UAT,LEGO_SYMBOL=APLS,LEGO_FIX_C=1500,LEGO_DIFF=60,LEGO_DNA_CODE=bypass:100,LEGO_DECIMAL_PRECISION=5,LEGO_SLOT_SECONDS=1800,LEGO_DNA_ORIGIN_UTC=2026-07-23T13:30:00Z,LEGO_DNA_CLOCK_MODE=market,AUTO_SUBMIT=false" \
+  --set-env-vars="FIREBASE_DB_URL=$DB_URL,WEBULL_ENV=UAT,LEGO_SYMBOL=AAPL,LEGO_FIX_C=3000,LEGO_DIFF=5,LEGO_DNA_CODE=bypass:100,LEGO_DECIMAL_PRECISION=3,LEGO_SLOT_SECONDS=900,LEGO_DNA_ORIGIN_UTC=2026-07-27T13:30:00Z,LEGO_DNA_CLOCK_MODE=market,AUTO_SUBMIT=true" \
   --set-secrets="WEBULL_APP_KEY=webull-app-key:latest,WEBULL_APP_SECRET=webull-app-secret:latest,WEBULL_ACCOUNT_ID=webull-account-id:latest"
 ```
 
@@ -349,12 +362,12 @@ echo "$FUNCTION_URL"
 echo "$FUNCTION_SA"
 ```
 
-สร้าง scheduler ให้เรียก function **ทุก 10 นาที จันทร์–ศุกร์** ในช่วงเวลา UTC ที่ครอบคลุมตลาดสหรัฐฯ:
+สร้าง scheduler ให้เรียก function **ทุก 5 นาที จันทร์–ศุกร์** ในช่วงเวลา UTC ที่ครอบคลุมตลาดสหรัฐฯ:
 
 ```bash
 gcloud scheduler jobs create http lego-tick \
   --location="$REGION" \
-  --schedule="*/10 13-20 * * 1-5" \
+  --schedule="*/5 13-20 * * 1-5" \
   --time-zone="UTC" \
   --max-retry-attempts=0 \
   --uri="$FUNCTION_URL" \
@@ -363,7 +376,7 @@ gcloud scheduler jobs create http lego-tick \
   --oidc-token-audience="$FUNCTION_URL"
 ```
 
-> 📖 **อ่าน schedule ยังไง?** `*/10 13-20 * * 1-5` = ทุก ๆ 10 นาที ในชั่วโมง 13–20 UTC วันจันทร์ถึงศุกร์ (ครอบคลุมเวลาเปิด–ปิดตลาดหุ้นสหรัฐฯ)
+> 📖 **อ่าน schedule ยังไง?** `*/5 13-20 * * 1-5` = ทุก ๆ 5 นาที ในชั่วโมง 13–20 UTC วันจันทร์ถึงศุกร์ (ครอบคลุมเวลาเปิด–ปิดตลาดหุ้นสหรัฐฯ)
 
 ลองทดสอบยิง scheduler ด้วยมือ (ไม่ต้องรอถึงเวลา):
 
@@ -377,10 +390,13 @@ gcloud scheduler jobs run lego-tick --location="$REGION"
 gcloud functions logs read lego-one-row --gen2 --region="$REGION" --limit=50
 ```
 
-> 🧭 **scheduler ยิงถี่กว่า slot ได้ ไม่เสียหาย** — `*/10` กับ `LEGO_SLOT_SECONDS=1800`
+> 🧭 **scheduler ยิงถี่กว่า slot ได้ ไม่เสียหาย** — `*/5` กับ `LEGO_SLOT_SECONDS=900`
 > แปลว่า 3 tick ต่อ 1 slot: tick แรก commit แถว อีก 2 tick ได้ `SLOT_CONSUMED` (200)
 > เพราะ slot guard ตีตกให้ **ห้ามยิงห่างกว่า slot** เด็ดขาด เพราะ slot ที่พลาดไปจะถูกข้าม
 > ถาวร (DNA เดินตามเวลาตลาด ไม่ย้อนกลับไปใช้ signal เก่า)
+>
+> ⚠️ กติกานี้ผูกกับ `LEGO_SLOT_SECONDS` โดยตรง: เปลี่ยนขนาด slot เมื่อไร ต้องแก้ cron
+> ให้ถี่กว่าเสมอ — กริด 15 นาทีกับ `*/20` จะพลาด slot ทิ้งทุกวัน
 
 ### 7.1) scheduler ของ order worker
 
@@ -423,30 +439,34 @@ slot ที่อยู่ก่อนหน้า slot ปัจจุบัน
 ```bash
 # รันในเวลาตลาดเปิด · <N> = DNA step ที่อยากให้ "แถวถัดไป" เป็น
 # chain ใหม่ = 0 · chain เดิมที่ anchor.dna_step = 41 ให้ใส่ 42
-export LEGO_SLOT_SECONDS=1800
+export LEGO_SLOT_SECONDS=900
 python find_origin.py 0
 ```
 
 ผลลัพธ์จะบอกค่าที่ต้อง set ตรง ๆ เช่น:
 
 ```
-LEGO_SLOT_SECONDS = 1800
-slot ปัจจุบัน      = 2026-07-23:9 (เริ่ม 2026-07-23T18:00:00Z)
+LEGO_SLOT_SECONDS = 900
+slot ปัจจุบัน      = 2026-07-27:0 (เริ่ม 2026-07-27T13:30:00Z)
 ตั้งค่าเป็น:
-  LEGO_DNA_ORIGIN_UTC=2026-07-23T18:00:00Z
+  LEGO_DNA_ORIGIN_UTC=2026-07-27T13:30:00Z
   LEGO_DNA_CLOCK_MODE=market
 ```
+
+> กริด 15 นาทีมี **26 slot ต่อวันทำการปกติ** (early close 14) — `2026-07-27:0` คือ slot แรก
+> ของวัน (`market_ordinal 0`), `2026-07-27:25` คือ slot สุดท้าย และ `2026-07-28:0`
+> เดินต่อเป็น `market_ordinal 26` ทันที ไม่นับกลางคืน/เสาร์อาทิตย์/วันหยุด
 
 เอาไป update ทั้งสองฟังก์ชัน (ค่าต้องตรงกัน):
 
 ```bash
 gcloud functions deploy lego-one-row --gen2 --region="$REGION" \
   --source=. --entry-point=lego_one_row \
-  --update-env-vars="LEGO_DNA_ORIGIN_UTC=2026-07-23T18:00:00Z,LEGO_DNA_CLOCK_MODE=market"
+  --update-env-vars="LEGO_DNA_ORIGIN_UTC=2026-07-27T13:30:00Z,LEGO_DNA_CLOCK_MODE=market"
 
 gcloud functions deploy lego-order-worker --gen2 --region="$REGION" \
   --source=. --entry-point=lego_order_worker \
-  --update-env-vars="LEGO_DNA_ORIGIN_UTC=2026-07-23T18:00:00Z,LEGO_DNA_CLOCK_MODE=market"
+  --update-env-vars="LEGO_DNA_ORIGIN_UTC=2026-07-27T13:30:00Z,LEGO_DNA_CLOCK_MODE=market"
 ```
 
 > เขียนแยกสองคำสั่งเพราะ `--entry-point` ของสองฟังก์ชันไม่เหมือนกัน — ระบุให้ชัดทุกครั้ง
@@ -498,7 +518,10 @@ gcloud functions deploy lego-order-worker --gen2 --region="$REGION" \
 3. ยิง 1 slot แล้วยืนยันว่า response มี `market_slot_id`, `market_step` และ `clock_mode` ไม่มีคำว่า `degraded`
 4. ตัดสินใจเรื่อง DNA (ต่ออายุ / ใส่ champion จริง) ให้เหลือ headroom พอ
 5. ตั้ง alert บน `webull_lego_warnings/auto_submit_blocked` และ `.../webull_token`
-6. ค่อยตั้ง `AUTO_SUBMIT=true` แล้วเฝ้า slot แรกด้วยตา
+6. เฝ้า slot แรกที่ได้ `READY_*` ด้วยตา — ตัวอย่างในคู่มือนี้ตั้ง `AUTO_SUBMIT=true`
+   มาตั้งแต่ deploy แรกแล้ว ดังนั้นข้อ 1–5 คือสิ่งที่ตัดสินว่ามี intent ออกจริงหรือไม่
+   ไม่ใช่ตัวสวิตช์ · ถ้าอยากปิดสนิทระหว่างไล่ข้อ 1–5 ให้ตั้ง `AUTO_SUBMIT=false` ก่อน
+   แล้วเปลี่ยนกลับเป็น `true` เมื่อพร้อม (ไม่กระทบ `config_hash` — ไม่ใช่ chain ใหม่)
 
 > [!IMPORTANT]
 > preflight เป็น fail-closed: อ่านค่าไหนไม่ได้ หรือตัว preflight เองพัง ก็นับเป็น "ไม่ผ่าน"
@@ -530,7 +553,7 @@ FIREBASE_SA_JSON = '{"type":"service_account", "project_id":"lego-firebase", "pr
 
 พอทุกอย่างต่อกันครบ ระบบจะวิ่งเองแบบนี้:
 
-1. ⏰ Cloud Scheduler ยิงตามเวลา (ทุก 10 นาที)
+1. ⏰ Cloud Scheduler ยิงตามเวลา (ทุก 5 นาที)
 2. ⚙️ Cloud Function รัน `lego_one_row`
 3. 🔥 Function อ่าน snapshot / คำนวณ row / commit ลง Firebase RTDB
 4. 📊 Streamlit dashboard อ่าน path ต่อไปนี้จาก Firebase:
@@ -800,7 +823,7 @@ gcloud functions deploy lego-one-row \
   --no-allow-unauthenticated \
   --memory=512Mi \
   --timeout=120s \
-  --set-env-vars="FIREBASE_DB_URL=$DB_URL,WEBULL_ENV=UAT,LEGO_SYMBOL=APLS,LEGO_FIX_C=1500,LEGO_DIFF=60,LEGO_DNA_CODE=bypass:100,LEGO_DECIMAL_PRECISION=5,LEGO_SLOT_SECONDS=1800,LEGO_DNA_ORIGIN_UTC=2026-07-23T13:30:00Z,LEGO_DNA_CLOCK_MODE=market,AUTO_SUBMIT=false" \
+  --set-env-vars="FIREBASE_DB_URL=$DB_URL,WEBULL_ENV=UAT,LEGO_SYMBOL=AAPL,LEGO_FIX_C=3000,LEGO_DIFF=5,LEGO_DNA_CODE=bypass:100,LEGO_DECIMAL_PRECISION=3,LEGO_SLOT_SECONDS=900,LEGO_DNA_ORIGIN_UTC=2026-07-27T13:30:00Z,LEGO_DNA_CLOCK_MODE=market,AUTO_SUBMIT=true" \
   --set-secrets="WEBULL_APP_KEY=webull-app-key:latest,WEBULL_APP_SECRET=webull-app-secret:latest,WEBULL_ACCOUNT_ID=webull-account-id:latest"
 ```
 
