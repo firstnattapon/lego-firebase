@@ -22,11 +22,24 @@ ROWS_PATH = "webull_lego_rows"
 STATE_PATH = "webull_lego_state"
 AUDIT_PATH = "webull_lego_order_audit"
 REALIZED_PATH = "webull_lego_realized"
-# Bumped from gated_theoretical_v2: under that name a READY_* decision advanced
-# Aₙ by itself, so an Aₙ written then and an Aₙ written now do not mean the same
-# thing and must not be chained. read_anchor restarts the cashflow baseline of a
-# chain carrying the old name, exactly as it does for any other semantics change.
-CASHFLOW_SEMANTICS = "execution_confirmed_v1"
+# Every cashflow accounting this chain family has ever written, oldest first.
+# The order is the whole point: each name means a different thing by "Aₙ", so a
+# chain may be carried *forward* through this list — read_anchor restarts its
+# baseline at the boundary — but never backwards.
+#
+# Backwards is not hypothetical. A revision that predates the split books a
+# decision (or, further back, every row) as an act, and Cloud Run keeps an old
+# revision serving until something takes its traffic away. Pointed at a chain
+# that has already moved to execution-confirmed accounting, it writes ΔAₙ on
+# PASS rows and drags P_acted forward with them, and every guard in this module
+# lets it: the version increments, the slot is fresh, the calendar and the DNA
+# still match. Only the semantics name disagrees, so that name is the fence.
+CASHFLOW_SEMANTICS_HISTORY = (
+    "cycle_realized_v1",        # ΔAₙ from FIFO-matched broker cycles
+    "gated_theoretical_v2",     # a READY_* decision advanced Aₙ by itself
+    "execution_confirmed_v1",   # only a broker-confirmed fill advances Aₙ
+)
+CASHFLOW_SEMANTICS = CASHFLOW_SEMANTICS_HISTORY[-1]
 
 # Execution cashflow state, owned by lego_order_worker and nested under its own
 # key so the decision pointer (version, dna_step, p0, slot_id, market_ordinal)
@@ -80,6 +93,14 @@ class RuntimeIdentityError(RuntimeError):
 
 class RuntimeIdentityMismatch(RuntimeIdentityError):
     """The chain was created under another opaque runtime identity."""
+
+
+class CashflowSemanticsDowngrade(RuntimeError):
+    """An older cashflow accounting tried to write a chain that moved past it.
+
+    Same family as CalendarDriftError and DNADriftError — an input the chain was
+    built on changed underneath it — except the input here is the running code.
+    """
 
 
 class ExecutionFinalizeError(RuntimeError):
@@ -173,6 +194,49 @@ def verify_dna_continuity(cfg: Config, state: dict | None) -> None:
             f"dna_code เดิมแต่ decode ได้ gate array คนละชุด: {stored} -> "
             f"{dna_fingerprint(cfg.dna_code)} (มักเกิดจาก numpy เปลี่ยนเวอร์ชัน) "
             "— chain นี้จะกลายเป็นคนละกลยุทธ์ ต้องคืน numpy เดิมหรือเริ่ม chain ใหม่")
+
+
+def cashflow_semantics_rank(name: str | None) -> int | None:
+    """Position of *name* in CASHFLOW_SEMANTICS_HISTORY, or None if unknown."""
+    if not name:
+        return None
+    try:
+        return CASHFLOW_SEMANTICS_HISTORY.index(str(name))
+    except ValueError:
+        return None
+
+
+def verify_cashflow_semantics(state: dict | None) -> str | None:
+    """Fail closed when older accounting tries to write a newer chain.
+
+    Returns the name being migrated *from* when this runtime is legitimately
+    ahead of the chain, so the caller can say the baseline reset out loud once —
+    read_anchor drops Aₙ to zero at that boundary, and a silent reset looks
+    exactly like the corruption this guard exists to stop. Returns None when
+    there is nothing to report: an absent state, a chain written before the
+    field existed, or a chain already on this runtime's semantics.
+
+    An unrecognised name is refused rather than adopted. It can only come from
+    code this deployment does not have, and guessing which side of the split it
+    sits on is precisely the guess that produces an unexplainable ledger.
+    """
+    if not state:
+        return None
+    stored = state.get("cashflow_semantics")
+    if not stored or str(stored) == CASHFLOW_SEMANTICS:
+        return None
+    stored_rank = cashflow_semantics_rank(stored)
+    if stored_rank is None:
+        raise CashflowSemanticsDowngrade(
+            f"chain ใช้ cashflow semantics '{stored}' ที่ deployment นี้ไม่รู้จัก "
+            f"(รู้จัก: {', '.join(CASHFLOW_SEMANTICS_HISTORY)}) — "
+            "อาจมี revision อื่นเขียน RTDB อยู่ ต้องตรวจ deployment ก่อน")
+    if stored_rank > cashflow_semantics_rank(CASHFLOW_SEMANTICS):
+        raise CashflowSemanticsDowngrade(
+            f"chain เดินไปถึง '{stored}' แล้ว แต่ runtime นี้เป็น "
+            f"'{CASHFLOW_SEMANTICS}' ซึ่งเก่ากว่า — revision เก่าห้ามเขียนทับ "
+            "ledger ที่ใหม่กว่า (ตรวจว่า revision ไหนยังรับ traffic อยู่)")
+    return str(stored)
 
 
 class _Unread:
@@ -284,6 +348,7 @@ def commit_final_row(cfg: Config, snapshot: dict, anchor: Anchor | None, row: di
     state_before = state_ref.get()
     verify_runtime_identity(state_before, runtime_identity)
     verify_dna_continuity(cfg, state_before)
+    migrated_from = verify_cashflow_semantics(state_before)
     if slot_id is not None:
         verify_calendar_continuity(state_before)
     _repair_pending_row(state_before)
@@ -317,6 +382,10 @@ def commit_final_row(cfg: Config, snapshot: dict, anchor: Anchor | None, row: di
     def txn(current):
         current = current or None
         verify_runtime_identity(current, runtime_identity)
+        # Re-checked inside the transaction, not only above: the write this
+        # fences against is another revision's, and it can land between the read
+        # at the top of this function and the moment this transaction runs.
+        verify_cashflow_semantics(current)
         if current is None:
             if anchor_version is not None:
                 raise StaleAnchorError("state ว่างแต่ anchor ไม่ใช่ genesis")
@@ -403,13 +472,20 @@ def commit_final_row(cfg: Config, snapshot: dict, anchor: Anchor | None, row: di
         row_ref.update({"committed": True})
         return {"committed": False, "idempotent": True,
                 "run_id": run_id, "version": expected_version}
-    except (StaleAnchorError, SlotAlreadyConsumed, OrdinalRegression):
+    except (StaleAnchorError, SlotAlreadyConsumed, OrdinalRegression,
+            CashflowSemanticsDowngrade):
         row_ref.delete()
         raise
 
     row_ref.update({"committed": True})
-    return {"committed": True, "run_id": run_id, "version": expected_version,
-            "market_slot_id": slot_id, "market_ordinal": market_ordinal}
+    result = {"committed": True, "run_id": run_id, "version": expected_version,
+              "market_slot_id": slot_id, "market_ordinal": market_ordinal}
+    if migrated_from is not None:
+        # read_anchor has already restarted Aₙ at zero for this commit. Saying so
+        # is the point: a baseline reset and a corrupted ledger look identical in
+        # the 17 columns, and only one of them is supposed to happen.
+        result["cashflow_semantics_migrated_from"] = migrated_from
+    return result
 
 
 def _utc_stamp() -> str:
@@ -472,6 +548,10 @@ def finalize_execution_fill(cfg: Config, run_id: str, fill: ExecutionFill, *,
                 "ไม่พบ chain state — finalize fill ไม่ได้")
         state = dict(current)
         verify_runtime_identity(state, runtime_identity)
+        # A fill is the one write that is *supposed* to move Aₙ, which makes it
+        # the worst one to let an out-of-date accounting perform: it would chain
+        # a new ΔAₙ onto an Aₙ that means something else.
+        verify_cashflow_semantics(state)
         cashflow = dict(state.get(EXECUTION_STATE_KEY) or {})
         if cashflow.get("last_action_price") is None:
             cashflow.update(execution_cashflow(state))

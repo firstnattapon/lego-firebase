@@ -430,13 +430,21 @@ def test_blocked_rows_keep_the_same_ledger(monkeypatch, auto_submit):
 
 def test_healthy_response_shape_is_unchanged(monkeypatch, auto_submit):
     """Case 14 — output. A passing slot answers with exactly the keys it always
-    did; the new fields appear only when something is blocked."""
+    did, plus cashflow_semantics; the rest appear only when something is blocked.
+
+    cashflow_semantics is unconditional on purpose. Identifying which revision
+    produced a row previously meant reading Cloud Run, and a stale revision that
+    still books a PASS row as an act answers 200 with a healthy-looking body —
+    the exact shape this test asserts. Naming the accounting in that body is what
+    makes runtime and repository comparable from the caller's side.
+    """
     body, code = _run(monkeypatch, SLOT_0, 320.0)
     assert code == 200
     assert set(body) == {
         "status", "committed", "idempotent", "run_id", "version", "step", "signal",
         "model_acted", "pipeline_status", "clock_mode", "legacy_step", "market_step",
-        "alignment_error", "market_slot_id"}
+        "alignment_error", "market_slot_id", "cashflow_semantics"}
+    assert body["cashflow_semantics"] == "execution_confirmed_v1"
 
 
 def test_low_watermark_notice_survived_the_refactor(monkeypatch, auto_submit):
