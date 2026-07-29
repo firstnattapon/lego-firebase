@@ -10,6 +10,7 @@ lego_archive_worker: move finished order records out of the live paths.
 """
 from __future__ import annotations
 
+import logging
 import os
 import time
 import traceback
@@ -52,6 +53,8 @@ from webull_io import (IncompleteOpenOrdersError, build_clients,
                         market_category, place_market_order,
                         preview_market_order, redact_sensitive_text,
                         runtime_identity_fingerprint, token_health)
+
+logger = logging.getLogger(__name__)
 
 ORDER_POLL_ATTEMPTS = 3
 ORDER_POLL_DELAY_S = 2.0
@@ -126,7 +129,16 @@ def _record_warning(kind: str, message: str, extra: dict | None = None) -> None:
     time would recreate the unbounded path this system is already trimming.
     Never raises — a warning that breaks the run it is warning about is worse
     than no warning.
+
+    Also emitted to the log, because RTDB was the only place it went. A blocked
+    order left three traces and an operator could reach none of them: the
+    response body, which Cloud Scheduler discards; a single counter node nobody
+    watches; and nothing at all in Cloud Logging, where the run showed HTTP 200
+    in 0.3s. Diagnosing this took a CSV export of the row table. One log line per
+    warning ends that — `kind` is greppable and `extra` carries blocked_by.
     """
+    logger.warning("lego warning kind=%s %s %s", kind, message,
+                   redact_sensitive_text(extra) if extra else "")
     try:
         ref = db.reference(f"{WARNINGS_PATH}/{kind}")
         now = _iso(datetime.now(UTC))
@@ -703,14 +715,25 @@ def _run_order_worker(cfg, limit: int = 3,
         verify_runtime_identity(state, runtime_identity), runtime_identity)
     _recover_pending_order_intents(cfg, runtime_identity, state=state)
     _repair_pending_audits(ck)
-    trade_client, data_client = build_clients()
-    expire_unsent_before(ck, datetime.now(UTC))
+    expired = expire_unsent_before(ck, datetime.now(UTC))
     results = []
     worker_id = uuid.uuid4().hex
     candidates = list_actionable(ck, limit=limit)
     if candidates and not state_verified:
         raise RuntimeIdentityError(
             "พบ outbox แต่ไม่พบ chain state สำหรับยืนยัน account/environment")
+    if not candidates:
+        # Nothing to dispatch, and saying so is the point: an idle tick and a
+        # broken tick both answered HTTP 200 in 0.3s with an empty body, which is
+        # what hid an outbox that never received a single intent. Building the
+        # clients here would also have cost four auth calls — two config plus two
+        # create_token, against a 10-per-30s cap shared with lego_one_row — to
+        # authenticate for work that does not exist.
+        logger.info("lego_order_worker actionable=0 expired_unsent=%d "
+                    "chain_key=%s — no order intent to dispatch", expired, ck)
+        return {"processed": 0, "actionable": 0, "expired_unsent": expired,
+                "results": []}
+    trade_client, data_client = build_clients()
     for intent in candidates:
         claimed = claim_intent(ck, intent["run_id"], worker_id)
         if claimed is None:
@@ -726,7 +749,11 @@ def _run_order_worker(cfg, limit: int = 3,
                 _dispatch_or_reconcile_one(trade_client, data_client, cfg, claimed))
         finally:
             release_intent_claim(ck, intent["run_id"], worker_id)
-    return {"processed": len(results), "results": results}
+    logger.info("lego_order_worker actionable=%d processed=%d expired_unsent=%d "
+                "statuses=%s", len(candidates), len(results), expired,
+                [r.get("status") for r in results])
+    return {"processed": len(results), "actionable": len(candidates),
+            "expired_unsent": expired, "results": results}
 
 
 @functions_framework.http
@@ -802,6 +829,13 @@ def lego_one_row(request):
                 if k in ("token_dir", "ephemeral_token_dir", "status",
                          "expires_at", "days_left") and v is not None})
         snapshot = fetch_snapshot(trade_client, data_client, cfg)
+        # Reaching this line is live proof that the token can sign a trade
+        # request: fetch_snapshot goes through account_v2.get_account_position on
+        # the very same authenticated ApiClient that place_order will use, and any
+        # auth failure would have left this block by exception instead. Recorded
+        # here, next to the call that earns it, so a later reordering cannot leave
+        # the claim standing without the evidence behind it.
+        token_proved_live = True
         # Before the row exists: a snapshot that lost the position would make
         # gap = fix_c, the largest order possible, and committing it would also
         # write prev_holdings = 0 and disarm this check for every commit after.
@@ -833,7 +867,8 @@ def lego_one_row(request):
             preflight = auto_submit_preflight(
                 auto_submit=auto, environment=env, row=row, row_durable=True,
                 slot=slot, token=health, dna_remaining=remaining,
-                min_dna_remaining=_min_dna_remaining())
+                min_dna_remaining=_min_dna_remaining(),
+                token_proved_live=token_proved_live)
             if preflight["ok"]:
                 pending_intent = _outbox_intent(
                     cfg, row, snapshot, slot, decision_time)
@@ -908,6 +943,20 @@ def lego_one_row(request):
         # it has always had.
         if remaining <= int(os.environ.get("LEGO_DNA_LOW_WATERMARK", "10")):
             out["dna_steps_remaining"] = remaining
+
+        # One line per slot in Cloud Logging. The response body says all of this
+        # already, but nothing reads it: the caller is Cloud Scheduler, which
+        # keeps the status code and throws the body away. Without this a chain
+        # deciding READY_SELL every slot and sending nothing looks exactly like a
+        # chain trading normally — 200, no error, no output.
+        logger.info(
+            "lego_one_row slot=%s step=%s status=%s committed=%s "
+            "order_intent=%s blocked_by=%s",
+            out.get("market_slot_id"), row["DNA step"], row["สถานะ"],
+            result["committed"],
+            "created" if (preflight and preflight["ok"] and not outbox_error)
+            else "none",
+            (preflight or {}).get("blocked_by") or [])
 
         # Off by default: dispatching inline adds broker latency to the DNA
         # invocation, which raises the odds of a scheduler timeout+retry.

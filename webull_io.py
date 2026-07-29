@@ -244,6 +244,14 @@ def token_health(now: datetime | None = None) -> dict:
     LEGO_ALLOW_EPHEMERAL_TOKEN_DIR accepts it. Every other reason still closes
     both. With the flag unset the two are always equal, which is why `ok`,
     `reasons` and the warning text are byte-for-byte what they were.
+
+    `durability_risk_only` names the third state the first two could not express:
+    blocked, but only by reasons about the *next* container — not one word about
+    the token in hand. It is what lets a caller holding independent proof that
+    this token just signed a request (lego_preflight's `token_proved_live`) tell
+    "the token is unusable" apart from "the token works and its directory will
+    not survive a recycle". False whenever any reason is about signing now, so it
+    can never forgive a missing, rejected or expiring token.
     """
     now = now or datetime.now(timezone.utc)
     info = {
@@ -255,30 +263,47 @@ def token_health(now: datetime | None = None) -> dict:
         "days_left": None,
         "ok": True,
         "ready": True,
+        "durability_risk_only": False,
         "reasons": [],
     }
+    durability_reasons: list[str] = []
 
-    def fail(reason: str, *, blocks_now: bool = True) -> None:
-        """Record a reason; `blocks_now` False marks it durability-only."""
+    def fail(reason: str, *, blocks_now: bool = True,
+             durability_only: bool = False) -> None:
+        """Record a reason.
+
+        `blocks_now` False marks it as already forgiven for `ready`.
+        `durability_only` marks it as saying nothing about whether the token in
+        hand can sign a request — the two are independent, because the operator
+        flag decides the first and the nature of the reason decides the second.
+        """
         info["ok"] = False
         if blocks_now:
             info["ready"] = False
+        if durability_only:
+            durability_reasons.append(reason)
         info["reasons"].append(reason)
+
+    def seal() -> dict:
+        info["durability_risk_only"] = bool(info["reasons"]) and (
+            len(durability_reasons) == len(info["reasons"]))
+        return info
 
     if info["ephemeral_token_dir"]:
         fail(f"token dir {token_dir()} อยู่บน storage ที่หายเมื่อ instance ถูกรีไซเคิล — "
              "ตั้ง WEBULL_TOKEN_DIR ไปยัง volume ที่คงอยู่ (เช่น GCS FUSE mount)",
-             blocks_now=not ephemeral_token_dir_accepted())
+             blocks_now=not ephemeral_token_dir_accepted(),
+             durability_only=True)
     local = read_local_token()
     if local is None:
         fail(f"ไม่พบ token file ที่ {token_file_path()} — ครั้งถัดไปจะต้องยืนยัน 2FA ใหม่")
-        return info
+        return seal()
     info["found"] = True
     info["status"] = local["status"] or None
     expires_at = local["expires_at"]
     if expires_at is None:
         fail("token file ไม่มีวันหมดอายุที่อ่านได้")
-        return info
+        return seal()
     days_left = (expires_at - now).total_seconds() / 86400.0
     info["expires_at"] = expires_at.strftime("%Y-%m-%dT%H:%M:%SZ")
     info["days_left"] = round(days_left, 3)
@@ -286,7 +311,7 @@ def token_health(now: datetime | None = None) -> dict:
         fail(f"token status={local['status']} (ต้องเป็น NORMAL)")
     if days_left <= _refresh_margin_days():
         fail(f"token เหลืออีก {days_left:.2f} วันก่อนหมดอายุ")
-    return info
+    return seal()
 
 
 def ensure_token_fresh(api_client) -> dict:
