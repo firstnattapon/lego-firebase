@@ -93,12 +93,17 @@ def _int_or_none(value):
 
 def evaluate_auto_submit_preflight(*, auto_submit, environment, row, row_durable,
                                    slot, token, dna_remaining,
-                                   min_dna_remaining: int = DEFAULT_MIN_DNA_REMAINING) -> dict:
+                                   min_dna_remaining: int = DEFAULT_MIN_DNA_REMAINING,
+                                   token_proved_live: bool = False) -> dict:
     """Every condition that must hold before a committed row may become an order.
 
     Returns a report; raises nothing the caller has to handle. `ok` is True only
     when every applicable check passed, so a report that could not be built at
     all still reads as blocked.
+
+    `token_proved_live` is the caller's evidence that this same token already
+    signed an authenticated broker request in this invocation. Default False, so
+    a caller that has no such evidence keeps the strict reading.
     """
     checks: list[dict] = []
 
@@ -157,6 +162,20 @@ def evaluate_auto_submit_preflight(*, auto_submit, environment, row, row_durable
     if not isinstance(token_reasons, (list, tuple)):
         token_reasons = [str(token_reasons)]
     token_usable = token["ready"] if "ready" in token else token.get("ok")
+    # ...and `ready` alone was still unsatisfiable in practice, because the flag
+    # that relaxes it is off by default while /tmp is the only writable path
+    # Cloud Functions offers. That left the deployed default in exactly the state
+    # this gate exists to prevent: every slot committing READY_SELL with the
+    # order blocked on a token that had just authenticated two calls in the same
+    # invocation. So a durability-only verdict yields to live proof — the caller
+    # says the token signed a real broker request moments ago, which answers this
+    # check's question directly and better than any local file inspection can.
+    # Deliberately narrow: `durability_risk_only` is False the moment any reason
+    # is about signing now, so a missing, rejected or expiring token still
+    # blocks no matter what the caller proved.
+    if (token_usable is not True and token_proved_live is True
+            and token.get("durability_risk_only") is True):
+        token_usable = True
     checks.append(_check(
         "token_ready", token_usable is True,
         "token ยังไม่พร้อม: " + ("; ".join(str(r) for r in token_reasons)
