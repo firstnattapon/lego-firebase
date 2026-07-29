@@ -18,6 +18,7 @@ Stack: **Scheduler (เวลา) → Cloud Function (engine) → RTDB (data) �
 | `lego_archive.py` | ย้าย intent/audit ที่ terminal แล้วไป `*_archive` (ไม่ลบ) ให้ path ที่ scan โตตามงานที่ยังค้างเท่านั้น |
 | `webull_io.py` | adapter ของ Webull OpenAPI (snapshot, position, preview/place/detail) |
 | `find_origin.py` | เครื่องมือหา `LEGO_DNA_ORIGIN_UTC` ก่อนเปิด clock mode `market` |
+| `lego_cashflow_audit.py` | ตรวจแถวที่ commit ไปแล้วเทียบกฎ `execution_confirmed_v1` — **อ่านอย่างเดียว ไม่แก้ RTDB** |
 
 ```
 PROJECT=your-gcp-project
@@ -212,6 +213,7 @@ gcloud scheduler jobs run lego-tick --location=$REGION --project=$PROJECT
 | `ORDINAL_REGRESSION` | 409 | slot ใหม่ให้ ordinal ที่ไม่เดินหน้า — DNA เดินถอยไม่ได้ |
 | `HOLDINGS_ANOMALY` | 409 | chain เคยเห็นของ แต่ snapshot อ่านได้ 0 — ไม่ commit ไม่ยิง order |
 | `DNA_DRIFT` | 409 | `dna_code` เดิมแต่ decode ได้ gate array คนละชุด (มักคือ numpy เปลี่ยนเวอร์ชัน) |
+| `CASHFLOW_SEMANTICS_DOWNGRADE` | 409 | chain เดินไปถึง cashflow semantics ที่ใหม่กว่า runtime นี้ หรือชื่อที่ deployment นี้ไม่รู้จัก — เกือบทั้งหมดคือ **revision เก่ายังรับ traffic อยู่** |
 | `DNA_EXHAUSTED` | 200 | DNA เดินจนหมด array (`bypass:100` ที่ slot 30m ≈ 8 วันทำการ) — เป็นจุดจบที่คาดไว้ ไม่ใช่ระบบพัง ต้องต่อ DNA ใหม่หรือหยุด scheduler |
 | `CONFIG_ERROR` | 500 | config ไม่ปลอดภัย/ไม่รองรับ เช่น slot, `WEBULL_ENV`, account หรือ runtime identity |
 | `SNAPSHOT_OR_ENGINE_ERROR` | 500/503 | 503 เมื่อเป็น transient |
@@ -225,6 +227,18 @@ field เตือนที่จะโผล่ใน response ของแถ�
 | `outbox_error` | materialize intent ไม่สำเร็จ (แถว commit แล้ว ไม่ rollback; state เก็บ recovery marker และ worker จะลองซ้ำ) |
 | `clock_warning` | market clock resolve ไม่ได้ จึงเดินด้วย legacy step |
 | `dna_steps_remaining` | DNA เหลือน้อยกว่า `LEGO_DNA_LOW_WATERMARK` (default 10) แล้ว |
+
+## 🔎 ตรวจแถวเก่าว่า ledger ถูกต้องไหม (read-only)
+
+```bash
+python lego_cashflow_audit.py rows.csv 3000          # csv export จาก dashboard
+python lego_cashflow_audit.py rows.csv 3000 340.08   # chain ที่ตัดหน้ามา: ระบุ P₀
+```
+
+ตรวจทีละแถวทีละคอลัมน์: `ΔAₙ/Aₙ/Eₙ` ขยับได้เฉพาะแถวที่มีหลักฐาน fill จาก broker
+(`cashflow_status = FINALIZED` หรือ `execution_quantity > 0`) ส่วน `Rₙ` ต้องวิ่งตามราคา
+ทุกแถว · exit code `1` เมื่อพบแถวผิด · **ไม่เขียน RTDB เลย** — แถวเก่าที่ผิดคือหลักฐาน
+การซ่อมต้องเป็น migration ที่ตรวจสอบและย้อนกลับได้ ไม่ใช่ job ที่ลบร่องรอยเงียบ ๆ
 
 ## ✅ ตรวจ invariant หลัง deploy
 1. ทุกแถวผ่าน `validate_row_columns` (17 คอลัมน์)
@@ -257,6 +271,10 @@ field เตือนที่จะโผล่ใน response ของแถ�
     ก่อน `place_order`; lease หมดอายุไม่ทำให้ worker เก่าวิ่งข้าม fence
 18. open-order pagination ต้องพิสูจน์ว่าครบทุกหน้า; cursor หาย/ไม่เดิน/ชนเพดาน =
     คง `PENDING_DISPATCH` และไม่ส่ง order
+19. `cashflow_semantics` ของ chain ต้องเดินหน้าเท่านั้น — revision ที่นับ "การตัดสินใจ"
+    เป็น act ห้ามเขียน chain ที่ย้ายมาใช้ `execution_confirmed_v1` แล้ว (`CASHFLOW_SEMANTICS_DOWNGRADE`)
+    และการย้ายไปข้างหน้า (baseline `Aₙ` รีเซ็ตเป็น 0) ต้องมีคำเตือนเสมอ ห้ามเงียบ —
+    เทียบ `cashflow_semantics` ใน response กับ `CASHFLOW_SEMANTICS` ใน repo คือวิธีจับ revision ค้าง
 19. fill ที่ยืนยันแล้วแต่ไม่มี quantity/price ต้องจบ `REALIZED_MATH_ERROR` +
     `needs_manual_check`; ห้ามปิดเป็น `FILLED` แบบ ledger ไม่ครบ
 20. audit ที่เขียนไม่สำเร็จต้องมี `audit_pending` ใน private outbox และถูกซ่อมก่อน archive

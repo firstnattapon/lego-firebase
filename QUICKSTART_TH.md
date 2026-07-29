@@ -629,6 +629,7 @@ gcloud functions logs read lego-one-row --gen2 --region="$REGION" --limit=100 \
 | `ORDINAL_REGRESSION` | slot ให้ ordinal ที่ไม่เดินหน้า | ตรวจ origin/เวลาเครื่อง — DNA เดินถอยไม่ได้ |
 | `HOLDINGS_ANOMALY` | chain เคยเห็นของ แต่ snapshot อ่านได้ 0 | เช็คที่ broker ว่ายังถืออยู่ไหม · ถ้าถืออยู่จริง = positions response ไม่ครบ รอรอบหน้า · ถ้าขายทิ้งไปจริง ตั้ง `LEGO_ALLOW_ZERO_HOLDINGS=true` 1 รอบแล้วเอาออก |
 | `DNA_DRIFT` | `dna_code` เดิม แต่ decode ได้ gate array คนละชุด | เกือบทั้งหมดคือ **numpy เปลี่ยนเวอร์ชัน** — คืน numpy ตัวที่ pin ไว้ใน `requirements.txt` หรือเริ่ม chain ใหม่ ห้ามปล่อยผ่าน (= เทรดคนละกลยุทธ์ใต้ชื่อเดิม) |
+| `CASHFLOW_SEMANTICS_DOWNGRADE` | chain เดินไปถึง cashflow semantics ที่ใหม่กว่า runtime ที่ตอบ (หรือชื่อที่ deployment นี้ไม่รู้จัก) | เกือบทั้งหมดคือ **Cloud Run revision เก่ายังรับ traffic อยู่** — เทียบ `cashflow_semantics` ใน response กับ `CASHFLOW_SEMANTICS` ใน `lego_state.py` ของ main, ตรวจว่า scheduler ยิงไป URL ของ revision ไหน แล้วย้าย traffic ไป revision ล่าสุด · ห้ามแก้ด้วยการเปลี่ยนชื่อ semantics ใน state |
 | `DNA_EXHAUSTED` | DNA เดินจนหมด array แล้ว (HTTP 200 ไม่ใช่ error) | ต่อ DNA ที่ยาวกว่าเดิม (= chain ใหม่ เพราะ `config_hash` เปลี่ยน) หรือหยุด scheduler ของ chain นี้ · ป้องกันล่วงหน้าด้วย `dna_steps_remaining` ที่ response แนบมาเมื่อใกล้หมด |
 
 field เตือนใน response ของแถวที่ commit สำเร็จ (ไม่มี field = ไม่มีอะไรต้องดู):

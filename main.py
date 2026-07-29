@@ -34,7 +34,8 @@ from lego_outbox import (begin_place_attempt, claim_intent,
                          list_audit_pending, put_intent, read_committed_row,
                          release_intent_claim, update_intent)
 from lego_preflight import DEFAULT_MIN_DNA_REMAINING, auto_submit_preflight
-from lego_state import (CalendarDriftError, DNADriftError,
+from lego_state import (CASHFLOW_SEMANTICS, CalendarDriftError,
+                         CashflowSemanticsDowngrade, DNADriftError,
                          ExecutionFinalizeError, OrdinalRegression,
                          RuntimeIdentityError, SlotAlreadyConsumed,
                          StaleAnchorError, apply_realized_fill, chain_key,
@@ -42,7 +43,8 @@ from lego_state import (CalendarDriftError, DNADriftError,
                          finalize_execution_fill, mark_order_intent_materialized,
                          pending_order_intents, read_anchor, read_chain_state,
                          UNREAD_STATE, update_order_audit,
-                         verify_runtime_identity, write_order_audit)
+                         verify_cashflow_semantics, verify_runtime_identity,
+                         write_order_audit)
 from market_clock import (MarketClockError, clock_mode, fallback_slot_id,
                           is_regular_session, resolve_dna_step, resolve_market_slot,
                           slot_seconds)
@@ -799,6 +801,19 @@ def lego_one_row(request):
                 "pipeline_status": "MARKET_CLOSED"}, 200
 
     try:
+        # Before the broker is touched: if this revision's accounting is behind
+        # the chain's, nothing it computes afterwards is worth writing. read_anchor
+        # is the other half — it restarts Aₙ at zero across a semantics boundary,
+        # and this is what stops that reset from happening silently.
+        semantics_migrated_from = verify_cashflow_semantics(state)
+        if semantics_migrated_from:
+            _record_warning(
+                "cashflow_semantics_migration",
+                f"chain เคยใช้ cashflow semantics '{semantics_migrated_from}' "
+                f"แต่ runtime นี้เป็น '{CASHFLOW_SEMANTICS}' — baseline Aₙ ถูกรีเซ็ต "
+                "เป็น 0 และเดินต่อ (แถวเก่าเทียบกับแถวใหม่ตรง ๆ ไม่ได้)",
+                {"from": semantics_migrated_from, "to": CASHFLOW_SEMANTICS,
+                 "chain_key": chain_key(cfg)})
         anchor = read_anchor(cfg, runtime_identity=runtime_identity, state=state)
         legacy_step = dna_step_for(anchor)
         slot = None
@@ -922,12 +937,18 @@ def lego_one_row(request):
             "step": row["DNA step"], "signal": row["DNA signal"],
             "model_acted": row["_meta"]["acted"],
             "pipeline_status": "ROW_COMMITTED",
+            # The running accounting, on every successful row. Comparing the
+            # deployed revision against main used to need Cloud Run access; this
+            # is the same answer from the response Cloud Scheduler already calls.
+            "cashflow_semantics": CASHFLOW_SEMANTICS,
             "clock_mode": mode,
             "legacy_step": legacy_step,
             "market_step": None if slot is None else slot.market_ordinal,
             "alignment_error": alignment_error,
             "market_slot_id": None if slot is None else slot.slot_id,
         }
+        if semantics_migrated_from:
+            out["cashflow_semantics_migrated_from"] = semantics_migrated_from
         if clock_error:
             out["clock_warning"] = clock_error
         if token_warning:
@@ -987,6 +1008,14 @@ def lego_one_row(request):
     except DNADriftError as exc:
         return {"status": "DNA_DRIFT", "committed": False,
                 "pipeline_status": "DNA_DRIFT", "note": str(exc)}, 409
+    except CashflowSemanticsDowngrade as exc:
+        # 409 for the same reason as the drift guards: the request is fine, the
+        # chain is fine, and this deployment is the thing that must not proceed.
+        return {"status": "CASHFLOW_SEMANTICS_DOWNGRADE", "committed": False,
+                "pipeline_status": "CASHFLOW_SEMANTICS_DOWNGRADE",
+                "note": str(exc), "runtime_cashflow_semantics": CASHFLOW_SEMANTICS,
+                "hint": "ตรวจว่า Cloud Run revision ไหนยังรับ traffic อยู่ "
+                        "และ scheduler ยิงไปที่ URL ของ revision ใด"}, 409
     except HoldingsAnomaly as exc:
         return {"status": "HOLDINGS_ANOMALY", "committed": False,
                 "pipeline_status": "HOLDINGS_ANOMALY", "note": str(exc)}, 409
