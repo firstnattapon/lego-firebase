@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import os
+import uuid
 from datetime import datetime, timedelta, timezone
 from firebase_admin import db
 
@@ -9,6 +10,7 @@ from lego_orders import normalize_status as _normalize_status
 
 OUTBOX_PATH = "webull_lego_order_outbox"
 ROWS_PATH = "webull_lego_rows"
+DISPATCH_LOCK_PATH = "webull_lego_order_dispatch_locks"
 # Terminal for the *outbox*: nothing more to dispatch. Wider than
 # lego_orders.TERMINAL_STATUSES, which only means the broker is done.
 TERMINAL = {
@@ -43,6 +45,168 @@ TERMINAL = {
 def normalize_status(value) -> str:
     """Same normalization as lego_orders; a missing status reads as UNKNOWN."""
     return _normalize_status(value or "UNKNOWN")
+
+
+def _dispatch_lease_seconds() -> int:
+    """Lease for the one worker allowed to cross a chain's money boundary."""
+    return max(5, int(os.environ.get(
+        "LEGO_CHAIN_DISPATCH_LEASE_SECONDS", "120")))
+
+
+def claim_chain_dispatch(chain_key: str, worker_id: str, *,
+                         now_utc: datetime | None = None,
+                         lease_seconds: int | None = None) -> dict | None:
+    """Lease the irreversible order path for one strategy chain.
+
+    Per-intent claims stop two workers sending the *same* client_order_id.  They
+    do not stop those workers claiming two different run_ids, both observing an
+    empty open-order list, and placing concurrently.  This lease serializes that
+    cross-intent window while leaving all chains independent.
+
+    An expired owner is replaceable.  ``claim_token`` is unique per acquisition,
+    so an old worker can neither renew nor release a successor's lease even when
+    a process id is accidentally reused.
+    """
+    now_utc = (now_utc or datetime.now(timezone.utc)).astimezone(timezone.utc)
+    lease_seconds = _dispatch_lease_seconds() if lease_seconds is None else max(
+        1, int(lease_seconds))
+    lease_until = now_utc + timedelta(seconds=lease_seconds)
+    lease_text = lease_until.strftime("%Y-%m-%dT%H:%M:%SZ")
+    token = uuid.uuid4().hex
+    ref = db.reference(f"{DISPATCH_LOCK_PATH}/{chain_key}")
+
+    def txn(current):
+        doc = dict(current or {})
+        owner = str(doc.get("owner") or "")
+        active_until = _parse_utc(doc.get("lease_until"))
+        if owner and owner != worker_id and active_until and active_until > now_utc:
+            return doc
+        doc.update({
+            "owner": worker_id,
+            "claim_token": token,
+            "generation": int(doc.get("generation", 0) or 0) + 1,
+            "claimed_at": now_utc.strftime("%Y-%m-%dT%H:%M:%SZ"),
+            "lease_until": lease_text,
+        })
+        # An unresolved broker call survives owner expiry.  The successor may
+        # reconcile that run_id, but may not forget it and dispatch another one.
+        if not doc.get("inflight_run_id"):
+            doc.pop("place_fence", None)
+            doc.pop("fenced_run_id", None)
+        return doc
+
+    result = ref.transaction(txn)
+    if not isinstance(result, dict) or result.get("claim_token") != token:
+        return None
+    return result
+
+
+def fence_chain_dispatch(chain_key: str, run_id: str, worker_id: str,
+                         claim_token: str, *,
+                         now_utc: datetime | None = None,
+                         lease_seconds: int | None = None) -> dict | None:
+    """Revalidate and renew the chain lease immediately before ``place_order``.
+
+    A worker whose lease expired loses this transaction after a successor claims
+    the chain.  Its stale result therefore cannot cross the irreversible call.
+    """
+    now_utc = (now_utc or datetime.now(timezone.utc)).astimezone(timezone.utc)
+    lease_seconds = _dispatch_lease_seconds() if lease_seconds is None else max(
+        1, int(lease_seconds))
+    lease_text = (now_utc + timedelta(seconds=lease_seconds)).strftime(
+        "%Y-%m-%dT%H:%M:%SZ")
+    fence = f"{claim_token}:{run_id}"
+    ref = db.reference(f"{DISPATCH_LOCK_PATH}/{chain_key}")
+
+    def txn(current):
+        if not isinstance(current, dict):
+            return current
+        doc = dict(current)
+        active_until = _parse_utc(doc.get("lease_until"))
+        inflight = str(doc.get("inflight_run_id") or "")
+        if (doc.get("owner") != worker_id
+                or doc.get("claim_token") != claim_token
+                or active_until is None or active_until <= now_utc
+                # Once a broker call may have started, no later run may replace
+                # that uncertainty merely because it acquired the owner lease.
+                or (inflight and inflight != str(run_id))):
+            return doc
+        doc.update({
+            "lease_until": lease_text,
+            "place_fence": fence,
+            "fenced_run_id": str(run_id),
+            # Durable across owner release/expiry.  A successor must reconcile
+            # this run before any different intent can cross place_order.
+            "inflight_run_id": str(run_id),
+            "fenced_at": now_utc.strftime("%Y-%m-%dT%H:%M:%SZ"),
+        })
+        return doc
+
+    result = ref.transaction(txn)
+    if not isinstance(result, dict) or result.get("place_fence") != fence:
+        return None
+    return result
+
+
+def release_chain_dispatch(chain_key: str, worker_id: str,
+                           claim_token: str) -> None:
+    """Release owner lease only; unresolved ``inflight_run_id`` stays durable."""
+    ref = db.reference(f"{DISPATCH_LOCK_PATH}/{chain_key}")
+
+    def txn(current):
+        if not isinstance(current, dict):
+            return current
+        doc = dict(current)
+        if (doc.get("owner") != worker_id
+                or doc.get("claim_token") != claim_token):
+            return doc
+        doc.update({"owner": "", "claim_token": "", "lease_until": ""})
+        return doc
+
+    ref.transaction(txn)
+
+
+def clear_chain_dispatch_inflight(chain_key: str, run_id: str, worker_id: str,
+                                  claim_token: str) -> bool:
+    """Clear a resolved broker run, but only for the current chain owner."""
+    ref = db.reference(f"{DISPATCH_LOCK_PATH}/{chain_key}")
+    clear_token = uuid.uuid4().hex
+
+    def txn(current):
+        if not isinstance(current, dict):
+            return current
+        doc = dict(current)
+        if (doc.get("owner") != worker_id
+                or doc.get("claim_token") != claim_token
+                or str(doc.get("inflight_run_id") or "") != str(run_id)):
+            return doc
+        doc.pop("inflight_run_id", None)
+        doc.pop("place_fence", None)
+        doc.pop("fenced_run_id", None)
+        doc.pop("fenced_at", None)
+        # A transaction callback may be retried.  A durable token in its result,
+        # unlike a closure side effect, proves that *this* attempt cleared it.
+        doc.update({
+            "last_clear_token": clear_token,
+            "last_cleared_run_id": str(run_id),
+            "cleared_at": datetime.now(timezone.utc).strftime(
+                "%Y-%m-%dT%H:%M:%SZ"),
+        })
+        return doc
+
+    result = ref.transaction(txn)
+    return (isinstance(result, dict)
+            and result.get("last_clear_token") == clear_token
+            and not result.get("inflight_run_id"))
+
+
+def read_intent(chain_key: str, run_id: str) -> dict | None:
+    payload = db.reference(f"{OUTBOX_PATH}/{chain_key}/{run_id}").get()
+    if not isinstance(payload, dict):
+        return None
+    doc = dict(payload)
+    doc.setdefault("run_id", str(run_id))
+    return doc
 
 
 def put_intent(chain_key: str, run_id: str, payload: dict) -> dict:

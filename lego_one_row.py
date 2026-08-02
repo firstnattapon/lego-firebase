@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import math
 from dataclasses import dataclass
+from decimal import Decimal, ROUND_DOWN
 
 from dna_engine import decode_dna
 
@@ -180,6 +181,14 @@ def build_decision(cfg: Config, price: float, holdings: float, signal: int) -> D
     if abs(gap) <= cfg.diff:
         return Decision(PASS_THRESHOLD, "PASS", "", PASS_THRESHOLD, 0.0, value, gap)
     qty = round(abs(gap) / price, cfg.decimal_precision)
+    if gap < -cfg.diff:
+        # The exact rebalance is below holdings because FIX_C > 0, but rounding
+        # can push a tiny fractional SELL above holdings. Cap at holdings rounded
+        # down to the same broker precision; never round this ceiling upward.
+        quantum = Decimal(1).scaleb(-cfg.decimal_precision)
+        sell_ceiling = float(Decimal(str(holdings)).quantize(
+            quantum, rounding=ROUND_DOWN))
+        qty = min(qty, sell_ceiling)
     if qty <= 0:
         return Decision(PASS_THRESHOLD, "PASS", "", PASS_THRESHOLD, 0.0, value, gap)
     if gap > cfg.diff:

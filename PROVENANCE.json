@@ -1,0 +1,51 @@
+{
+  "schema": "lego_release_provenance_v1",
+  "generated_at": "2026-08-02T18:25:20+07:00",
+  "status": "local_release_candidate_not_live_certified",
+  "readiness": {
+    "score": 80,
+    "target": 100,
+    "remaining": 20,
+    "remaining_gates": [
+      "controlled live Webull UAT Preview to Place to terminal reconciliation",
+      "separate PROD deployment read-only IAM OIDC Secret RTDB market-data smoke"
+    ]
+  },
+  "sources": [
+    {
+      "name": "lego-firebase",
+      "url": "https://github.com/firstnattapon/lego-firebase",
+      "upstream_commit": "9959c5b175e93441fb9e1112eb035f17873e4d36",
+      "release_file_count_before_manifest_and_provenance": 46
+    },
+    {
+      "name": "lego-firebase-streamlit",
+      "url": "https://github.com/firstnattapon/lego-firebase-streamlit",
+      "upstream_commit": "f64e11392475410fdc309cef3bef347b84f14cab",
+      "release_file_count_before_manifest_and_provenance": 13
+    }
+  ],
+  "verification": {
+    "python": "3.12",
+    "backend_full_suite": "618 passed, 1 emulator-only skipped",
+    "firebase_rules_emulator": "56 passed, 0 failed, Realtime Database Emulator 4.11.2",
+    "admin_reconciliation_suite": "61 passed, 0 failed",
+    "streamlit_full_suite": "53 passed, 0 failed",
+    "compileall": "passed for both sources",
+    "pip_check": "no broken requirements for both clean environments",
+    "pip_audit": "no known vulnerabilities for both clean environments as checked 2026-08-02",
+    "secret_pattern_scan": "no real credential, token, or private key found; formal CI secret scan remains a deploy gate",
+    "independent_review": "no remaining P0 or P1 finding after final patch review"
+  },
+  "preserved_contracts": {
+    "streamlit_ui": "2 tabs, 6 number inputs, 1 text input, 17-column prefix",
+    "cashflow_semantics": "execution_confirmed_v1",
+    "production_order_scope": "AUTO_SUBMIT=false read-only smoke; source intentionally blocks placing outside UAT"
+  },
+  "live_actions_performed": {
+    "webull_order_preview": false,
+    "webull_order_place": false,
+    "cloud_deploy": false,
+    "firebase_live_write": false
+  }
+}

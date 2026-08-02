@@ -5,8 +5,10 @@
 # The stored dna_fingerprint makes that fail closed; this pin keeps it from
 # happening in the first place. Change it only with a fingerprint check.
 numpy==2.4.6
-functions-framework==3.*
-firebase-admin==6.*
+# Exact pins make deploys reproducible; these are the versions exercised by the
+# final Python 3.12 review environment. Upgrade only through the full suite.
+functions-framework==3.10.2
+firebase-admin==6.9.0
 # The SDK is pinned for the same reason as numpy, on a shorter fuse: it owns the
 # HMAC signing, the auth flow, and the exact order payload that reaches the
 # broker, so an unplanned upgrade at deploy time changes the money path with
@@ -15,4 +17,4 @@ firebase-admin==6.*
 # the audited cryptography floor. See vendor/README.md and its provenance tests.
 cryptography==48.0.1
 ./vendor/webull_openapi_python_sdk-2.0.15-1lego-py3-none-any.whl
-tzdata>=2024.1
+tzdata==2025.3

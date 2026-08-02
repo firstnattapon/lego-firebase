@@ -71,6 +71,7 @@ def _run(monkeypatch, moment: datetime, price: float, holdings: float = 9.0):
     monkeypatch.setattr(main, "datetime", _fixed_now(moment))
     monkeypatch.setattr(main, "fetch_snapshot", lambda t, d, cfg: {
         "captured_at": moment.strftime("%Y-%m-%dT%H:%M:%SZ"),
+        "quote_time": moment.strftime("%Y-%m-%dT%H:%M:%SZ"),
         "price": price, "holdings": holdings,
     })
     return main.lego_one_row(object())

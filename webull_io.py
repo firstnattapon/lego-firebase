@@ -30,12 +30,19 @@ _TRANSIENT_CODES = {
     "GATEWAY_TIMEOUT", "TIMEOUT", "SERVICE_UNAVAILABLE",
     "RATE_LIMIT", "RATE_LIMIT_EXCEEDED", "TOO_MANY_REQUESTS",
     "REQUEST_LIMIT_EXCEEDED", "FREQUENCY_LIMIT",
+    # Pinned SDK ClientException codes for transport failures. These are only
+    # consumed by the read/preview wrapper; place_order deliberately bypasses
+    # retries because a timeout cannot prove whether money moved.
+    "SDK.HTTPERROR", "SDK.UNKNOWNSERVERERROR", "SDK.ENDPOINTRESOLVINGERROR",
 }
 # Any of these present-and-truthy means the broker rejected the preview.
 _PREVIEW_ERROR_KEYS = ("error", "error_code", "errorCode")
 # webull/data/common/category.py of the pinned SDK 2.0.15.
 CATEGORIES = ("US_STOCK", "US_ETF", "US_OPTION", "US_CRYPTO", "US_FUTURES",
               "US_EVENT", "HK_STOCK", "HK_ETF", "HK_FUTURES", "CN_STOCK")
+# The order payload below is deliberately US EQUITY. Accepting every market
+# data enum here could price one instrument family and submit it as another.
+EXECUTION_CATEGORIES = ("US_STOCK", "US_ETF")
 
 
 class WebullConfigError(ValueError):
@@ -106,9 +113,14 @@ def market_category() -> str:
     """
     value = os.environ.get("LEGO_MARKET_CATEGORY", "US_STOCK").strip().upper()
     if value not in CATEGORIES:
-        raise ValueError(
+        raise WebullConfigError(
             f"LEGO_MARKET_CATEGORY={value!r} ไม่อยู่ใน Category ของ SDK — fail closed "
             f"(ค่าที่ใช้ได้: {', '.join(CATEGORIES)})")
+    if value not in EXECUTION_CATEGORIES:
+        raise WebullConfigError(
+            f"LEGO_MARKET_CATEGORY={value!r} ยังไม่รองรับใน money path — "
+            "order payload ปัจจุบันส่งได้เฉพาะ US EQUITY; fail closed "
+            f"(ค่าที่รองรับ: {', '.join(EXECUTION_CATEGORIES)})")
     return value
 
 
@@ -443,12 +455,13 @@ def _sdk_log_level() -> int:
 
 
 _SECRET_FIELDS = (
-    "x-signature", "x-access-token", "x-app-key", "app_secret",
+    "x-signature", "signature", "x-access-token", "x-app-key", "app_secret",
     "app_key_secret", "access_token", "account_id", "webull_account_id",
     "authorization",
 )
 _SECRET_PATTERN = re.compile(
-    r"(?P<label>%s)(?P<sep>\"?\s*[:=]\s*\"?)(?P<value>[^\"',\s}\]]+)"
+    r"(?P<label>%s)(?P<sep>['\"]?(?:\s*[:=]\s*|%%3A|%%3D)"
+    r"(?:['\"]|%%22|%%27)?)(?P<value>[^\"',\s}\]&]+)"
     % "|".join(re.escape(f) for f in _SECRET_FIELDS), re.IGNORECASE)
 _REDACTED = "<redacted>"
 
@@ -499,6 +512,30 @@ def _install_redaction(logger_name: str = "webull.core") -> None:
             handler.addFilter(_RedactSecrets())
 
 
+def _configure_sdk_stream_logger(api) -> None:
+    """Install one process-wide SDK stream handler and reuse it on rebuilds."""
+    level = _sdk_log_level()
+    sdk_logger = logging.getLogger("webull.core")
+    managed = [handler for handler in sdk_logger.handlers
+               if getattr(handler, "_lego_webull_stream", False)]
+    if managed:
+        sdk_logger.setLevel(level)
+        for handler in managed:
+            handler.setLevel(level)
+        # TradeClient/DataClient otherwise install their own console *and file*
+        # handlers on every newly constructed ApiClient.
+        api._stream_logger_set = True
+    else:
+        before = set(sdk_logger.handlers)
+        api.set_stream_logger(
+            log_level=level, stream=sys.stdout,
+            format_string="%(asctime)s %(name)s %(levelname)s %(message)s")
+        for handler in sdk_logger.handlers:
+            if handler not in before:
+                handler._lego_webull_stream = True
+    _install_redaction()
+
+
 def build_clients():
     """Build (or reuse) the SDK clients for this instance.
 
@@ -535,9 +572,7 @@ def build_clients():
     api = ApiClient(os.environ["WEBULL_APP_KEY"], os.environ["WEBULL_APP_SECRET"], "th")
     api.add_endpoint("th", _endpoint())
     api.set_token_dir(token_dir())
-    api.set_stream_logger(log_level=_sdk_log_level(), stream=sys.stdout,
-                          format_string="%(asctime)s %(name)s %(levelname)s %(message)s")
-    _install_redaction()
+    _configure_sdk_stream_logger(api)
     if token_dir_is_ephemeral():
         logger.warning("WEBULL_TOKEN_DIR=%s อยู่บน storage ชั่วคราว — token จะหายเมื่อ "
                        "instance ถูกรีไซเคิลและต้องยืนยัน 2FA ใหม่", token_dir())
@@ -578,8 +613,13 @@ def fetch_snapshot(trade_client, data_client, cfg: Config) -> dict:
     price = _extract_price(snap, cfg.symbol)
     if not (price and price > 0):
         raise ValueError(f"snapshot price ไม่ถูกต้อง ({price}) — fail closed")
+    quote_time = _extract_quote_time(snap, cfg.symbol)
+    if quote_time is None:
+        raise ValueError(
+            "snapshot ไม่มี last_trade_time ที่ตรวจสอบได้ — fail closed ไม่ใช้เวลารับ response แทนเวลา quote")
     return {
         "captured_at": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+        "quote_time": quote_time.isoformat(timespec="milliseconds").replace("+00:00", "Z"),
         "price": float(price),
         "holdings": float(holdings),
     }
@@ -756,6 +796,7 @@ def _extract_qty(positions, symbol: str) -> float:
 
 
 _PRICE_KEYS = ("last", "lastPrice", "price", "close")
+_QUOTE_TIME_KEYS = ("last_trade_time", "lastTradeTime", "trade_time")
 
 
 def _entry_symbol(entry: dict) -> str:
@@ -767,6 +808,60 @@ def _price_of(entry: dict) -> float:
         if entry.get(key):
             return float(entry[key])
     return 0.0
+
+
+def _snapshot_entry(snap, symbol: str) -> dict:
+    """Return the one snapshot record that belongs to *symbol*."""
+    want = symbol.upper()
+    if isinstance(snap, list):
+        entries = [entry for entry in snap if isinstance(entry, dict)]
+        matching = [entry for entry in entries if _entry_symbol(entry) == want]
+        if matching:
+            snap = matching[0]
+        elif any(_entry_symbol(entry) for entry in entries):
+            return {}                    # response is about other symbols only
+        else:
+            # Unnamed single-symbol payload: the historical shape get_snapshot
+            # returns for a one-symbol request.
+            snap = entries[0] if entries else {}
+    if not isinstance(snap, dict):
+        return {}
+    named = _entry_symbol(snap)
+    if not named or named == want:
+        if _price_of(snap):
+            return snap
+    nested = snap.get(want) or snap.get(symbol)
+    return nested if isinstance(nested, dict) else {}
+
+
+def _quote_datetime(raw) -> datetime | None:
+    """Normalize Webull's Unix-millisecond trade time without guessing."""
+    if raw is None or isinstance(raw, bool):
+        return None
+    try:
+        numeric = float(raw)
+    except (TypeError, ValueError):
+        return None
+    if not (numeric > 0 and numeric < float("inf")):
+        return None
+    # Webull documents last_trade_time as Unix epoch milliseconds.  Requiring
+    # millisecond scale avoids silently reading an unrelated small integer as a
+    # plausible 1970 quote and makes response-schema drift fail closed.
+    if numeric < 100_000_000_000:
+        return None
+    try:
+        return datetime.fromtimestamp(numeric / 1000.0, timezone.utc)
+    except (OverflowError, OSError, ValueError):
+        return None
+
+
+def _extract_quote_time(snap, symbol: str) -> datetime | None:
+    """Read the source trade time from the same symbol record as its price."""
+    entry = _snapshot_entry(snap, symbol)
+    for key in _QUOTE_TIME_KEYS:
+        if key in entry:
+            return _quote_datetime(entry.get(key))
+    return None
 
 
 def _extract_price(snap, symbol: str) -> float:
@@ -782,26 +877,4 @@ def _extract_price(snap, symbol: str) -> float:
     fail-closed answer: fetch_snapshot already turns a non-positive price into a
     ValueError, so the row is never built rather than built on a wrong price.
     """
-    want = symbol.upper()
-    if isinstance(snap, list):
-        entries = [e for e in snap if isinstance(e, dict)]
-        matching = [e for e in entries if _entry_symbol(e) == want]
-        if matching:
-            snap = matching[0]
-        elif any(_entry_symbol(e) for e in entries):
-            return 0.0                  # the response is about other symbols only
-        else:
-            # Unnamed single-symbol payload: the historical shape get_snapshot
-            # returns for a one-symbol request.
-            snap = entries[0] if entries else {}
-    if not isinstance(snap, dict):
-        return 0.0
-    named = _entry_symbol(snap)
-    if not named or named == want:
-        price = _price_of(snap)
-        if price:
-            return price
-    nested = snap.get(want) or snap.get(symbol)
-    if isinstance(nested, dict):
-        return _price_of(nested)
-    return 0.0
+    return _price_of(_snapshot_entry(snap, symbol))

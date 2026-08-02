@@ -57,6 +57,37 @@ CASHFLOW_PENDING = "PENDING_EXECUTION"     # READY_*: waiting for a broker fill
 CASHFLOW_FINALIZED = "FINALIZED"           # fill confirmed, ΔAₙ/Aₙ/Eₙ written
 
 
+def realized_open_legs_hash(open_legs) -> str:
+    """Canonical witness for one valid FIFO ledger state after an applied fill."""
+    if not isinstance(open_legs, dict) or any(
+            key not in {"buys", "sells"} for key in open_legs):
+        raise ValueError("realized open_legs ต้องเป็น buys/sells object")
+    canonical = {"buys": [], "sells": []}
+    for side in ("buys", "sells"):
+        legs = open_legs.get(side, [])
+        if not isinstance(legs, list):
+            raise ValueError("realized open_legs แต่ละฝั่งต้องเป็น list")
+        for leg in legs:
+            if not isinstance(leg, (list, tuple)) or len(leg) != 3:
+                raise ValueError("realized leg ต้องเป็น [quantity, price, fee_per_share]")
+            if any(isinstance(value, bool) for value in leg):
+                raise ValueError("realized leg ห้ามใช้ bool")
+            try:
+                quantity, price, fee_per_share = map(float, leg)
+            except (TypeError, ValueError) as exc:
+                raise ValueError("realized leg ต้องเป็นตัวเลข") from exc
+            if (not all(math.isfinite(value) for value in
+                        (quantity, price, fee_per_share))
+                    or quantity <= 1e-9 or price <= 0 or fee_per_share < 0):
+                raise ValueError("realized leg อยู่นอกช่วงที่อนุญาต")
+            canonical[side].append([quantity, price, fee_per_share])
+    if canonical["buys"] and canonical["sells"]:
+        raise ValueError("FIFO ledger ห้ามมี buy/sell open legs พร้อมกัน")
+    raw = json.dumps(canonical, sort_keys=True, ensure_ascii=False,
+                     separators=(",", ":"), allow_nan=False)
+    return hashlib.sha256(raw.encode("utf-8")).hexdigest()
+
+
 class StaleAnchorError(RuntimeError):
     pass
 
@@ -583,6 +614,8 @@ def finalize_execution_fill(cfg: Config, run_id: str, fill: ExecutionFill, *,
             last_action_price=float(cashflow["last_action_price"]),
             actual_cumulative=float(cashflow.get("actual_cumulative", 0.0) or 0.0),
             reference_R=reference_R)
+        previous_actual_cumulative = float(
+            cashflow.get("actual_cumulative", 0.0) or 0.0)
         seq = int(cashflow.get("finalized_seq", 0) or 0) + 1
         record = {
             "delta_actual": result.dA,
@@ -590,6 +623,7 @@ def finalize_execution_fill(cfg: Config, run_id: str, fill: ExecutionFill, *,
             "excess": result.E,
             "reference": reference_R,
             "previous_action_price": float(cashflow["last_action_price"]),
+            "previous_actual_cumulative": previous_actual_cumulative,
             "filled_price": float(fill.filled_price),
             "filled_quantity": float(fill.filled_quantity),
             "holdings_after": float(fill.holdings_after),
@@ -658,6 +692,44 @@ def pending_order_intents(cfg: Config, *,
         for run_id, payload in raw.items()
         if isinstance(payload, dict)
     }
+
+
+def repair_pending_intent_row(cfg: Config, run_id: str, *,
+                              runtime_identity: str | None = None,
+                              state=UNREAD_STATE) -> dict:
+    """Finish the row patch proven committed by a transaction intent marker.
+
+    ``commit_final_row`` writes the row as ``committed=False``, atomically moves
+    the state pointer together with ``pending_order_intents[run_id]``, then
+    patches the row true.  A process can die between the last two operations.
+    Recovery must repair that row *before* materializing its outbox entry;
+    otherwise the dispatcher sees an uncommitted source and absorbs the real
+    intent as ``NOT_PLACED``.
+    """
+    resolved = _resolve_state(cfg, state) or {}
+    verify_runtime_identity(resolved, runtime_identity)
+    run_id = str(run_id)
+    pending = resolved.get("pending_order_intents") or {}
+    if run_id not in pending or not isinstance(pending.get(run_id), dict):
+        raise ExecutionFinalizeError(
+            f"state has no committed pending-intent marker for row {run_id}")
+
+    ck = chain_key(cfg)
+    ref = db.reference(f"{ROWS_PATH}/{run_id}")
+    doc = ref.get()
+    if not isinstance(doc, dict):
+        raise ExecutionFinalizeError(
+            f"pending-intent marker exists but row {run_id} is missing")
+    if doc.get("chain_key") != ck:
+        raise ExecutionFinalizeError(
+            f"pending-intent row {run_id} belongs to another chain")
+    if doc.get("run_id") != run_id:
+        raise ExecutionFinalizeError(
+            f"pending-intent row id mismatch for {run_id}")
+    if doc.get("committed") is not True:
+        ref.update({"committed": True})
+        doc = {**doc, "committed": True}
+    return doc
 
 
 def chain_runtime_identity_is_verified(
@@ -761,8 +833,16 @@ def apply_realized_fill(ck: str, event_id: str, side: str,
     cumulative_qty = float(cumulative_qty)
     price = float(price)
     cumulative_fee = float(cumulative_fee or 0.0)
+    side = str(side).upper()
+    if side not in ("BUY", "SELL"):
+        raise ValueError("side ต้อง BUY หรือ SELL")
+    if not all(math.isfinite(value) for value in
+               (cumulative_qty, price, cumulative_fee)):
+        raise ValueError("cumulative fill/price/fee ต้องเป็น finite")
     if cumulative_qty < 0 or cumulative_fee < 0:
         raise ValueError("cumulative fill/fee ติดลบไม่ได้")
+    if cumulative_qty > 1e-9 and price <= 0:
+        raise ValueError("fill price ต้อง > 0 เมื่อ quantity เป็นบวก")
     ref = db.reference(f"{REALIZED_PATH}/{ck}")
     apply_token = uuid.uuid4().hex
 
@@ -787,24 +867,43 @@ def apply_realized_fill(ck: str, event_id: str, side: str,
                 "average fill price เปลี่ยนโดย quantity ไม่เพิ่ม — ต้องตรวจด้วยมือ")
         if delta_qty <= 1e-9 and delta_fee <= 1e-9:
             return state
+        try:
+            prior_cumulative = float(state.get("cumulative_realized", 0.0) or 0.0)
+            applied_seq = int(state.get("applied_seq", 0) or 0) + 1
+        except (TypeError, ValueError) as exc:
+            raise ValueError("realized ledger head ไม่ถูกต้อง") from exc
+        if not math.isfinite(prior_cumulative) or applied_seq <= 0:
+            raise ValueError("realized ledger head ไม่ถูกต้อง")
         if delta_qty <= 1e-9:
             # Some brokers publish fees after the final quantity.  Recognizing
             # the fee now keeps cumulative P&L correct without inventing another
             # share fill or charging it twice on replay.
             realized_delta = -delta_fee
-            cumulative = (
-                float(state.get("cumulative_realized", 0.0) or 0.0)
-                + realized_delta
-            )
+            cumulative = prior_cumulative + realized_delta
+            open_legs = state.get("open_legs")
+            if not isinstance(open_legs, dict):
+                raise ValueError("realized open_legs หายก่อนบันทึก late fee")
+            event_realized = float(prev.get("realized_delta", 0.0) or 0.0)
+            if not math.isfinite(event_realized):
+                raise ValueError("event realized_delta ไม่ถูกต้อง")
+            event_realized += realized_delta
+            if not (math.isfinite(realized_delta) and math.isfinite(cumulative)
+                    and math.isfinite(event_realized)):
+                raise ValueError("realized ledger result ต้องเป็น finite")
             applied[event_id] = {
                 "quantity": cumulative_qty,
                 "fee": cumulative_fee,
                 "average_price": price,
-                "side": str(side).upper(),
+                "side": side,
+                "realized_delta": event_realized,
+                "cumulative_realized_after": cumulative,
+                "open_legs_after_hash": realized_open_legs_hash(open_legs),
+                "seq": applied_seq,
             }
             state.update({
                 "applied_fills": applied,
                 "cumulative_realized": cumulative,
+                "applied_seq": applied_seq,
                 "last_realized_delta": realized_delta,
                 "last_event_id": event_id,
                 "last_apply_token": apply_token,
@@ -819,13 +918,25 @@ def apply_realized_fill(ck: str, event_id: str, side: str,
             raise ValueError("incremental fill price ต้อง > 0")
         legs, realized_delta = apply_fill(
             state.get("open_legs"), side, delta_qty, delta_price, delta_fee)
-        cumulative = float(state.get("cumulative_realized", 0.0) or 0.0) + realized_delta
+        cumulative = prior_cumulative + realized_delta
+        event_realized = float(prev.get("realized_delta", 0.0) or 0.0)
+        if not math.isfinite(event_realized):
+            raise ValueError("event realized_delta ไม่ถูกต้อง")
+        event_realized += realized_delta
+        if not (math.isfinite(realized_delta) and math.isfinite(cumulative)
+                and math.isfinite(event_realized)):
+            raise ValueError("realized ledger result ต้องเป็น finite")
         applied[event_id] = {"quantity": cumulative_qty, "fee": cumulative_fee,
-                             "average_price": price, "side": str(side).upper()}
+                             "average_price": price, "side": side,
+                             "realized_delta": event_realized,
+                             "cumulative_realized_after": cumulative,
+                             "open_legs_after_hash": realized_open_legs_hash(legs),
+                             "seq": applied_seq}
         state.update({
             "open_legs": legs,
             "applied_fills": applied,
             "cumulative_realized": cumulative,
+            "applied_seq": applied_seq,
             "last_realized_delta": realized_delta,
             "last_event_id": event_id,
             "last_apply_token": apply_token,

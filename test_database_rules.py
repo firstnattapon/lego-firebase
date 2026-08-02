@@ -21,6 +21,8 @@ PUBLIC_READ_PATHS = frozenset({
 PRIVATE_PATHS = frozenset({
     "webull_lego_order_outbox",
     "webull_lego_order_outbox_archive",
+    "webull_lego_order_dispatch_locks",
+    "webull_lego_admin_reconcile_audit",
     "webull_lego_realized",
     "webull_lego_errors",
 })

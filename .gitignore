@@ -4,6 +4,7 @@ __pycache__/
 .mypy_cache/
 .ruff_cache/
 .audit-cache/
+.review-runtime/
 .coverage
 htmlcov/
 
@@ -14,7 +15,11 @@ venv/
 .env.*
 !.env.example
 *service-account*.json
+*service_account*.json
+*serviceaccount*.json
 *credentials*.json
+secrets.toml
+.streamlit/secrets.toml
 token.txt
 webull_token/
 

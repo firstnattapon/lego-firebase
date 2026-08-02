@@ -48,6 +48,7 @@ def _run(monkeypatch, moment: datetime, price: float, holdings: float = 9.0):
     monkeypatch.setattr(main, "datetime", _fixed_now(moment))
     monkeypatch.setattr(main, "fetch_snapshot", lambda t, d, cfg: {
         "captured_at": moment.strftime("%Y-%m-%dT%H:%M:%SZ"),
+        "quote_time": moment.strftime("%Y-%m-%dT%H:%M:%SZ"),
         "price": price, "holdings": holdings,
     })
     return main.lego_one_row(object())
@@ -164,12 +165,19 @@ def test_unsupported_clock_mode_is_a_config_error(monkeypatch):
     assert FAKE_DB.reference("webull_lego_rows").get() is None
 
 
-def test_unknown_market_category_is_a_config_error(monkeypatch):
-    """It is a snapshot query parameter, so a typo is answered by the broker."""
-    monkeypatch.setenv("LEGO_MARKET_CATEGORY", "US_STONK")
+@pytest.mark.parametrize("category", ["US_STONK", "US_OPTION", "US_CRYPTO",
+                                      "US_FUTURES", "HK_STOCK", "CN_STOCK"])
+def test_unsupported_market_category_is_a_config_error_before_broker(monkeypatch,
+                                                                     category):
+    """Snapshot category and hard-coded US EQUITY order payload must agree."""
+    touched = []
+    monkeypatch.setattr(
+        main, "build_clients", lambda: touched.append(True) or (object(), object()))
+    monkeypatch.setenv("LEGO_MARKET_CATEGORY", category)
     body, code = _run(monkeypatch, SESSION_OPEN_SLOT, 320.0)
     assert code == 500 and body["pipeline_status"] == "CONFIG_ERROR"
     assert FAKE_DB.reference("webull_lego_rows").get() is None
+    assert touched == []
 
 
 def test_an_unhealthy_token_is_reported_without_stopping_the_row(monkeypatch):
@@ -248,25 +256,35 @@ def test_unresolvable_order_stops_being_retried(monkeypatch, auto_submit):
     assert "still UNKNOWN" in audit["last_error"]                # why it gave up
 
 
-def test_a_stuck_intent_never_starves_a_later_decision(monkeypatch, auto_submit):
-    """The whole execution leg used to die silently: three unresolvable intents
-    fill LEGO_ORDER_WORKER_LIMIT oldest-first and no order goes out again."""
+def test_a_manual_reconcile_fence_blocks_a_later_decision(monkeypatch, auto_submit):
+    """Queue churn stops, but broker uncertainty must not permit another order.
+
+    RECONCILE_ABANDONED means "ask a human", not "the broker rejected it". The
+    DNA may keep committing decisions, while the money path stays fenced until
+    that first run is reconciled explicitly.
+    """
     monkeypatch.setenv("LEGO_RECONCILE_MAX_ATTEMPTS", "2")
     _stub_broker(monkeypatch, place=_reject)
     cfg = main.load_config()
     ck = chain_key(cfg)
-    _run(monkeypatch, SESSION_OPEN_SLOT, 320.0)
+    first, _ = _run(monkeypatch, SESSION_OPEN_SLOT, 320.0)
     for _ in range(2):
         main._run_order_worker(cfg, limit=1)
 
-    # broker recovers, a later slot decides to trade
-    _stub_broker(monkeypatch, detail=lambda tc, r: {
+    # Even if the broker endpoint recovers, a later run cannot be sent while the
+    # abandoned run's existence remains unanswered.
+    placed = []
+    _stub_broker(monkeypatch, place=lambda tc, order: placed.append(order) or {
+        "order_status": "FILLED"}, detail=lambda tc, r: {
         "order_status": "FILLED", "filled_quantity": 1.0, "avg_filled_price": 322.0},
         holdings_after=10.0)
     later, _ = _run(monkeypatch, datetime(2026, 7, 23, 19, 30, 5, tzinfo=UTC), 322.0)
-    main._run_order_worker(cfg, limit=1)
+    result = main._run_order_worker(cfg, limit=1)
+    assert result["dispatch_blocked"] is True
+    assert result["dispatch_inflight_run_id"] == first["run_id"]
+    assert placed == []
     assert FAKE_DB.reference(
-        f"{OUTBOX_PATH}/{ck}/{later['run_id']}").get()["status"] == "FILLED"
+        f"{OUTBOX_PATH}/{ck}/{later['run_id']}").get()["status"] == "PENDING_DISPATCH"
 
 
 def test_whole_share_quantity_is_not_truncated(monkeypatch, auto_submit):
