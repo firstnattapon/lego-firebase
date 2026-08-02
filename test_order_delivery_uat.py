@@ -11,8 +11,13 @@ that had just signed two authenticated calls in the same invocation.
 The tests here pin both halves of the answer:
 
 * `durability_risk_only` separates "this token cannot sign a request" from "this
-  token's directory will not survive a recycle", and live proof of a signed
-  request satisfies only the second. Nothing else is forgiven.
+  token's directory will not survive a recycle", and `live_proof_supersedable`
+  adds the one other finding a local file inspection cannot settle — no token
+  file at all, on a broker app that never asks for one. Live proof of a signed
+  request satisfies those two and nothing else; a rejected or expiring token is
+  the broker's own verdict and still blocks.
+  (The missing-file half is the 2026-07-29/30 outage; see
+  test_holdings_never_moved_incident.py, which replays that export.)
 * the delivery path itself, from intent through preview, place, order detail and
   the position read back afterwards, including the acceptance equations for
   delivery rate, fill confirmation and duplicate orders.
@@ -168,14 +173,23 @@ def test_an_ephemeral_dir_with_a_good_token_is_durability_risk_only(
     assert "storage ที่หายเมื่อ instance ถูกรีไซเคิล" in health["reasons"][0]
 
 
-def test_a_missing_token_is_never_durability_risk_only(tmp_path, monkeypatch):
-    """No token file is a statement about signing now. Nothing forgives it."""
+def test_a_missing_token_is_supersedable_but_never_durability_risk_only(
+        tmp_path, monkeypatch):
+    """Two different questions, and no token file answers them differently.
+
+    It is not a durability risk — that word is reserved for the *next* container
+    — so `durability_risk_only` stays False and the narrow exemption still
+    refuses it. It is a local-file finding, though, and a broker app with token
+    checking disabled never produces the file at all, so live proof of a signed
+    request supersedes it.
+    """
     token_dir = _write_token(tmp_path, monkeypatch)
     (token_dir / "token.txt").unlink()
 
     health = webull_io.token_health()
     assert health["ready"] is False
     assert health["durability_risk_only"] is False
+    assert health["live_proof_supersedable"] is True
 
 
 @pytest.mark.parametrize("days_left,status", [(1.0, "NORMAL"), (14.0, "EXPIRED")])
@@ -223,15 +237,36 @@ def test_live_proof_clears_a_durability_only_block():
     assert _report(token=token, token_proved_live=True)["ok"] is True
 
 
-def test_live_proof_does_not_excuse_a_token_that_cannot_sign():
-    """The narrowness is the safety: any reason about signing now still blocks."""
-    for reasons in (["ไม่พบ token file"], ["token status=EXPIRED"],
+def test_live_proof_does_not_excuse_a_token_the_broker_judged():
+    """The narrowness is the safety: a verdict about the token still blocks.
+
+    A rejected or expiring token is the broker's answer, not something a local
+    inspection invented, so neither flag may be set for it and live proof changes
+    nothing.
+    """
+    for reasons in (["token status=EXPIRED"],
                     ["token เหลืออีก 1.00 วันก่อนหมดอายุ"]):
         token = {"ok": False, "ready": False, "durability_risk_only": False,
-                 "reasons": reasons}
+                 "live_proof_supersedable": False, "reasons": reasons}
         report = _report(token=token, token_proved_live=True)
         assert report["ok"] is False
         assert report["blocked_by"] == ["token_ready"]
+
+
+def test_live_proof_clears_a_token_file_the_broker_never_asked_for():
+    """The wider exemption, and it is still opt-in on both sides."""
+    token = {"ok": False, "ready": False, "durability_risk_only": False,
+             "live_proof_supersedable": True,
+             "reasons": ["ไม่พบ token file ที่ /tmp/webull_token/token.txt …"]}
+    assert _report(token=token)["blocked_by"] == ["token_ready"]
+    assert _report(token=token, token_proved_live=False)["blocked_by"] == [
+        "token_ready"]
+    assert _report(token=token, token_proved_live=True)["ok"] is True
+    # A health report from before this field existed keeps the strict reading.
+    assert _report(token={"ok": False, "ready": False,
+                          "durability_risk_only": False,
+                          "reasons": ["ไม่พบ token file"]},
+                   token_proved_live=True)["blocked_by"] == ["token_ready"]
 
 
 def test_live_proof_is_opt_in_so_older_callers_keep_the_strict_reading():
@@ -320,10 +355,51 @@ def test_the_production_row_is_bit_identical_to_the_export(monkeypatch):
     assert row[DELTA_COLUMN] == 0.0 and row[ACTUAL_COLUMN] == 0.0
 
 
-def test_a_missing_token_still_blocks_the_production_slot(tmp_path, monkeypatch):
-    """The gate is still a gate: nothing to sign with, nothing to send."""
+def test_a_token_file_the_broker_never_asked_for_does_not_block(
+        tmp_path, monkeypatch):
+    """The second outage, same column: 2026-07-29/30, AAPL, 8.78392 shares flat.
+
+    On the UAT app the chain runs under, ClientInitializer logs
+    `_check_token_enable result is False` on every call and returns before
+    TokenManager exists, so token.txt is never written. token_health read that as
+    'nothing to sign with' and shut the gate on every slot: twenty-two consecutive
+    committed READY_BUY/READY_SELL rows, zero intents, and `จำนวนถือครอง (หุ้น)`
+    frozen at 8.78392 from the first row to the last.
+
+    The snapshot in `_run` is the live proof — the same authenticated client that
+    would place the order just read the account position — so the missing file is
+    no longer the last word. The durability warning is still emitted, and the row
+    itself is untouched.
+    """
     token_dir = _write_token(tmp_path, monkeypatch)
     (token_dir / "token.txt").unlink()
+
+    body, code = _run(monkeypatch)
+
+    assert code == 200 and body["committed"] is True      # DNA time never stops
+    assert body["status"] == "READY_SELL"
+    assert "outbox_blocked" not in body and "outbox_blocked_checks" not in body
+    assert FAKE_DB.reference(
+        "webull_lego_warnings/auto_submit_blocked").get() is None
+    # Still said out loud: the operator needs to know there is no token file.
+    assert "ไม่พบ token file" in body["token_warning"]
+
+    intent = _intent(body["run_id"])
+    assert intent["status"] == "PENDING_DISPATCH"
+    assert intent["side"] == "SELL" and intent["quantity"] == PROD_QUANTITY
+
+
+@pytest.mark.parametrize("days_left,status", [(1.0, "NORMAL"), (14.0, "EXPIRED")])
+def test_a_dying_or_rejected_token_still_blocks_the_production_slot(
+        tmp_path, monkeypatch, days_left, status):
+    """The gate is still a gate for every verdict about the token itself.
+
+    Live proof widened by exactly one local-file finding. A token the broker
+    rejected, or one about to expire, is not a file-inspection artefact — it is
+    an answer about this token — so a call that happened to succeed a moment ago
+    does not buy it a pass.
+    """
+    _write_token(tmp_path, monkeypatch, days_left=days_left, status=status)
 
     body, code = _run(monkeypatch)
 
