@@ -209,7 +209,7 @@ finalize ΔAₙ/Aₙ/Eₙ`) ก่อนแตะเงินจริง
 | `AUTO_SUBMIT` | `false` | `true` = **ขอ**สร้าง order intent อัตโนมัติเมื่อแถวเป็น `READY_*` · ตัวอย่างใช้ `true` (ปลอดภัยเพราะอยู่บน `WEBULL_ENV=UAT`) · ไม่ใช่สวิตช์เดียว — ต้องผ่าน preflight ครบ 8 ข้อก่อน (ดูหัวข้อ 7.6) |
 | `LEGO_AUTO_SUBMIT_MIN_DNA_REMAINING` | `1` | preflight บล็อกการสร้าง intent ใหม่เมื่อ DNA เหลือน้อยกว่านี้ |
 | `WEBULL_TOKEN_DIR` | `/tmp/webull_token` | ที่เก็บ token ของ SDK · ⚠️ `/tmp` หายทุกครั้งที่ instance ถูกรีไซเคิล → SDK จะสร้าง token ใหม่และรอคนกด 2FA ในแอป 300 วิ ถ้าไม่มีคนกด = `ERROR_INIT_TOKEN` · ชี้ไป volume ที่คงอยู่ (เช่น GCS FUSE mount) จะเห็นคำเตือนที่ `webull_lego_warnings/webull_token` จนกว่าจะย้าย |
-| `LEGO_ALLOW_EPHEMERAL_TOKEN_DIR` | `false` | `true` = ยอมรับว่า token dir อยู่บน `/tmp` แล้วให้ `token_health()["ready"]` เป็น `true` · **ไม่จำเป็นสำหรับการส่ง order แล้ว**: `token_ready` ยอมรับหลักฐานว่า token นี้เพิ่งเซ็น request สำเร็จใน invocation เดียวกัน (ดู check 7 หัวข้อ 7.6) · ให้อภัยเฉพาะข้อ "dir ไม่คงอยู่" ข้อเดียว (ไม่พบ token / status ≠ `NORMAL` / ใกล้หมดอายุ ยังบล็อกเหมือนเดิม) และคำเตือน `token_warning` ยังขึ้นทุก slot |
+| `LEGO_ALLOW_EPHEMERAL_TOKEN_DIR` | `false` | `true` = ยอมรับว่า token dir อยู่บน `/tmp` แล้วให้ `token_health()["ready"]` เป็น `true` · **ไม่จำเป็นสำหรับการส่ง order แล้ว**: `token_ready` ยอมรับหลักฐานว่า token นี้เพิ่งเซ็น request สำเร็จใน invocation เดียวกัน (ดู check 7 หัวข้อ 7.6) · ให้อภัยเฉพาะข้อ "dir ไม่คงอยู่" ข้อเดียว (status ≠ `NORMAL` / ใกล้หมดอายุ ยังบล็อกเหมือนเดิม) และคำเตือน `token_warning` ยังขึ้นทุก slot |
 | `LEGO_TOKEN_REFRESH_MARGIN_DAYS` | `3` | token อายุ 15 วันและ SDK **ไม่ต่ออายุให้** — เหลือน้อยกว่านี้จะเรียก `token/refresh` เองตอนสร้าง client · refresh ล้มเหลวไม่หยุด slot (token เดิมยังใช้ได้) แค่แจ้งเตือน |
 | `LEGO_MARKET_CATEGORY` | `US_STOCK` | Category ที่ใช้ขอ snapshot · ตั้ง `US_ETF` เมื่อ `LEGO_SYMBOL` เป็น ETF · ค่านอก enum ของ SDK = fail closed |
 | `LEGO_CLIENT_CACHE_TTL_SECONDS` | `3600` | instance ที่ยังอุ่นใช้ client คู่เดิม (สร้างใหม่ 1 ครั้ง = 4 auth request และ token create จำกัด 10/30s) · ครบเวลาแล้วสร้างใหม่เพื่อตรวจ token อีกรอบ |
@@ -502,7 +502,7 @@ gcloud functions deploy lego-order-worker --gen2 --region="$REGION" \
 | 4 | `row_actionable` | สถานะ `READY_BUY`/`READY_SELL` และ quantity > 0 | ไม่ใช่ decision ที่ส่งได้ |
 | 5 | `clock_not_degraded` | resolve slot ได้ (ตั้ง `LEGO_DNA_ORIGIN_UTC` แล้ว) | ไม่มี slot window → คำนวณ `expires_at` ไม่ได้ |
 | 6 | `step_matches_market_ordinal` | `DNA step` = `market_ordinal` ของ slot | order จะตกคนละ slot กับที่ DNA เทรนมา (เกิดใน mode `shadow` เมื่อ scheduler พลาด slot) |
-| 7 | `token_ready` | `token_health()["ready"]` **หรือ** (`durability_risk_only` และ token นี้เพิ่งเซ็น request สำเร็จใน invocation เดียวกัน) | ไม่พบ token file / status ≠ `NORMAL` / ใกล้หมดอายุ — สามข้อนี้บล็อกเสมอ · **token dir ไม่คงอยู่ ไม่บล็อกอีกแล้ว**: `fetch_snapshot` เรียก `account_v2.get_account_position` ด้วย ApiClient ตัวเดียวกับที่ `place_order` จะใช้ ผ่านแล้วจึงถึง preflight — token ที่เพิ่งเซ็นสำเร็จคือคำตอบของคำถามข้อนี้โดยตรง (คำเตือน `token_warning` ยังขึ้นทุก slot) |
+| 7 | `token_ready` | `token_health()["ready"]` **หรือ** (`live_proof_supersedable` และ token นี้เพิ่งเซ็น request สำเร็จใน invocation เดียวกัน) | status ≠ `NORMAL` / ใกล้หมดอายุ / วันหมดอายุอ่านไม่ได้ — สามข้อนี้บล็อกเสมอ (เป็นคำตัดสินเรื่องตัว token เอง) · **token dir ไม่คงอยู่ และ "ไม่พบ token file" ไม่บล็อกอีกแล้ว**: `fetch_snapshot` เรียก `account_v2.get_account_position` ด้วย ApiClient ตัวเดียวกับที่ `place_order` จะใช้ ผ่านแล้วจึงถึง preflight — token ที่เพิ่งเซ็นสำเร็จคือคำตอบของคำถามข้อนี้โดยตรง · **ทำไม "ไม่พบไฟล์" ถึงไม่ใช่ความผิด:** `ClientInitializer.init_token()` ถาม broker ก่อนว่าเปิด token check ไหม ถ้าตอบ `False` (log: `_check_token_enable result is False` — คือค่าที่ UAT app นี้ตอบทุกครั้ง) มันจะ return ก่อนสร้าง `TokenManager` เลย → `token.txt` **ไม่ถูกเขียนและจะไม่มีวันถูกเขียน** SDK เซ็นด้วย HMAC อย่างเดียว (คำเตือน `token_warning` ยังขึ้นทุก slot) |
 | 8 | `dna_headroom` | เหลือ ≥ `LEGO_AUTO_SUBMIT_MIN_DNA_REMAINING` | chain ใกล้ `DNA_EXHAUSTED` |
 
 ลำดับที่แนะนำให้ไล่ปิดก่อนเปิดจริง:
@@ -512,9 +512,10 @@ gcloud functions deploy lego-order-worker --gen2 --region="$REGION" \
    "recycle แล้วต้องกด 2FA ใหม่" และ `token_warning` จะขึ้นทุก slot จนกว่าจะย้าย
    แต่ **ไม่ใช่ตัวบล็อก order อีกแล้ว**: เดิม check 7 อ่าน `ready` ตรง ๆ ทำให้ deployment
    มาตรฐานบนแพลตฟอร์มนี้ผ่านไม่ได้เลย — ทุกแถว `READY_*` commit แล้วไม่มี intent สักใบ
-   และจำนวนถือครองไม่ขยับ (คือเคสจริงวันที่ 2026-07-28) · ตอนนี้ check 7 ยอมรับหลักฐาน
-   ว่า token เพิ่งเซ็น request สำเร็จ ส่วน `LEGO_ALLOW_EPHEMERAL_TOKEN_DIR` เหลือไว้
-   สำหรับ caller ที่ตัดสินใจก่อนจะมีหลักฐานนั้น
+   และจำนวนถือครองไม่ขยับ (คือเคสจริงวันที่ 2026-07-28 และ 2026-07-29/30) · ตอนนี้ check 7
+   ยอมรับหลักฐานว่า token เพิ่งเซ็น request สำเร็จ ทั้งกรณี "dir ไม่คงอยู่" และกรณี
+   "ไม่พบ token file" (broker ปิด token check จึงไม่มีไฟล์ให้พบ) ส่วน
+   `LEGO_ALLOW_EPHEMERAL_TOKEN_DIR` เหลือไว้สำหรับ caller ที่ตัดสินใจก่อนจะมีหลักฐานนั้น
 2. `python find_origin.py <dna_step+1>` → ตั้ง `LEGO_DNA_ORIGIN_UTC` → `LEGO_DNA_CLOCK_MODE=market`
    (ข้อ 7.5 → check 5 และ 6) · เปลี่ยนหลัง commit แรก = `CalendarDriftError` ต้องเริ่ม chain ใหม่
 3. ยิง 1 slot แล้วยืนยันว่า response มี `market_slot_id`, `market_step` และ `clock_mode` ไม่มีคำว่า `degraded`
@@ -641,7 +642,7 @@ field เตือนใน response ของแถวที่ commit สำ�
 | `outbox_error` | สร้าง intent ไม่สำเร็จ (แถว commit แล้ว ไม่ rollback) | ดู error แล้วเช็ค RTDB rules/quota · slot ถัดไปยังทำงานปกติ |
 | `clock_warning` | resolve slot ไม่ได้ จึงเดินด้วย legacy step | เหมือน `outbox_skipped` — ต้นเหตุเดียวกัน |
 | `dna_steps_remaining` | DNA เหลือน้อยกว่า `LEGO_DNA_LOW_WATERMARK` | เตรียม DNA ชุดใหม่ก่อนถึง `DNA_EXHAUSTED` |
-| `token_warning` | token ของ Webull ใกล้หมดอายุ / ไม่พบ / เก็บใน dir ที่ไม่คงอยู่ | ดูหัวข้อ `WEBULL_TOKEN_DIR` · นับสะสมที่ `webull_lego_warnings/webull_token` · แถวยัง commit ปกติ ไม่หยุด DNA · **เห็น `token_warning` เดี่ยว ๆ โดยไม่มี `outbox_blocked` = ปกติ** (เป็นเรื่อง dir ไม่คงอยู่เท่านั้น) · ถ้าเห็นคู่กับ `outbox_blocked_checks: ["token_ready"]` = token ใช้เซ็นไม่ได้จริง (ไม่พบไฟล์ / status ≠ `NORMAL` / ใกล้หมดอายุ) ต้องแก้ token ไม่ใช่แก้ dir |
+| `token_warning` | token ของ Webull ใกล้หมดอายุ / ไม่พบ / เก็บใน dir ที่ไม่คงอยู่ | ดูหัวข้อ `WEBULL_TOKEN_DIR` · นับสะสมที่ `webull_lego_warnings/webull_token` · แถวยัง commit ปกติ ไม่หยุด DNA · **เห็น `token_warning` เดี่ยว ๆ โดยไม่มี `outbox_blocked` = ปกติ** (เป็นเรื่อง dir ไม่คงอยู่ หรือ broker ปิด token check จึงไม่มีไฟล์) · ถ้าเห็นคู่กับ `outbox_blocked_checks: ["token_ready"]` = token ใช้เซ็นไม่ได้จริง (status ≠ `NORMAL` / ใกล้หมดอายุ) ต้องแก้ token ไม่ใช่แก้ dir |
 
 > [!WARNING]
 > **อาการ "จำนวนถือครอง (หุ้น) ไม่เปลี่ยนเลย" ทั้งที่แถวเป็น `READY_SELL`/`READY_BUY` ทุก slot**
@@ -658,8 +659,24 @@ field เตือนใน response ของแถวที่ commit สำ�
 > "token dir อยู่บน `/tmp`" เข้าไปด้วย — และ `/tmp` เป็น path เดียวที่ Cloud Functions เขียนได้
 > ทำให้ gate นี้ **ผ่านไม่ได้เลยบนแพลตฟอร์มที่ระบบรันอยู่** ทั้งที่ token ตัวเดียวกันเพิ่งเซ็น
 > `get_account_position` + `get_snapshot` สำเร็จใน invocation เดียวกันเพื่อสร้างแถวนั้นเอง
-> ตอนนี้ check 7 ยอมรับหลักฐานนั้น (ดูหัวข้อ 7.6) — ส่วนเหตุผลที่บอกว่า token เซ็นไม่ได้จริง
-> (ไม่พบไฟล์ / status ≠ `NORMAL` / ใกล้หมดอายุ) ยังบล็อกเหมือนเดิมทุกข้อ
+> ตอนนี้ check 7 ยอมรับหลักฐานนั้น (ดูหัวข้อ 7.6)
+>
+> **เคสจริง 2026-07-29 → 2026-07-30 (แก้แล้ว — อาการเดียวกัน ต้นเหตุคนละข้อ):** 37 แถวติดกัน
+> (DNA step 63 → 99) commit ครบทุก slot ไม่ขาด, 33 แถวเป็น `READY_BUY`/`READY_SELL`,
+> `จำนวนถือครอง (หุ้น)` = `8.78392` ทั้ง 37 แถว และ ΔAₙ/Aₙ/Eₙ = 0 ทั้งหมด · log บอกตรง ๆ ว่า
+> `blocked_by: ['token_ready']` เพราะ `ไม่พบ token file ที่ /tmp/webull_token/token.txt` —
+> **แต่ไฟล์นั้นไม่เคยถูกสร้างและจะไม่มีวันถูกสร้าง** เพราะ SDK log ในหน้าต่างเดียวกันตอบ
+> `_check_token_enable result is False` ทุกครั้ง: `ClientInitializer.init_token()` ถาม broker
+> ว่าเปิด token check ไหม ตอบ `False` แล้ว return ก่อนสร้าง `TokenManager` เลย (UAT app นี้เซ็น
+> ด้วย HMAC อย่างเดียว) · `token_health()` ตีความว่า "ไม่มีอะไรให้เซ็น" gate จึงปิดถาวร
+> ตอนนี้ "ไม่พบ token file" ถูกจัดเป็น `live_proof_supersedable` — หลักฐานว่า token เพิ่งเซ็น
+> request สำเร็จลบล้างการเดาจากไฟล์ในเครื่องได้ · ส่วนคำตัดสินเรื่องตัว token เอง
+> (status ≠ `NORMAL` / ใกล้หมดอายุ / วันหมดอายุอ่านไม่ได้) ยังบล็อกเหมือนเดิมทุกข้อ
+>
+> เกร็ดจาก log ชุดเดียวกันที่ **ไม่ใช่** ต้นเหตุ แต่เห็นแล้วมักเข้าใจผิด: `GATEWAY_TIMEOUT`
+> 504 บน `/openapi/assets/positions` โผล่เป็นชุด ๆ — `_retry_transient` กู้ได้ทุกครั้ง
+> (ทุก slot ในช่วงนั้น commit สำเร็จ) และหนึ่ง error จริงถูก log ซ้ำ 5–7 บรรทัดเพราะ
+> `set_stream_logger` ผูก handler เพิ่มทุกครั้งที่สร้าง client
 
 สถานะ outbox ที่ต้องมีคนเข้าไปดู (นอกจาก `RECONCILE_ABANDONED`):
 

@@ -252,6 +252,34 @@ def token_health(now: datetime | None = None) -> dict:
     "the token is unusable" apart from "the token works and its directory will
     not survive a recycle". False whenever any reason is about signing now, so it
     can never forgive a missing, rejected or expiring token.
+
+    `live_proof_supersedable` is the wider of the two exemptions and answers a
+    different question: is every recorded reason one that *inspecting a local
+    file* raised, and that direct evidence of a signed broker request settles
+    better? It adds exactly one reason to the durability set — a token file that
+    is not there at all — because on this deployment that is not a fault:
+
+        ClientInitializer.init_token() asks the broker whether token checking is
+        enabled and, when the answer is no, returns before TokenManager is ever
+        constructed. Nothing writes token.txt, nothing ever will, and the SDK
+        signs every request with HMAC alone. The UAT app the chain runs under
+        answers `_check_token_enable result is False` on every single call, so
+        `found` was permanently False, `ready` permanently False, and the
+        AUTO_SUBMIT gate permanently shut: rows committed READY_BUY/READY_SELL
+        for days, no intent was ever created, and the broker position — the
+        `จำนวนถือครอง (หุ้น)` column — never moved.
+
+    The inference the exemption rests on is one-directional and safe. If token
+    checking *were* enabled and no usable token existed, TokenManager.init_token
+    raises ERROR_INIT_TOKEN inside build_clients(), so the caller never reaches
+    the snapshot that earns the proof; and a create/refresh that did succeed
+    writes the file. A missing file plus an authenticated broker read therefore
+    means the broker is not asking for a token — not that we lost one.
+
+    Deliberately still excluded: an unreadable expiry, a non-NORMAL status, and a
+    token inside the refresh margin. Those are the broker's or the file's own
+    verdict on the token, and a call that happened to succeed a moment ago does
+    not overturn them.
     """
     now = now or datetime.now(timezone.utc)
     info = {
@@ -264,29 +292,39 @@ def token_health(now: datetime | None = None) -> dict:
         "ok": True,
         "ready": True,
         "durability_risk_only": False,
+        "live_proof_supersedable": False,
         "reasons": [],
     }
     durability_reasons: list[str] = []
+    supersedable_reasons: list[str] = []
 
     def fail(reason: str, *, blocks_now: bool = True,
-             durability_only: bool = False) -> None:
+             durability_only: bool = False,
+             live_proof_supersedable: bool = False) -> None:
         """Record a reason.
 
         `blocks_now` False marks it as already forgiven for `ready`.
         `durability_only` marks it as saying nothing about whether the token in
         hand can sign a request — the two are independent, because the operator
         flag decides the first and the nature of the reason decides the second.
+        `live_proof_supersedable` marks it as a local-file finding that direct
+        evidence of a signed broker request answers; durability reasons are
+        always such a finding, so they never have to say so twice.
         """
         info["ok"] = False
         if blocks_now:
             info["ready"] = False
         if durability_only:
             durability_reasons.append(reason)
+        if durability_only or live_proof_supersedable:
+            supersedable_reasons.append(reason)
         info["reasons"].append(reason)
 
     def seal() -> dict:
         info["durability_risk_only"] = bool(info["reasons"]) and (
             len(durability_reasons) == len(info["reasons"]))
+        info["live_proof_supersedable"] = bool(info["reasons"]) and (
+            len(supersedable_reasons) == len(info["reasons"]))
         return info
 
     if info["ephemeral_token_dir"]:
@@ -296,7 +334,8 @@ def token_health(now: datetime | None = None) -> dict:
              durability_only=True)
     local = read_local_token()
     if local is None:
-        fail(f"ไม่พบ token file ที่ {token_file_path()} — ครั้งถัดไปจะต้องยืนยัน 2FA ใหม่")
+        fail(f"ไม่พบ token file ที่ {token_file_path()} — ครั้งถัดไปจะต้องยืนยัน 2FA ใหม่",
+             live_proof_supersedable=True)
         return seal()
     info["found"] = True
     info["status"] = local["status"] or None

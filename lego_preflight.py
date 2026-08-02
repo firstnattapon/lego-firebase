@@ -167,14 +167,24 @@ def evaluate_auto_submit_preflight(*, auto_submit, environment, row, row_durable
     # Cloud Functions offers. That left the deployed default in exactly the state
     # this gate exists to prevent: every slot committing READY_SELL with the
     # order blocked on a token that had just authenticated two calls in the same
-    # invocation. So a durability-only verdict yields to live proof — the caller
-    # says the token signed a real broker request moments ago, which answers this
-    # check's question directly and better than any local file inspection can.
-    # Deliberately narrow: `durability_risk_only` is False the moment any reason
-    # is about signing now, so a missing, rejected or expiring token still
-    # blocks no matter what the caller proved.
+    # invocation. So a local-file verdict yields to live proof — the caller says
+    # the token signed a real broker request moments ago, which answers this
+    # check's question directly and better than any file inspection can.
+    #
+    # `live_proof_supersedable` is what token_health offers now; it covers the
+    # durability warning and one more finding that turned out to be equally
+    # unanswerable from disk — no token file at all. On a broker app with token
+    # checking disabled the SDK never writes one and never will, so that reason
+    # alone shut the gate permanently and the position never moved.
+    # `durability_risk_only` is still honoured on its own so a health report from
+    # before the wider field existed keeps working unchanged.
+    #
+    # Deliberately narrow either way: both flags are False the moment any reason
+    # is the broker's or the file's own verdict on the token, so a rejected or
+    # expiring token still blocks no matter what the caller proved.
     if (token_usable is not True and token_proved_live is True
-            and token.get("durability_risk_only") is True):
+            and (token.get("durability_risk_only") is True
+                 or token.get("live_proof_supersedable") is True)):
         token_usable = True
     checks.append(_check(
         "token_ready", token_usable is True,
