@@ -19,6 +19,7 @@ Stack: **Scheduler (เวลา) → Cloud Function (engine) → RTDB (data) �
 | `webull_io.py` | adapter ของ Webull OpenAPI (snapshot, position, preview/place/detail) |
 | `find_origin.py` | เครื่องมือหา `LEGO_DNA_ORIGIN_UTC` ก่อนเปิด clock mode `market` |
 | `lego_cashflow_audit.py` | ตรวจแถวที่ commit ไปแล้วเทียบกฎ `execution_confirmed_v1` — **อ่านอย่างเดียว ไม่แก้ RTDB** |
+| `lego_admin_reconcile.py` | เครื่องมือ operator แบบ dry-run ก่อนเสมอ: อ่าน broker terminal evidence + ตรวจ row/model/realized ledger แล้วจึงปลด manual chain fence ด้วย exact ACK และ transaction |
 
 ```
 PROJECT=your-gcp-project
@@ -54,6 +55,8 @@ firebase deploy --only database --project="$PROJECT"
     "webull_lego_order_audit_archive": { ".read": true, ".write": false },
     "webull_lego_order_outbox": { ".read": false, ".write": false },
     "webull_lego_order_outbox_archive": { ".read": false, ".write": false },
+    "webull_lego_order_dispatch_locks": { ".read": false, ".write": false },
+    "webull_lego_admin_reconcile_audit": { ".read": false, ".write": false },
     "webull_lego_realized": { ".read": false, ".write": false },
     "webull_lego_errors":{ ".read": false, ".write": false },
     "webull_lego_warnings":{ ".read": true, ".write": false }
@@ -70,7 +73,7 @@ firebase deploy --only database --project="$PROJECT"
 # ไม่ตั้ง origin = clock resolve ไม่ได้ = โหมด degraded ซึ่ง "commit แถวได้ปกติ แต่ไม่สร้าง
 # order intent เลยสักใบ" (response จะมี outbox_skipped + นับใน webull_lego_warnings)
 # หาค่า origin ด้วย `python find_origin.py <dna_step ถัดไป>` ก่อน แล้วค่อย deploy
-ENVS=FIREBASE_DB_URL=$DB_URL,WEBULL_ENV=UAT,LEGO_SYMBOL=APLS,LEGO_FIX_C=1500,LEGO_DIFF=60,LEGO_DNA_CODE=bypass:100,LEGO_DECIMAL_PRECISION=5,LEGO_SLOT_SECONDS=1800,LEGO_DNA_ORIGIN_UTC=2026-07-23T13:30:00Z,LEGO_DNA_CLOCK_MODE=market,AUTO_SUBMIT=false
+ENVS=FIREBASE_DB_URL=$DB_URL,WEBULL_ENV=UAT,LEGO_SYMBOL=AAPL,LEGO_FIX_C=1500,LEGO_DIFF=60,LEGO_DNA_CODE=bypass:100,LEGO_DECIMAL_PRECISION=5,LEGO_SLOT_SECONDS=1800,LEGO_DNA_ORIGIN_UTC=2026-07-23T13:30:00Z,LEGO_DNA_CLOCK_MODE=market,AUTO_SUBMIT=false
 SECRETS=WEBULL_APP_KEY=webull-app-key:latest,WEBULL_APP_SECRET=webull-app-secret:latest,WEBULL_ACCOUNT_ID=webull-account-id:latest
 
 gcloud functions deploy lego-one-row \
@@ -92,7 +95,7 @@ gcloud functions deploy lego-archive-worker \
   --source=. --entry-point=lego_archive_worker \
   --trigger-http --no-allow-unauthenticated \
   --memory=512Mi --timeout=300s \
-  --set-env-vars=$ENVS --set-secrets=$SECRETS --project=$PROJECT
+  --set-env-vars=$ENVS --project=$PROJECT
 ```
 > UAT ก่อนเสมอ (`WEBULL_ENV=UAT`), `AUTO_SUBMIT=false` จน pipeline นิ่ง แล้วค่อยเปิด
 > `WEBULL_ENV` รับเฉพาะ `UAT`, `PROD`, `PRODUCTION` (ไม่สนตัวพิมพ์เล็ก/ใหญ่);
@@ -112,19 +115,19 @@ gcloud functions deploy lego-archive-worker \
 | ฝั่ง | เขียนอะไร | เงื่อนไข |
 |---|---|---|
 | `lego_one_row` | decision pointer: `version`, `dna_step`, `p0`, `slot_id`, `market_ordinal` + คอลัมน์ตัดสินใจทั้งหมด และ `Rₙ` (live ทุกแถว) | ทุก slot ที่ commit สำเร็จ |
-| `lego_order_worker` | execution cashflow: `execution_cashflow.last_action_price` (P_acted), `execution_cashflow.actual_cumulative` (Aₙ) + คอลัมน์ `ΔAₙ`/`Aₙ`/`Eₙ` ของแถวนั้น | เฉพาะเมื่อ broker ยืนยัน `cumulative_filled_quantity > 0` **และ** อ่าน holdings หลัง fill แล้วเปลี่ยนจริง |
+| `lego_order_worker` | execution cashflow: `execution_cashflow.last_action_price` (P_acted), `execution_cashflow.actual_cumulative` (Aₙ) + คอลัมน์ `ΔAₙ`/`Aₙ`/`Eₙ` ของแถวนั้น | เฉพาะเมื่อ broker เป็น terminal, ยืนยัน `cumulative_filled_quantity > 0` **และ** อ่าน holdings หลัง fill แล้วเปลี่ยนจริง |
 
 - แถวที่ commit แล้วแต่ยังไม่ fill มี `cashflow_status = PENDING_EXECUTION` และ `ΔAₙ = 0`
   (`Aₙ` ค้างที่ค่าจาก fill ล่าสุด) — `SUBMITTED`/`PENDING_DISPATCH`/`READY_*` ไม่เคยเพิ่ม `Aₙ`
-- fill แล้ว → `cashflow_status = FINALIZED` พร้อม `execution_price`, `execution_quantity`,
+- terminal fill แล้ว → `cashflow_status = FINALIZED` พร้อม `execution_price`, `execution_quantity`,
   `post_execution_holdings` (ทั้งหมดอยู่นอก 17 คอลัมน์)
 - `ΔAₙ` ใช้ **filled_price จริง** ไม่ใช่ `decision_price`; holdings ใช้ค่าที่อ่านกลับจาก broker
   ไม่ใช่จำนวนที่สั่ง
-- finalize เป็น transaction เดียว idempotent ที่ `run_id` (= `client_order_id`) → retry, poll ซ้ำ
-  ของ partial fill และ worker หลาย instance บันทึกได้ครั้งเดียว
+- finalize เป็น transaction เดียว idempotent ที่ `run_id` (= `client_order_id`) → partial fill
+  รอ terminal cumulative quantity/average price ก่อน; retry และ worker หลาย instance บันทึกได้ครั้งเดียว
 - fill ที่ broker ยืนยันแต่ holdings ยังไม่ขยับ → `AWAITING_FILL_CONFIRMATION` (ไม่ terminal)
-  แล้วลองใหม่จนถึงเพดาน `LEGO_FILL_CONFIRM_MAX_ATTEMPTS` (default 5) จึงปล่อยออกจากคิว
-  พร้อม `needs_manual_check` — ห้าม book cashflow จากคำพูด broker อย่างเดียว
+  แล้วลองใหม่จนถึงเพดาน `LEGO_FILL_CONFIRM_MAX_ATTEMPTS` (default 5) จึงออกจาก actionable queue
+  พร้อม `needs_manual_check` แต่คง chain fence ไว้ — ห้าม book cashflow จากคำพูด broker อย่างเดียว
 
 > **อัปเกรด chain เดิม:** `cashflow_semantics` เปลี่ยนเป็น `execution_confirmed_v1`
 > ความหมายของ `Aₙ` ต่างจาก `gated_theoretical_v2` (อันเดิมนับ decision เป็น act) จึงลากต่อกันไม่ได้
@@ -149,17 +152,28 @@ state ใหม่เก็บเฉพาะ SHA-256 fingerprint ของ `WEB
 - fingerprint ไม่ตรง: fail closed เป็น `CONFIG_ERROR` — ไม่มีสวิตช์ให้ข้าม ถ้าตั้งใจย้ายบัญชี
   ต้องเริ่ม chain ใหม่
 
-## 4. Cloud Scheduler (ทุก 30 นาที ในกรอบตลาดสหรัฐฯ; โค้ด guard วันหยุดเอง)
+## 4. Cloud Scheduler (ยิงถี่กว่า slot ในกรอบตลาดสหรัฐฯ; โค้ด guard วันหยุดเอง)
 
 ```bash
+# ใช้ caller identity แยกจาก runtime identity ของ function (least privilege)
+gcloud iam service-accounts create lego-scheduler-invoker \
+  --display-name="LEGO Scheduler Invoker" --project=$PROJECT
+SCHEDULER_SA="lego-scheduler-invoker@$PROJECT.iam.gserviceaccount.com"
+
+# Gen2 function เป็น Cloud Run ใต้ฝากระโปรง: private function ต้อง grant invoker
+# ให้ caller SA ทุกตัว มิฉะนั้น Scheduler จะได้ 403
+for FN in lego-one-row lego-order-worker lego-archive-worker; do
+  gcloud functions add-invoker-policy-binding "$FN" \
+    --region=$REGION --member="serviceAccount:$SCHEDULER_SA" --project=$PROJECT
+done
+
 URL=$(gcloud functions describe lego-one-row --gen2 --region=$REGION --format='value(serviceConfig.uri)')
-SA=$(gcloud functions describe lego-one-row --gen2 --region=$REGION --format='value(serviceConfig.serviceAccountEmail)')
 
 gcloud scheduler jobs create http lego-tick \
-  --location=$REGION --schedule="*/30 13-20 * * 1-5" --time-zone="UTC" \
+  --location=$REGION --schedule="*/5 13-20 * * 1-5" --time-zone="UTC" \
   --max-retry-attempts=0 \
   --uri="$URL" --http-method=POST \
-  --oidc-service-account-email="$SA" --oidc-token-audience="$URL" \
+  --oidc-service-account-email="$SCHEDULER_SA" --oidc-token-audience="$URL" \
   --project=$PROJECT
 
 WURL=$(gcloud functions describe lego-order-worker --gen2 --region=$REGION --format='value(serviceConfig.uri)')
@@ -167,7 +181,7 @@ gcloud scheduler jobs create http lego-order-tick \
   --location=$REGION --schedule="*/5 13-20 * * 1-5" --time-zone="UTC" \
   --max-retry-attempts=0 \
   --uri="$WURL" --http-method=POST \
-  --oidc-service-account-email="$SA" --oidc-token-audience="$WURL" \
+  --oidc-service-account-email="$SCHEDULER_SA" --oidc-token-audience="$WURL" \
   --project=$PROJECT
 
 AURL=$(gcloud functions describe lego-archive-worker --gen2 --region=$REGION --format='value(serviceConfig.uri)')
@@ -175,13 +189,15 @@ gcloud scheduler jobs create http lego-archive-tick \
   --location=$REGION --schedule="30 22 * * *" --time-zone="UTC" \
   --max-retry-attempts=0 \
   --uri="$AURL" --http-method=POST \
-  --oidc-service-account-email="$SA" --oidc-token-audience="$AURL" \
+  --oidc-service-account-email="$SCHEDULER_SA" --oidc-token-audience="$AURL" \
   --project=$PROJECT
 ```
 > cron ยิงเผื่อไว้ 13:00–20:30 UTC (ครอบทั้ง EDT 13:30–20:00 และ EST 14:30–21:00);
 > `market_clock.is_regular_session()` ตัดนอกเวลาด้วยปฏิทินเดียวกับที่คำนวณ ordinal —
 > **9:30–16:00 America/New_York (DST-aware), รู้จักวันหยุดและ early close 13:00** → `PASS_MARKET_CLOSED`
-> `--max-retry-attempts=0` + `LEGO_SLOT_SECONDS=1800` = สองชั้นกัน retry สร้าง 2 แถวใน slot เดียว (กิน DNA step ซ้ำ)
+> cron ต้องยิง **ถี่กว่า** `LEGO_SLOT_SECONDS`: ถ้า tick แรกเจอ cold-start/503 tick ถัดไปยังทัน
+> slot เดิม; transaction + slot guard ทำให้เรียกซ้ำแล้วได้ `SLOT_CONSUMED` แทนการสร้าง 2 แถว
+> ส่วน `--max-retry-attempts=0` กัน Scheduler retry ซ้อนกับ tick ถัดไป
 > order worker ยิงถี่กว่า slot ได้ (ไม่กระทบ DNA) — มันแค่ไล่ intent ที่ค้างในหน้าต่างของ slot นั้น
 
 ## 5. Streamlit (streamlit.app)
@@ -248,8 +264,10 @@ python lego_cashflow_audit.py rows.csv 3000 340.08   # chain ที่ตัด�
 5. order ส่งได้เฉพาะ UAT + READY_* + row committed แล้ว + ผ่าน submit gate; Production read-only
 6. FILLED ยืนยันจาก order detail ของ broker เท่านั้น — ไม่โม้จาก SUBMITTED
 7. commit แถวก่อน แล้วค่อยเขียน outbox — order พังต้องไม่ rollback แถวและไม่ขวาง slot ถัดไป
-8. order ใบเดียวที่ค้างต้องไม่ขวางใบถัดไป — `PLACING_UNKNOWN` มีเพดาน
-   (`LEGO_RECONCILE_MAX_ATTEMPTS`) แล้วจบเป็น `RECONCILE_ABANDONED` + `needs_manual_check`
+8. order ที่ยังตอบไม่ได้ว่า broker รับหรือไม่ต้อง **ขวาง money path ของ chain เดิม** —
+   `PLACING_UNKNOWN` มีเพดานการถาม (`LEGO_RECONCILE_MAX_ATTEMPTS`) แล้วเปลี่ยนเป็น
+   `RECONCILE_ABANDONED` + `needs_manual_check`; DNA/slot ยังเดินต่อ แต่ order ถัดไปห้ามส่ง
+   จนคนกระทบยอดและยืนยันผลของ `run_id` เดิม
 9. จำนวนที่ส่ง broker ต้องเท่าจำนวนที่ตัดสินใจเสมอ ทุกค่า `LEGO_DECIMAL_PRECISION` รวม `0`
 10. snapshot ที่ทำให้ของหายไปทั้งก้อนต้องไม่กลายเป็น order — `gap = FIX_C` คือ order ใหญ่สุด
     ที่กลยุทธ์สร้างได้ และการ rebalance ปกติทำให้ holdings เป็น 0 ไม่ได้
@@ -264,11 +282,13 @@ python lego_cashflow_audit.py rows.csv 3000 340.08   # chain ที่ตัด�
 13. ราคาที่เข้าสมการต้องเป็นราคาของ `LEGO_SYMBOL` เท่านั้น — snapshot ที่ตอบมาเป็น symbol อื่น
     ต้อง fail closed ไม่ใช่เอามาคิด `gap`
 14. order ที่ fill แล้วต้องไม่ถูกส่งซ้ำ แม้ realized ledger จะคำนวณต่อไม่ได้ — จบเป็น
-    `REALIZED_MATH_ERROR` + `needs_manual_check` (คนละเรื่องกับ "ไม่รู้ว่า order มีจริงไหม")
+    `REALIZED_MATH_ERROR` + `needs_manual_check` และคง chain fence จนกระทบยอดเสร็จ
+    (คนละเรื่องกับ "ไม่รู้ว่า order มีจริงไหม")
 15. `webull-openapi-python-sdk` ต้อง pin exact version — SDK คุม signing/auth/order payload
     โดยตรง การอัปเดตต้องผ่าน UAT ก่อนเสมอ (เหตุผลเดียวกับ numpy)
-17. worker ต้อง claim intent ด้วย RTDB transaction ก่อนทำงาน และผ่าน generation fence
-    ก่อน `place_order`; lease หมดอายุไม่ทำให้ worker เก่าวิ่งข้าม fence
+17. worker ต้อง claim intent ด้วย RTDB transaction และ claim money path ทีละ chain ก่อนทำงาน
+    แล้วผ่าน generation fence ก่อน `place_order`; owner lease หมดอายุได้ แต่ durable
+    `inflight_run_id` ห้ามหมดตาม — successor ทำได้แค่ reconcile run เดิมก่อน order ใบอื่น
 18. open-order pagination ต้องพิสูจน์ว่าครบทุกหน้า; cursor หาย/ไม่เดิน/ชนเพดาน =
     คง `PENDING_DISPATCH` และไม่ส่ง order
 19. `cashflow_semantics` ของ chain ต้องเดินหน้าเท่านั้น — revision ที่นับ "การตัดสินใจ"
@@ -280,7 +300,15 @@ python lego_cashflow_audit.py rows.csv 3000 340.08   # chain ที่ตัด�
 20. audit ที่เขียนไม่สำเร็จต้องมี `audit_pending` ใน private outbox และถูกซ่อมก่อน archive
 21. `ΔAₙ`/`Aₙ`/`Eₙ` ขยับได้จาก fill ที่ broker ยืนยันเท่านั้น — `READY_*`, `PENDING_DISPATCH`
     และ `SUBMITTED` ห้ามเพิ่ม `Aₙ`; PASS ให้ `ΔAₙ = 0` และ `Aₙ` คงเดิม
-22. finalize ต้อง idempotent ที่ `run_id` — partial fill ใช้ cumulative quantity และ finalize
-    ครั้งเดียว, worker หลาย instance ต้องได้ผลเดียวกัน, retry ต้องไม่คำนวณซ้ำ
+22. finalize ต้อง idempotent ที่ `run_id` — `PARTIAL_FILLED` ยังห้าม finalize model ledger
+    เพราะ cumulative quantity/average price ยังเปลี่ยนได้; finalize ครั้งเดียวเมื่อ broker terminal
+    โดยใช้ค่า cumulative สุดท้าย (รวม `CANCELLED`/`EXPIRED` ที่ fill บางส่วน), worker หลาย instance
+    ต้องได้ผลเดียวกัน และ retry ต้องไม่คำนวณซ้ำ
 23. finalize ห้ามแตะ decision pointer (`version`, `dna_step`, `p0`, `slot_id`, `market_ordinal`)
     — cashflow อยู่ใต้ `execution_cashflow` และ commit รอบถัดไปต้องพา state นั้นไปต่อ ไม่ทับ
+24. ก่อน MARKET `place_order` ต้องอ่าน snapshot ใหม่และ re-decision: holdings/ราคา/อายุ quote
+    ต้องอยู่ใน safety budget, side ต้องไม่กลายเป็น PASS/ฝั่งตรงข้าม และ quantity เดิมห้าม rebalance
+    เลยเป้าปัจจุบัน; ไม่ผ่าน = `SUPPRESSED_STATE_CHANGED` และส่ง order ศูนย์ใบ
+25. manual terminal ห้ามปลด `inflight_run_id` ตรงใน Console — ใช้ `lego_admin_reconcile.py`
+    ซึ่งตรวจ terminal broker evidence + row/model/realized ledger, exact ACK, generation fence และ
+    immutable audit; dry-run เป็น default และไม่เรียก preview/place/cancel/replace

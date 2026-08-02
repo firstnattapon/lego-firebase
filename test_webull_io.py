@@ -116,10 +116,21 @@ def test_unusable_price_shapes_return_zero():
 
 def test_fetch_snapshot_reads_price_and_position():
     trade = fake_trade_client(positions={"positions": [{"symbol": "FFWM", "quantity": "3"}]})
-    data = fake_data_client(snapshot=[{"symbol": "FFWM", "last": 12.5}])
+    data = fake_data_client(snapshot=[{
+        "symbol": "FFWM", "last": 12.5,
+        "last_trade_time": 1761131406558,
+    }])
     snap = fetch_snapshot(trade, data, CFG)
     assert (snap["price"], snap["holdings"]) == (12.5, 3.0)
     assert snap["captured_at"].endswith("Z")
+    assert snap["quote_time"] == "2025-10-22T11:10:06.558Z"
+
+
+def test_fetch_snapshot_refuses_price_without_source_trade_time():
+    trade = fake_trade_client(positions={"positions": []})
+    data = fake_data_client(snapshot=[{"symbol": "FFWM", "last": 12.5}])
+    with pytest.raises(ValueError, match="last_trade_time"):
+        fetch_snapshot(trade, data, CFG)
 
 
 def test_fetch_snapshot_refuses_a_foreign_price():
@@ -249,7 +260,8 @@ def test_transient_broker_error_is_retried_by_the_adapter(monkeypatch):
         return {"positions": [{"symbol": "FFWM", "quantity": 2}]}
 
     trade = fake_trade_client(positions=flaky)
-    data = fake_data_client(snapshot={"last": 10.0})
+    data = fake_data_client(snapshot={
+        "last": 10.0, "last_trade_time": 1761131406558})
     assert fetch_snapshot(trade, data, CFG)["holdings"] == 2.0
     assert attempts["n"] == 3
 
@@ -270,6 +282,15 @@ def test_rate_limiting_counts_as_transient():
     assert webull_io.is_transient_exception(_Throttled("slow down")) is True
     assert webull_io.is_transient_exception(_Down("gateway")) is True
     assert webull_io.is_transient_exception(ValueError("bad request")) is False
+
+
+@pytest.mark.parametrize("code", [
+    "SDK.HttpError", "SDK.UnknownServerError", "SDK.EndpointResolvingError",
+])
+def test_sdk_transport_errors_are_transient_for_reads_only(code):
+    exc = RuntimeError("transport")
+    exc.error_code = code
+    assert webull_io.is_transient_exception(exc) is True
 
 
 def test_a_placed_order_is_never_sent_twice():
@@ -295,7 +316,10 @@ def test_market_data_403_is_named_for_what_it_is():
 
 def test_the_snapshot_category_is_configurable_and_validated(monkeypatch):
     trade = fake_trade_client(positions={"positions": []})
-    data = fake_data_client(snapshot=[{"symbol": "FFWM", "last": 12.5}])
+    data = fake_data_client(snapshot=[{
+        "symbol": "FFWM", "last": 12.5,
+        "last_trade_time": 1761131406558,
+    }])
     monkeypatch.setenv("LEGO_MARKET_CATEGORY", "us_etf")
     fetch_snapshot(trade, data, CFG)
     assert data.market_data.get_snapshot.calls[0][0][1] == "US_ETF"
@@ -308,6 +332,17 @@ def test_the_snapshot_category_is_configurable_and_validated(monkeypatch):
 def test_the_default_category_is_unchanged(monkeypatch):
     monkeypatch.delenv("LEGO_MARKET_CATEGORY", raising=False)
     assert webull_io.market_category() == "US_STOCK"
+
+
+@pytest.mark.parametrize(
+    "category",
+    sorted(set(webull_io.CATEGORIES) - set(webull_io.EXECUTION_CATEGORIES)),
+)
+def test_non_us_equity_categories_fail_before_the_money_path(monkeypatch, category):
+    """Snapshot and order payload must describe the same instrument family."""
+    monkeypatch.setenv("LEGO_MARKET_CATEGORY", category)
+    with pytest.raises(webull_io.WebullConfigError, match="US EQUITY"):
+        webull_io.market_category()
 
 
 # ---- token lifecycle: the SDK renews nothing --------------------------------
@@ -567,6 +602,17 @@ def test_sdk_logs_cannot_carry_credentials(caplog):
     assert "FFWM" in text                      # only the credentials are removed
 
 
+@pytest.mark.parametrize("source", [
+    "signature:abc123",
+    "{'x-app-key': 'abc123', 'symbol': 'FFWM'}",
+    "x-app-key%3Dabc123&symbol=FFWM",
+])
+def test_redactor_covers_real_sdk_and_encoded_log_shapes(source):
+    redacted = webull_io.redact_sensitive_text(source)
+    assert "abc123" not in redacted
+    assert "<redacted>" in redacted
+
+
 def test_redaction_is_installed_once_per_handler(monkeypatch):
     _install_fake_sdk(monkeypatch)
     monkeypatch.setenv("WEBULL_APP_KEY", "key")
@@ -583,6 +629,35 @@ def test_redaction_is_installed_once_per_handler(monkeypatch):
     finally:
         sdk_logger.removeHandler(handler)
     assert len(filters) == 1
+
+
+def test_sdk_stream_handler_is_reused_across_client_rebuilds():
+    sdk_logger = logging.getLogger("webull.core")
+    original = list(sdk_logger.handlers)
+
+    class Api:
+        def __init__(self):
+            self.calls = 0
+
+        def set_stream_logger(self, log_level=None, stream=None,
+                              format_string=None):
+            self.calls += 1
+            sdk_logger.addHandler(logging.StreamHandler(stream))
+            self._stream_logger_set = True
+
+    first, second = Api(), Api()
+    try:
+        webull_io._configure_sdk_stream_logger(first)
+        webull_io._configure_sdk_stream_logger(second)
+        managed = [h for h in sdk_logger.handlers
+                   if getattr(h, "_lego_webull_stream", False)]
+        assert len(managed) == 1
+        assert first.calls == 1 and second.calls == 0
+        assert second._stream_logger_set is True
+    finally:
+        for handler in list(sdk_logger.handlers):
+            if handler not in original:
+                sdk_logger.removeHandler(handler)
 
 
 def test_warm_instances_reuse_one_authenticated_client_pair(monkeypatch):

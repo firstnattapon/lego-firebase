@@ -20,7 +20,7 @@ from datetime import datetime, timedelta, timezone
 from firebase_admin import db
 
 from lego_orders import TERMINAL_STATUSES, normalize_status
-from lego_outbox import OUTBOX_PATH, TERMINAL
+from lego_outbox import DISPATCH_LOCK_PATH, OUTBOX_PATH, TERMINAL
 from lego_state import AUDIT_PATH
 
 UTC = timezone.utc
@@ -74,9 +74,19 @@ def archive_terminal_intents(cutoff: datetime, limit: int) -> int:
     for ck, intents in (db.reference(OUTBOX_PATH).get() or {}).items():
         if not isinstance(intents, dict):
             continue
+        dispatch = db.reference(f"{DISPATCH_LOCK_PATH}/{ck}").get() or {}
+        inflight_run_id = str(dispatch.get("inflight_run_id") or "") \
+            if isinstance(dispatch, dict) else ""
         for run_id, doc in intents.items():
             if moved >= limit:
                 return moved
+            # A terminal result is written before the order worker clears its
+            # durable chain fence. If a crash lands between those operations,
+            # archiving this source would make recovery see a missing inflight
+            # intent and block the chain forever. Leave it live until the fence
+            # is cleared; on the next archive tick it becomes movable normally.
+            if str(run_id) == inflight_run_id:
+                continue
             if _movable(doc, TERMINAL, cutoff):
                 _move(f"{OUTBOX_PATH}/{ck}", f"{OUTBOX_ARCHIVE_PATH}/{ck}", run_id, doc)
                 moved += 1

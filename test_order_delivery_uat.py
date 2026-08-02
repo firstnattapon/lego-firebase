@@ -119,6 +119,7 @@ def _run(monkeypatch, moment=PROD_MOMENT, price=PROD_PRICE, holdings=PROD_HOLDIN
     monkeypatch.setattr(main, "datetime", _fixed_now(moment))
     monkeypatch.setattr(main, "fetch_snapshot", lambda t, d, cfg: {
         "captured_at": moment.strftime("%Y-%m-%dT%H:%M:%SZ"),
+        "quote_time": moment.strftime("%Y-%m-%dT%H:%M:%SZ"),
         "price": price, "holdings": holdings,
     })
     return main.lego_one_row(object())

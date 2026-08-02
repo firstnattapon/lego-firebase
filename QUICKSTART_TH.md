@@ -179,7 +179,10 @@ finalize ΔAₙ/Aₙ/Eₙ`) ก่อนแตะเงินจริง
 
 ถ้ายังไม่อยากให้มี order intent เลยแม้แต่ใบเดียวระหว่างทดสอบ ตั้ง `AUTO_SUBMIT=false`
 แทนได้ (ค่า default ของโค้ดคือ `false` อยู่แล้ว) แล้วค่อยเปิดทีหลัง
-ส่วนการย้ายไป production เป็นคนละเรื่อง — เปลี่ยน `WEBULL_ENV` เมื่อมั่นใจแล้วเท่านั้น
+ส่วน production ต้องแยก Google Cloud project/RTDB/credential จาก UAT
+และเริ่ม chain ใหม่—ห้ามเปลี่ยน `WEBULL_ENV` ครอบ RTDB/chain เดิม เพราะ
+runtime-identity guard จะ fail closed. รุ่นนี้ให้ Production เป็น read-only; ไม่มีทางส่ง
+คำสั่งจริงจนกว่าจะมีการอนุมัติ product/safety แยกต่างหาก.
 
 ### ตาราง env ทั้งหมดที่โค้ดอ่านจริง
 
@@ -211,7 +214,7 @@ finalize ΔAₙ/Aₙ/Eₙ`) ก่อนแตะเงินจริง
 | `WEBULL_TOKEN_DIR` | `/tmp/webull_token` | ที่เก็บ token ของ SDK · ⚠️ `/tmp` หายทุกครั้งที่ instance ถูกรีไซเคิล → SDK จะสร้าง token ใหม่และรอคนกด 2FA ในแอป 300 วิ ถ้าไม่มีคนกด = `ERROR_INIT_TOKEN` · ชี้ไป volume ที่คงอยู่ (เช่น GCS FUSE mount) จะเห็นคำเตือนที่ `webull_lego_warnings/webull_token` จนกว่าจะย้าย |
 | `LEGO_ALLOW_EPHEMERAL_TOKEN_DIR` | `false` | `true` = ยอมรับว่า token dir อยู่บน `/tmp` แล้วให้ `token_health()["ready"]` เป็น `true` · **ไม่จำเป็นสำหรับการส่ง order แล้ว**: `token_ready` ยอมรับหลักฐานว่า token นี้เพิ่งเซ็น request สำเร็จใน invocation เดียวกัน (ดู check 7 หัวข้อ 7.6) · ให้อภัยเฉพาะข้อ "dir ไม่คงอยู่" ข้อเดียว (status ≠ `NORMAL` / ใกล้หมดอายุ ยังบล็อกเหมือนเดิม) และคำเตือน `token_warning` ยังขึ้นทุก slot |
 | `LEGO_TOKEN_REFRESH_MARGIN_DAYS` | `3` | token อายุ 15 วันและ SDK **ไม่ต่ออายุให้** — เหลือน้อยกว่านี้จะเรียก `token/refresh` เองตอนสร้าง client · refresh ล้มเหลวไม่หยุด slot (token เดิมยังใช้ได้) แค่แจ้งเตือน |
-| `LEGO_MARKET_CATEGORY` | `US_STOCK` | Category ที่ใช้ขอ snapshot · ตั้ง `US_ETF` เมื่อ `LEGO_SYMBOL` เป็น ETF · ค่านอก enum ของ SDK = fail closed |
+| `LEGO_MARKET_CATEGORY` | `US_STOCK` | Category ที่ใช้ขอ snapshot · money path ปัจจุบันรองรับเฉพาะ `US_STOCK` และ `US_ETF` ให้ตรงกับ payload `US EQUITY`; category อื่น fail closed ก่อนเรียก broker |
 | `LEGO_CLIENT_CACHE_TTL_SECONDS` | `3600` | instance ที่ยังอุ่นใช้ client คู่เดิม (สร้างใหม่ 1 ครั้ง = 4 auth request และ token create จำกัด 10/30s) · ครบเวลาแล้วสร้างใหม่เพื่อตรวจ token อีกรอบ |
 | `LEGO_WEBULL_LOG_LEVEL` | `INFO` | ระดับ log ของ SDK ที่ส่งลง stdout · `DEBUG` จะพิมพ์ response body ทุกครั้ง (มีข้อมูลบัญชี) |
 | `LEGO_ALLOW_ZERO_HOLDINGS` | `false` | `true` = ยอมรับว่า "ถือ 0 จริง" ทั้งที่ chain เคยเห็นของ · ใช้เฉพาะตอนขายทิ้งเอง/ย้าย position นอกระบบ **แล้วเอาออกทันที** (ดู `HOLDINGS_ANOMALY`) |
@@ -232,13 +235,17 @@ finalize ΔAₙ/Aₙ/Eₙ`) ก่อนแตะเงินจริง
 |---|---|---|
 | `LEGO_INLINE_ORDER_WORKER` | `false` | `true` = ส่ง order ต่อท้ายการ commit เลย (เพิ่ม latency ให้ฟังก์ชัน DNA — ไม่แนะนำ) |
 | `LEGO_ORDER_WORKER_LIMIT` | `3` | จำนวน intent สูงสุดต่อการเรียก 1 ครั้ง |
-| `LEGO_ORDER_CLAIM_LEASE_SECONDS` | `120` | lease ของ transactional worker claim; generation fence ก่อน `place_order` กัน worker เก่าหลัง lease หมด |
+| `LEGO_ORDER_CLAIM_LEASE_SECONDS` | `120` | lease ของ transactional claim ต่อ intent; generation fence ก่อน `place_order` กัน worker เก่าหลัง lease หมด |
+| `LEGO_CHAIN_DISPATCH_LEASE_SECONDS` | `120` | owner lease ของ money path ต่อ chain; lease หมดแล้ว successor รับช่วงได้ แต่ durable `inflight_run_id` ยังอยู่และบังคับให้ reconcile run เดิมก่อนเสมอ |
 | `LEGO_ORDER_EXPIRY_MARGIN_SECONDS` | `15` | กันส่ง order คาบเกี่ยว slot ถัดไป |
-| `LEGO_HOLDINGS_DRIFT_TOLERANCE` | `0.000001` | holdings เปลี่ยนเกินนี้ระหว่างรอส่ง = `SUPPRESSED_STATE_CHANGED` |
-| `LEGO_RECONCILE_MAX_ATTEMPTS` | `20` | ถาม broker ซ้ำได้กี่ครั้งก่อนยอมแพ้เป็น `RECONCILE_ABANDONED` (ที่ `*/5` = ~100 นาที) — กัน order ที่ broker ไม่เคยรับ วนถามไม่รู้จบจนเบียด intent ใหม่ทั้งหมด |
-| `LEGO_FILL_CONFIRM_MAX_ATTEMPTS` | `5` | broker บอก fill แล้วแต่ position ยังไม่ขยับ = `AWAITING_FILL_CONFIRMATION` แล้วถามใหม่ได้กี่ครั้งก่อนปล่อยออกจากคิวพร้อม `needs_manual_check` · ระหว่างนี้ `ΔAₙ`/`Aₙ`/`Eₙ` ยังไม่ถูกบันทึก (ห้าม book cashflow จากคำพูด broker อย่างเดียว) |
+| `LEGO_HOLDINGS_DRIFT_TOLERANCE` | `0.000001` | holdings เปลี่ยนเกินนี้ระหว่างรอส่ง = `SUPPRESSED_STATE_CHANGED`; ต้องเป็น finite และ ≥ 0 (`NaN` = `CONFIG_ERROR`) |
+| `LEGO_MAX_DISPATCH_PRICE_DRIFT_BPS` | `100` | ราคาใหม่ห่างจากราคา decision เกิน 100 bps (1%) = ไม่ส่ง; แม้อยู่ในเพดาน worker ยัง re-decision และบล็อกเมื่อ side กลายเป็น PASS/ฝั่งตรงข้าม หรือ quantity เดิมจะ rebalance เลยเป้าปัจจุบัน |
+| `LEGO_MAX_DISPATCH_QUOTE_AGE_SECONDS` | `360` | decision เก่ากว่า 6 นาที = ไม่ส่ง MARKET order; default เผื่อ worker cron `*/5` + latency เล็กน้อย |
+| `LEGO_RECONCILE_MAX_ATTEMPTS` | `20` | ถาม broker ซ้ำได้กี่ครั้งก่อนหยุด auto-query เป็น `RECONCILE_ABANDONED` (ที่ `*/5` = ~100 นาที) — หยุดการวนถาม แต่ **ไม่ปล่อย order ถัดไป**; chain คง fence รอคนกระทบยอด |
+| `LEGO_FILL_CONFIRM_MAX_ATTEMPTS` | `5` | broker บอก fill แล้วแต่ position ยังไม่ขยับ = `AWAITING_FILL_CONFIRMATION` แล้วถามใหม่ได้กี่ครั้งก่อนออกจาก actionable queue พร้อม `needs_manual_check` และคง chain fence · `ΔAₙ`/`Aₙ`/`Eₙ` ยังไม่ถูกบันทึก จึงห้ามส่ง order ถัดไปจนกระทบยอด |
 | `LEGO_OPEN_ORDER_PAGE_SIZE` | `50` | `get_order_open` ตอบเป็น "หน้า" (default ของ broker = 10) · การกันส่งซ้ำอ่านจากรายการนี้ ถ้าหน้าเดียวไม่ครบจะมองไม่เห็น order ของเราเอง |
 | `LEGO_OPEN_ORDER_MAX_PAGES` | `5` | เพดานจำนวนหน้าที่ไล่ต่อการตรวจ 1 ครั้ง · ชนเพดาน/cursor ไม่ครบ = fail closed คง intent รอและไม่ส่ง order |
+| `LEGO_ADMIN_RECONCILE_LEASE_SECONDS` | `300` | lease 30–1800 วินาทีของ CLI operator เท่านั้น; ไม่ต้องใส่ใน Cloud Function env |
 
 > 🔐 state บันทึกเฉพาะ fingerprint ของ account/environment ไม่บันทึก account ID.
 > chain เดิมที่ยังไม่มี fingerprint จะถูก **adopt อัตโนมัติ** ใน commit แรกหลัง deploy
@@ -328,13 +335,23 @@ gcloud functions deploy lego-archive-worker \
   --no-allow-unauthenticated \
   --memory=512Mi \
   --timeout=300s \
-  --set-env-vars="FIREBASE_DB_URL=$DB_URL,WEBULL_ENV=UAT,LEGO_SYMBOL=AAPL,LEGO_FIX_C=3000,LEGO_DIFF=5,LEGO_DNA_CODE=bypass:100,LEGO_DECIMAL_PRECISION=3,LEGO_SLOT_SECONDS=900,LEGO_DNA_ORIGIN_UTC=2026-07-27T13:30:00Z,LEGO_DNA_CLOCK_MODE=market,AUTO_SUBMIT=true" \
-  --set-secrets="WEBULL_APP_KEY=webull-app-key:latest,WEBULL_APP_SECRET=webull-app-secret:latest,WEBULL_ACCOUNT_ID=webull-account-id:latest"
+  --set-env-vars="FIREBASE_DB_URL=$DB_URL,WEBULL_ENV=UAT,LEGO_SYMBOL=AAPL,LEGO_FIX_C=3000,LEGO_DIFF=5,LEGO_DNA_CODE=bypass:100,LEGO_DECIMAL_PRECISION=3,LEGO_SLOT_SECONDS=900,LEGO_DNA_ORIGIN_UTC=2026-07-27T13:30:00Z,LEGO_DNA_CLOCK_MODE=market,AUTO_SUBMIT=true"
 ```
 
 ตั้งนาฬิกาวันละครั้งหลังตลาดปิดก็พอ:
 
 ```bash
+# caller identity ของ Scheduler ต้องแยกจาก runtime identity ของ function
+gcloud iam service-accounts create lego-scheduler-invoker \
+  --display-name="LEGO Scheduler Invoker" --project="$PROJECT"
+export SCHEDULER_SA="lego-scheduler-invoker@$PROJECT.iam.gserviceaccount.com"
+
+# Gen2 private functions ต้อง grant Cloud Run Invoker ให้ caller SA ทุกตัว
+for FN in lego-one-row lego-order-worker lego-archive-worker; do
+  gcloud functions add-invoker-policy-binding "$FN" \
+    --region="$REGION" --member="serviceAccount:$SCHEDULER_SA" --project="$PROJECT"
+done
+
 export ARCHIVE_URL="$(gcloud functions describe lego-archive-worker --gen2 --region="$REGION" --format='value(serviceConfig.uri)')"
 
 gcloud scheduler jobs create http lego-archive-tick \
@@ -344,7 +361,7 @@ gcloud scheduler jobs create http lego-archive-tick \
   --max-retry-attempts=0 \
   --uri="$ARCHIVE_URL" \
   --http-method=POST \
-  --oidc-service-account-email="$FUNCTION_SA" \
+  --oidc-service-account-email="$SCHEDULER_SA" \
   --oidc-token-audience="$ARCHIVE_URL"
 ```
 
@@ -352,14 +369,13 @@ gcloud scheduler jobs create http lego-archive-tick \
 
 ## 7) ⏰ Deploy Google Cloud Scheduler — นาฬิกาปลุกของระบบ
 
-ก่อนอื่นดึง URL และ service account ของ Cloud Function มาเก็บไว้:
+ก่อนอื่นดึง URL ของ Cloud Function มาเก็บไว้ (ใช้ `SCHEDULER_SA` ที่สร้างในหัวข้อ 6.2):
 
 ```bash
 export FUNCTION_URL="$(gcloud functions describe lego-one-row --gen2 --region="$REGION" --format='value(serviceConfig.uri)')"
-export FUNCTION_SA="$(gcloud functions describe lego-one-row --gen2 --region="$REGION" --format='value(serviceConfig.serviceAccountEmail)')"
 
 echo "$FUNCTION_URL"
-echo "$FUNCTION_SA"
+echo "$SCHEDULER_SA"
 ```
 
 สร้าง scheduler ให้เรียก function **ทุก 5 นาที จันทร์–ศุกร์** ในช่วงเวลา UTC ที่ครอบคลุมตลาดสหรัฐฯ:
@@ -372,7 +388,7 @@ gcloud scheduler jobs create http lego-tick \
   --max-retry-attempts=0 \
   --uri="$FUNCTION_URL" \
   --http-method=POST \
-  --oidc-service-account-email="$FUNCTION_SA" \
+  --oidc-service-account-email="$SCHEDULER_SA" \
   --oidc-token-audience="$FUNCTION_URL"
 ```
 
@@ -413,7 +429,7 @@ gcloud scheduler jobs create http lego-order-tick \
   --max-retry-attempts=0 \
   --uri="$WORKER_URL" \
   --http-method=POST \
-  --oidc-service-account-email="$FUNCTION_SA" \
+  --oidc-service-account-email="$SCHEDULER_SA" \
   --oidc-token-audience="$WORKER_URL"
 ```
 
@@ -614,8 +630,39 @@ gcloud functions logs read lego-one-row --gen2 --region="$REGION" --limit=100 \
   ข้าม slot — ถ้าเห็น `EXPIRED_UNSENT` ทุกใบ แปลว่ายังไม่ได้ deploy `lego-order-worker` (ข้อ 6.1)
 - ⚠️ ถ้าเห็น `RECONCILE_ABANDONED` ใน outbox (หรือ `needs_manual_check: true` ใน
   `webull_lego_order_audit`) = **ต้องเข้าไปเช็คที่ broker เองว่า order ใบนั้นมีจริงไหม**
-  ระบบถาม broker จนครบ `LEGO_RECONCILE_MAX_ATTEMPTS` แล้วไม่ได้คำตอบ จึงเลิกถามเพื่อไม่ให้
-  ไปเบียด order ใหม่ · อ่าน `first_error` เพื่อรู้สาเหตุตั้งต้น (`last_error` คือครั้งล่าสุด)
+  ระบบถาม broker จนครบ `LEGO_RECONCILE_MAX_ATTEMPTS` แล้วไม่ได้คำตอบ จึงหยุด auto-query
+  แต่ยังคง `webull_lego_order_dispatch_locks/{chain_key}/inflight_run_id` ไว้ — order ใหม่ของ
+  chain นี้จะคง `PENDING_DISPATCH` และ worker ตอบ `dispatch_blocked` · อ่าน `first_error`
+  เพื่อรู้สาเหตุตั้งต้น (`last_error` คือครั้งล่าสุด)
+
+  **ห้ามลบ `inflight_run_id` ใน Console โดยตรง** ให้ pause `lego-tick` และ
+  `lego-order-tick`, ใช้ workstation/Cloud Shell ที่มี ADC สำหรับ project นี้และ Webull env/secret
+  ชุดเดียวกับ chain แล้วรันเครื่องมือแบบ dry-run ก่อน:
+
+  ```bash
+  export CHAIN_KEY='<chain_key จาก dispatch_blocked>'
+  export RUN_ID='<inflight_run_id>'
+  python lego_admin_reconcile.py --chain-key="$CHAIN_KEY" --run-id="$RUN_ID"
+  ```
+
+  เครื่องมืออ่าน `get_order_detail(account_id, client_order_id=run_id)` เท่านั้น—ไม่ preview,
+  place, cancel หรือ replace—และยอมเฉพาะ broker terminal ที่มี order id + cumulative fill ชัดเจน:
+  zero-fill ต้องตรงกับ row `PENDING_EXECUTION`; positive fill ต้องตรงกับ committed row,
+  `execution_cashflow.finalized_runs` และ realized ledger ครบทุกชุด ถ้า `allowed=false` ให้แก้
+  blocker/กระทบยอดก่อน **ห้ามฝืนและห้ามแก้ lock เอง**
+
+  เมื่อ `allowed=true` ให้ copy `confirmation_phrase` ทั้งบรรทัด แล้ว apply พร้อมชื่อ operator:
+
+  ```bash
+  python lego_admin_reconcile.py --chain-key="$CHAIN_KEY" --run-id="$RUN_ID" \
+    --apply --operator='name@example.com' \
+    --confirmation='ACK RECONCILED <chain> <run> <broker-id> <status> <qty>'
+  ```
+
+  CLI re-read broker/RTDB หลังชนะ generation lease, เขียน immutable 3-phase audit ที่
+  `webull_lego_admin_reconcile_audit`, ปลด manual flag หลัง fence clear สำเร็จเท่านั้น และ replay
+  หลัง crash เป็น idempotent เมื่อครบแล้ว จากนั้นยืนยันว่า worker ไม่ตอบ `dispatch_blocked` ก่อน
+  resume Scheduler ทั้งสอง job
 
 ค่า `pipeline_status` ที่ต้องอ่านให้ออกจาก log:
 
@@ -678,11 +725,14 @@ field เตือนใน response ของแถวที่ commit สำ�
 > (ทุก slot ในช่วงนั้น commit สำเร็จ) และหนึ่ง error จริงถูก log ซ้ำ 5–7 บรรทัดเพราะ
 > `set_stream_logger` ผูก handler เพิ่มทุกครั้งที่สร้าง client
 
-สถานะ outbox ที่ต้องมีคนเข้าไปดู (นอกจาก `RECONCILE_ABANDONED`):
+สถานะ outbox ที่ต้องมีคนเข้าไปดู (นอกจาก `RECONCILE_ABANDONED`) — ทุกสถานะในตาราง
+คง chain fence และบล็อก order ถัดไปจนกระทบยอด:
 
 | status | แปลว่า | ต้องทำอะไร |
 |---|---|---|
 | `REALIZED_MATH_ERROR` | **order fill สำเร็จแล้วที่ broker** แต่คำนวณ realized ต่อไม่ได้ (ตัวเลข cumulative fill ที่ได้มาทำให้ราคาต่อหน่วยของส่วนเพิ่ม ≤ 0) | ห้ามส่ง order ซ้ำ — order มีจริงและ fill แล้ว · เข้าไปกระทบยอด `webull_lego_realized` เอง โดยดู `filled_quantity`/`filled_price` ที่เก็บไว้ใน audit |
+| `CASHFLOW_FINALIZE_ERROR` | broker ยืนยัน fill แล้ว แต่บันทึก `ΔAₙ`/`Aₙ`/`Eₙ` ลง model ledger ไม่สำเร็จ | ห้ามส่ง order ซ้ำ · กระทบยอด row + `execution_cashflow` + holdings ให้ตรงกับ cumulative fill ก่อนปลด fence |
+| broker terminal + `needs_manual_check: true` | broker จบแล้ว แต่ position/ledger ยังยืนยันไม่ครบ เช่น fill แล้ว holdings ไม่ขยับจนครบเพดาน | ตรวจ broker position และ ledger ทั้งสองชุด ห้ามปลด fence จาก status `FILLED` เพียงอย่างเดียว |
 
 ตรวจใน **Streamlit:**
 

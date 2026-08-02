@@ -191,7 +191,8 @@ def _run(monkeypatch, row, holdings=FROZEN_HOLDINGS):
     moment = _moment(captured_at)
     monkeypatch.setattr(main, "datetime", _fixed_now(moment))
     monkeypatch.setattr(main, "fetch_snapshot", lambda t, d, cfg: {
-        "captured_at": captured_at, "price": price, "holdings": holdings})
+        "captured_at": captured_at, "quote_time": captured_at,
+        "price": price, "holdings": holdings})
     return main.lego_one_row(object())
 
 

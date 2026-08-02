@@ -25,7 +25,7 @@ from webull_io import _extract_qty, _retry_transient, build_order_payload
 CFG = Config(symbol="APLS", fix_c=1500.0, diff=60.0)
 
 
-# ---- Step 8: decision band ตามสัญญา (invariant #4, #5 — ไม่มี clamp) --------
+# ---- Step 8: decision band ตามสัญญา (invariant #4, #5) ---------------------
 def test_decision_buy_spec():
     d = build_decision(CFG, price=10.0, holdings=100.0, signal=1)
     assert (d.status, d.action, d.side) == (READY_BUY, "TRIGGER_ACTION", "BUY")
@@ -33,14 +33,33 @@ def test_decision_buy_spec():
     assert d.quantity == round(500.0 / 10.0, 5) == 50.0
 
 
-def test_decision_sell_spec_no_clamp():
-    # คอลัมน์ 11 = round(|gap|/Pₙ, dp) ตรง ๆ — ห้ามมีเงื่อนไขอื่นแทรก
+def test_decision_sell_spec():
+    # ค่าปกติยังเท่ากับ round(|gap|/Pₙ, dp)
     d = build_decision(CFG, price=12.0, holdings=150.0, signal=1)
     assert (d.status, d.side) == (READY_SELL, "SELL")
     assert d.gap == -300.0
     assert d.quantity == round(300.0 / 12.0, 5) == 25.0
     # qty < holdings เสมอ (คณิต: qty = holdings − FIX_C/Pₙ)
     assert d.quantity < 150.0
+
+
+def test_sell_rounding_never_exceeds_fractional_holdings():
+    """Broker precision must not turn a valid rebalance into an oversell."""
+    cfg = Config(symbol="FFWM", fix_c=1000.0, decimal_precision=5)
+    holdings = 0.000016
+    d = build_decision(cfg, price=1_000_000_000.0,
+                       holdings=holdings, signal=1)
+    assert (d.status, d.side) == (READY_SELL, "SELL")
+    assert d.quantity == 0.00001
+    assert d.quantity <= holdings
+
+
+def test_sell_smaller_than_one_quantity_tick_fails_closed():
+    cfg = Config(symbol="FFWM", fix_c=100.0, decimal_precision=5)
+    d = build_decision(cfg, price=1_000_000_000.0,
+                       holdings=0.000006, signal=1)
+    assert d.status == PASS_THRESHOLD
+    assert d.quantity == 0.0 and d.side == ""
 
 
 def test_decision_pass_threshold_band():

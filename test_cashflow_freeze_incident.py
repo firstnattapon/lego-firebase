@@ -63,7 +63,8 @@ def _cfg(fix_c: float = FIX_C, diff: float = DIFF) -> Config:
 
 
 def _snapshot(price: float, holdings: float) -> dict:
-    return {"captured_at": "2026-07-29T14:05:06Z", "price": price,
+    return {"captured_at": "2026-07-29T14:05:06Z",
+            "quote_time": "2026-07-29T14:05:06Z", "price": price,
             "holdings": holdings}
 
 

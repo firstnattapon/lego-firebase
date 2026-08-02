@@ -72,6 +72,7 @@ def _run(monkeypatch, moment: datetime, price: float, holdings: float):
     monkeypatch.setattr(main, "datetime", _fixed_now(moment))
     monkeypatch.setattr(main, "fetch_snapshot", lambda t, d, cfg: {
         "captured_at": moment.strftime("%Y-%m-%dT%H:%M:%SZ"),
+        "quote_time": moment.strftime("%Y-%m-%dT%H:%M:%SZ"),
         "price": price, "holdings": holdings,
     })
     return main.lego_one_row(object())
@@ -185,6 +186,15 @@ def test_filled_buy_finalizes_once_against_the_filled_price(monkeypatch):
     # Rₙ still comes from the decision price — only ΔAₙ/Aₙ/Eₙ moved sides.
     assert row[REFERENCE_COLUMN] == pytest.approx(FIX_C * math.log(330.0 / 320.0))
     assert _row(first["run_id"])[DELTA_COLUMN] == 0.0     # untouched genesis row
+    witness = _cashflow()["finalized_runs"][run_id]
+    assert witness["previous_action_price"] == 320.0
+    assert witness["previous_actual_cumulative"] == 0.0
+    assert witness["delta_actual"] == pytest.approx(
+        FIX_C * (witness["filled_price"] / witness["previous_action_price"] - 1.0))
+    assert witness["actual_cumulative"] == pytest.approx(
+        witness["previous_actual_cumulative"] + witness["delta_actual"])
+    assert witness["excess"] == pytest.approx(
+        witness["actual_cumulative"] - witness["reference"])
 
     anchor = read_anchor(_cfg())
     assert anchor.prev_price == 331.25                     # P_acted = fill price
@@ -337,7 +347,8 @@ def test_a_pass_row_carries_the_ledger_and_creates_no_intent(monkeypatch):
 
 # --- Case 4: partial fills use the cumulative quantity, counted once ---------
 
-def test_partial_fill_finalizes_once_on_the_cumulative_quantity(monkeypatch):
+def test_partial_fill_waits_then_finalizes_once_on_terminal_cumulative_values(
+        monkeypatch):
     _run(monkeypatch, SLOT_0, 320.0, holdings=0.0)
     body, _ = _run(monkeypatch, SLOT_1, 330.0, holdings=8.0)
     run_id = body["run_id"]
@@ -348,10 +359,13 @@ def test_partial_fill_finalizes_once_on_the_cumulative_quantity(monkeypatch):
         "order_status": "PARTIAL_FILLED", "filled_quantity": half,
         "avg_filled_price": 331.0,
     })
-    _work()
-    expected = FIX_C * (331.0 / 320.0 - 1.0)
-    assert _row(run_id)[DELTA_COLUMN] == pytest.approx(expected)
-    assert _cashflow()["finalized_seq"] == 1
+    partial = [r for r in _work() if r["run_id"] == run_id][0]
+    assert partial["status"] == "PARTIAL_FILLED"
+    assert partial["cashflow_finalized"] is False
+    assert partial["cashflow_waiting_for_terminal"] is True
+    assert _row(run_id)[DELTA_COLUMN] == 0.0
+    assert _row(run_id)["cashflow_status"] == CASHFLOW_PENDING
+    assert _cashflow()["finalized_seq"] == 0
 
     # The rest fills; the poll reports the cumulative quantity again.
     _stub_broker(monkeypatch, holdings_after=8.0 + ordered, detail={
@@ -359,10 +373,38 @@ def test_partial_fill_finalizes_once_on_the_cumulative_quantity(monkeypatch):
         "avg_filled_price": 331.2,
     })
     _work()
-    assert _row(run_id)[DELTA_COLUMN] == pytest.approx(expected)   # not counted twice
+    expected = FIX_C * (331.2 / 320.0 - 1.0)
+    assert _row(run_id)[DELTA_COLUMN] == pytest.approx(expected)
+    assert _row(run_id)["execution_price"] == pytest.approx(331.2)
+    assert _row(run_id)["execution_quantity"] == pytest.approx(ordered)
     assert _cashflow()["actual_cumulative"] == pytest.approx(expected)
     assert _cashflow()["finalized_seq"] == 1
     assert _intent(run_id)["status"] == "FILLED"
+
+
+@pytest.mark.parametrize("terminal_status", ["CANCELLED", "EXPIRED"])
+def test_terminal_cancel_or_expiry_books_its_final_cumulative_partial_fill(
+        monkeypatch, terminal_status):
+    _run(monkeypatch, SLOT_0, 320.0, holdings=0.0)
+    body, _ = _run(monkeypatch, SLOT_1, 330.0, holdings=8.0)
+    run_id = body["run_id"]
+    ordered = float(_intent(run_id)["quantity"])
+    cumulative = round(ordered / 2, 2)
+
+    _stub_broker(monkeypatch, holdings_after=8.0 + cumulative, detail={
+        "order_status": terminal_status,
+        "filled_quantity": cumulative,
+        "avg_filled_price": 331.4,
+    })
+    result = [r for r in _work() if r["run_id"] == run_id][0]
+
+    expected = FIX_C * (331.4 / 320.0 - 1.0)
+    assert result["status"] == terminal_status
+    assert result["cashflow_finalized"] is True
+    assert _row(run_id)[DELTA_COLUMN] == pytest.approx(expected)
+    assert _row(run_id)["execution_quantity"] == pytest.approx(cumulative)
+    assert _cashflow()["actual_cumulative"] == pytest.approx(expected)
+    assert _cashflow()["finalized_seq"] == 1
 
 
 # --- Case 5: many workers, one finalization ---------------------------------
