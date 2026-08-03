@@ -478,11 +478,11 @@ slot ปัจจุบัน      = 2026-07-27:0 (เริ่ม 2026-07-27T13
 ```bash
 gcloud functions deploy lego-one-row --gen2 --region="$REGION" \
   --source=. --entry-point=lego_one_row \
-  --update-env-vars="LEGO_DNA_ORIGIN_UTC=2026-07-27T13:30:00Z,LEGO_DNA_CLOCK_MODE=market"
+  --update-env-vars="LEGO_DNA_ORIGIN_UTC=2026-08-01T13:30:00Z,LEGO_DNA_CLOCK_MODE=market"
 
 gcloud functions deploy lego-order-worker --gen2 --region="$REGION" \
   --source=. --entry-point=lego_order_worker \
-  --update-env-vars="LEGO_DNA_ORIGIN_UTC=2026-07-27T13:30:00Z,LEGO_DNA_CLOCK_MODE=market"
+  --update-env-vars="LEGO_DNA_ORIGIN_UTC=2026-08-01T13:30:00Z,LEGO_DNA_CLOCK_MODE=market"
 ```
 
 > เขียนแยกสองคำสั่งเพราะ `--entry-point` ของสองฟังก์ชันไม่เหมือนกัน — ระบุให้ชัดทุกครั้ง
