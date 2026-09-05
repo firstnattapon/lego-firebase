@@ -57,7 +57,11 @@ class FakeReference:
     def transaction(self, fn):
         current = self.get()
         result = fn(copy.deepcopy(current))
-        self.set(result)
+        # Firebase RTDB treats a transaction result of None as a deletion.
+        if result is None:
+            self.delete()
+        else:
+            self.set(result)
         return copy.deepcopy(result)
 
     def push(self, value):

@@ -582,6 +582,21 @@ def build_clients():
     return trade, data
 
 
+def clients_endpoint(trade_client, data_client) -> str | None:
+    """Return the endpoint bound to this exact cached authenticated pair.
+
+    Operational smoke tools must prove their UAT/Production label describes the
+    clients they will actually call.  Reading the environment twice is not such
+    a proof because it can change between validation and client construction.
+    """
+    if _CLIENTS is None:
+        return None
+    cache_key, _built_at, cached_trade, cached_data = _CLIENTS
+    if cached_trade is not trade_client or cached_data is not data_client:
+        return None
+    return str(cache_key[0])
+
+
 def fetch_holdings(trade_client, cfg: Config) -> float:
     """Shares of cfg.symbol the broker says the account holds, right now.
 

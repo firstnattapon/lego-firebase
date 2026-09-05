@@ -16,7 +16,7 @@ WHEEL = (
 )
 DIST_INFO = "webull_openapi_python_sdk-2.0.15.dist-info"
 PATCHED_SHA256 = (
-    "eef88481073ab4ff998b3446d685322b92bd2ef5a0e090d00f9e46bb814c15ad"
+    "73d252bc82ebdc5a2c53bc94122994ecfb29d44e76f4af33defe27bbdccca1c6"
 )
 ORIGINAL_RUNTIME_AGGREGATE = (
     "0c6be72befa78586ceb51674b99050ac2edf250efee72b766559a1f620a9079d"
@@ -65,7 +65,7 @@ def test_vendored_wheel_only_allows_audited_cryptography_floor():
         metadata = wheel.read(f"{DIST_INFO}/METADATA").decode("utf-8")
         assert "Version: 2.0.15" in metadata
         assert (
-            'cryptography<49,>=48.0.1; python_version >= "3.12" '
+            'cryptography<55,>=50.0.0; python_version >= "3.12" '
             'and python_version < "3.14"'
         ) in metadata
         assert (

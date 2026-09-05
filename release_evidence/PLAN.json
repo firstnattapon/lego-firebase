@@ -1,0 +1,1128 @@
+{
+  "framework": "5-step-process",
+  "language": "th",
+  "prompt_metadata": {
+    "title": "LEGO Firebase — Final Commercial Architecture & Execution Prompt",
+    "version": "2.0.0",
+    "prepared_at": "2026-09-05",
+    "target_model": "gpt-5.6-sol",
+    "reasoning_effort": "medium",
+    "repository": "https://github.com/firstnattapon/lego-firebase",
+    "reviewed_reference_commit": "c3e5394974aa4a1b4ac972b2e6e436a4643071ca",
+    "reference_policy": "commit นี้เป็นหลักฐาน audit ก่อนหน้า ไม่ใช่คำสั่งให้ downgrade หรือถือว่าเป็น HEAD ปัจจุบัน ตรวจ branch, commit, working tree และ deployed revision จริงก่อนเริ่ม",
+    "document_status": "IMPLEMENTATION_PLAN_NOT_RELEASE_CERTIFICATION",
+    "instruction": "คุณรับบท System Architect, implementation engineer และ auditor ลงมือทำตามแผนจนถึงขอบเขตที่ได้รับอนุญาต ใช้หลักฐานจริง รักษา financial contracts และบันทึกงานเพื่อให้ทำต่อได้หลัง context reset",
+    "scope": "ยกระดับ backend rebalancing ที่มีอยู่ให้พร้อมใช้งานเชิงพาณิชย์ภายใน deployment profile ที่ระบุและทดสอบแล้ว",
+    "commercial_scope_boundary": "ค่าเริ่มต้นเป็น operator-managed deployment ตาม identity/account/chain contracts ที่มีอยู่ ไม่ตีความเป็น multi-tenant SaaS หรือเปิดรับเงินลูกค้าโดยอัตโนมัติ การเพิ่มลูกค้าหลายราย, billing, licensing, legal certification หรือ tenant isolation เป็น scope แยก",
+    "delivery_rule": "อ่าน JSON ทั้งหมดก่อนเริ่ม งานนี้เป็น audit_then_targeted_refactor ไม่ใช่ greenfield rewrite"
+  },
+  "step_1_goals": {
+    "raw_goal": "สร้าง Final Product Grade Commercial บรรลุเป้าหมาย 100% ยึด simple–stable–fast",
+    "refined_goal": "ทำให้ระบบที่มีอยู่ผ่าน release gates ทุกข้อด้วยหลักฐานที่ผูกกับ release candidate เดียวกัน รักษาความถูกต้องของคำสั่งซื้อขายและ ledger ลดความซับซ้อนที่พิสูจน์ได้ พร้อม deploy, operate, recover และ rollback ตามคู่มือที่ทดสอบจริง",
+    "target_metric": {
+      "name": "Required acceptance criteria verified",
+      "current": null,
+      "target": 100,
+      "unit": "percent",
+      "horizon": "ไม่กำหนดวันปล่อยล่วงหน้า ใช้ลำดับ dependency และหลักฐานเป็นตัวตัดสิน"
+    },
+    "success_criteria": [
+      "100% ของ required criteria เป็น PASS; ไม่มี FAIL, BLOCKED, NOT_RUN, evidence หมดอายุ หรือข้อบกพร่อง critical/high ที่ยังไม่ปิดใน release scope",
+      "ไม่มี duplicate external order หรือ duplicate ledger application ใน fault/concurrency/retry scenarios ที่กำหนด",
+      "ผ่าน isolated Gen2 deployment, real Webull UAT execution/fill/holdings และ operational recovery/rollback drills",
+      "ผู้อื่นสามารถ deploy และดูแล release จากเอกสารและ artifacts ได้ โดยไม่ต้องพึ่งความทรงจำจากบทสนทนา"
+    ]
+  },
+  "step_2_problems": [
+    {
+      "id": "P1",
+      "description": "แผนเดิมใช้ E, Frozen และ cashflow กว้างกว่าสัญญาที่โค้ดทำจริง",
+      "gap_value": null,
+      "severity": 5
+    },
+    {
+      "id": "P2",
+      "description": "ยังต้องพิสูจน์ duplicate protection และ convergence ภายใต้ process crash, stale worker, partial fill และ concurrent archive",
+      "gap_value": null,
+      "severity": 5
+    },
+    {
+      "id": "P3",
+      "description": "main.py รวม orchestration หลายความรับผิดชอบ ทำให้การเปลี่ยนแปลงมี blast radius สูง",
+      "gap_value": null,
+      "severity": 3
+    },
+    {
+      "id": "P4",
+      "description": "ความพร้อม security, deployment, recovery, observability และ real broker UAT ยังไม่มีชุดหลักฐาน release ครบใน prompt นี้",
+      "gap_value": null,
+      "severity": 5
+    },
+    {
+      "id": "P5",
+      "description": "คำว่า fast และ 100% ยังต้องผูกกับ workload, budget, criterion และหลักฐานที่ตรวจสอบได้",
+      "gap_value": null,
+      "severity": 4
+    }
+  ],
+  "step_3_diagnosis": [
+    {
+      "problem_id": "P1",
+      "root_causes": [
+        {
+          "id": "RC1",
+          "cause": "รวม conceptual model กับ persistent contract และ broker-realized ledger เป็นคำอธิบายเดียว",
+          "why_chain": [
+            "ชื่อ execution-confirmed ทำให้เข้าใจว่า A เป็น cash movement จริง",
+            "สูตร A ไม่ขึ้นกับ filled quantity/fees และ E มี branch-specific semantics",
+            "ต้องแยกนิยามและยืนยัน current behavior ก่อนแก้เอกสารหรือโค้ด"
+          ],
+          "impact_weight": 1,
+          "evidence": "อ่าน lego_one_row.py compute_recurrence/finalize_recurrence และ main.py _finish_with_realized ที่ reference commit; ต้องตรวจซ้ำกับ working revision"
+        }
+      ]
+    },
+    {
+      "problem_id": "P2",
+      "root_causes": [
+        {
+          "id": "RC2",
+          "cause": "รายการ test scenario ยังไม่เท่ากับหลักฐานที่ควบคุม interleaving และ failure boundaries",
+          "why_chain": [
+            "เรียก worker ซ้ำแบบ sequential อาจผ่านแม้มี race",
+            "broker call กับ RTDB commit ไม่มี atomic transaction ร่วมกัน",
+            "ต้องกำหนด state transition, durable pre-place fence และ fault injection อย่างเจาะจง"
+          ],
+          "impact_weight": 1,
+          "evidence": "main.py begin_place_attempt path และ lego_archive.py อ่าน eligibility ก่อน copy/delete; archive race เป็น NEEDS_CHARACTERIZATION ไม่ใช่ confirmed bug"
+        }
+      ]
+    },
+    {
+      "problem_id": "P3",
+      "root_causes": [
+        {
+          "id": "RC3",
+          "cause": "orchestration, adapter invocation, recovery และ HTTP boundary รวมอยู่ใน module เดียว",
+          "why_chain": [
+            "การย้าย helper อาจเปลี่ยน import/init หรือ exception handling",
+            "line count ไม่พิสูจน์ความเสี่ยงหรือประโยชน์",
+            "ต้องสร้าง call-order characterization และแบ่ง extraction ตาม ownership"
+          ],
+          "impact_weight": 1,
+          "evidence": "main.py reference commit มี Decision, Execution และ Archive entrypoints อยู่แล้ว"
+        }
+      ]
+    },
+    {
+      "problem_id": "P4",
+      "root_causes": [
+        {
+          "id": "RC4",
+          "cause": "test-local success ไม่พิสูจน์ runtime permissions, broker behavior หรือ incident operation",
+          "why_chain": [
+            "mock SDK/RTDB ไม่ครอบคลุม IAM, retry จริงและ holdings delay",
+            "UAT deployment อย่างเดียวไม่ยืนยัน fill path",
+            "ต้องมี evidence สำหรับ deployment, live UAT และ operations แยกกัน"
+          ],
+          "impact_weight": 1,
+          "evidence": "ช่องว่างหลักฐานในแผน ไม่ใช่ข้อสรุปว่าระบบปัจจุบันไม่มีความสามารถเหล่านี้"
+        }
+      ]
+    },
+    {
+      "problem_id": "P5",
+      "root_causes": [
+        {
+          "id": "RC5",
+          "cause": "ไม่มี frozen acceptance registry และ performance profile ของ release candidate",
+          "why_chain": [
+            "คะแนนรวมอาจซ่อน critical failure",
+            "จำนวน test มากขึ้นไม่ได้แปลว่า invariant ครบ",
+            "ต้องวัด criterion pass, latency/read growth และผูกผลกับ revision เดียวกัน"
+          ],
+          "impact_weight": 1,
+          "evidence": "proposed governance improvement; baseline ตัวเลขยังไม่ทราบ"
+        }
+      ]
+    }
+  ],
+  "step_4_design": [
+    {
+      "id": "S1",
+      "targets_root_cause": "RC1",
+      "intervention": "จัดทำ contract registry และ characterization ของ E, genesis, model/realized ledger และ partial terminal lifecycle",
+      "expected_effect": 100,
+      "cost": 2,
+      "priority_score": 50,
+      "rank": 1
+    },
+    {
+      "id": "S2",
+      "targets_root_cause": "RC2",
+      "intervention": "ทำ failure-boundary matrix, concurrency tests และ isolated correctness fixes ก่อน extraction",
+      "expected_effect": 100,
+      "cost": 5,
+      "priority_score": 20,
+      "rank": 2
+    },
+    {
+      "id": "S3",
+      "targets_root_cause": "RC5",
+      "intervention": "กำหนด acceptance registry, deployment workload profile และ performance budget ก่อน optimization",
+      "expected_effect": 100,
+      "cost": 5,
+      "priority_score": 20,
+      "rank": 3
+    },
+    {
+      "id": "S4",
+      "targets_root_cause": "RC3",
+      "intervention": "แยก orchestration ทีละ service ด้วย explicit dependency injection ที่จำเป็นและรักษา call ordering",
+      "expected_effect": 100,
+      "cost": 6,
+      "priority_score": 16.6667,
+      "rank": 4
+    },
+    {
+      "id": "S5",
+      "targets_root_cause": "RC4",
+      "intervention": "พิสูจน์ deployment, security, real UAT, incident recovery และ release rollback",
+      "expected_effect": 100,
+      "cost": 10,
+      "priority_score": 10,
+      "rank": 5
+    }
+  ],
+  "architecture": {
+    "principles": {
+      "simple": [
+        "ใช้เครื่องจักร Decision/Execution/Archive ที่มีอยู่ให้ชัด ไม่สร้างระบบคู่ขนาน",
+        "pure helpers ใช้ร่วมเมื่อ invariant เดียวกันจริง; อย่ารวม independent safety witnesses เพียงเพราะโค้ดคล้ายกัน",
+        "เพิ่ม abstraction เฉพาะที่ลด coupling หรือทำให้ทดสอบ failure boundary ได้",
+        "ไม่เพิ่ม queue, microservice, database หรือ framework ใหม่ถ้า targeted extraction แก้ปัญหาได้"
+      ],
+      "stable": [
+        "fail closed ก่อนส่งคำสั่งเมื่อ identity, semantics, market evidence หรือ ownership ไม่ชัด",
+        "durable intent ก่อน external side effect; unresolved outcome ต้อง reconcile",
+        "state ownership ชัดเจนและ mutations ที่เงินเกี่ยวข้องต้องมี transactional/idempotent evidence",
+        "recovery และ rollback เป็นส่วนหนึ่งของ release ไม่ใช่งานภายหลัง"
+      ],
+      "fast": [
+        "วัด broker calls, RTDB bytes/latency และ worker cycle แยก PASS/ACT/reconcile",
+        "ลดเฉพาะ redundant computation/read ที่พิสูจน์ว่าไม่ทำให้ witness เก่าหรือหาย",
+        "ไม่แลก ordering, holdings witness, money fence หรือ reconciliation กับ latency",
+        "กำหนด workload ceiling และ backlog alerts ถ้ายังพิสูจน์ bounded scaling ไม่ได้"
+      ]
+    },
+    "runtime": {
+      "main_py": {
+        "role": "thin Cloud Functions HTTP boundary",
+        "owns": [
+          "entrypoint decorators",
+          "minimal composition/wiring",
+          "Firebase initialization ตาม lifecycle เดิม",
+          "request/response translation",
+          "top-level error mapping"
+        ],
+        "forbidden": [
+          "broker workflow implementation",
+          "financial formula duplication",
+          "business state transitions"
+        ]
+      },
+      "decision_service_py": {
+        "role": "Decision orchestration",
+        "owns": [
+          "config/state/identity validation",
+          "pending committed intent recovery",
+          "market/session/semantics/anchor/DNA checks ตาม characterized ordering",
+          "snapshot และ holdings continuity",
+          "pure decision/model-row computation",
+          "atomic decision + recoverable intent persistence"
+        ],
+        "forbidden": [
+          "place_order",
+          "finalize execution ledger จาก READY"
+        ]
+      },
+      "execution_service_py": {
+        "role": "Execution orchestration",
+        "owns": [
+          "intent claim/generation",
+          "chain dispatch fence",
+          "fresh execution checks",
+          "preview",
+          "durable pre-place transition",
+          "single guarded place attempt",
+          "reconciliation",
+          "realized and model ledger completion",
+          "audit repair",
+          "safe fence release"
+        ],
+        "forbidden": [
+          "blind resubmission",
+          "substituting requested qty or quote for actual fill",
+          "clearing ambiguous fence to restore availability"
+        ]
+      },
+      "archive_service_py": {
+        "role": "Archive orchestration",
+        "owns": [
+          "retention configuration",
+          "bounded work orchestration",
+          "terminal/recovery-safe eligibility",
+          "archive result/error mapping"
+        ],
+        "forbidden": [
+          "deleting live recovery evidence"
+        ]
+      },
+      "core_modules": {
+        "lego_one_row.py": "pure strategy, exact 17-column contract, branch-specific recurrence และ model finalization math",
+        "lego_state.py": "RTDB transaction, identity/semantics, decision pointer, execution state และ idempotent row repair",
+        "lego_outbox.py": "durable outbox, claims, ownership generation, chain fence และ recovery identity",
+        "lego_orders.py": "normalization, execution evidence extraction และ realized math contracts",
+        "webull_io.py": "broker adapter; preserve request/payload/error semantics; inspect SDK retries",
+        "lego_preflight.py": "validation/preflight ที่ไม่มี order submission",
+        "lego_archive.py": "archive persistence/eligibility ที่ต้องพิสูจน์ concurrency",
+        "lego_cashflow_audit.py": "read-only integrity checks ตาม ledger แต่ละประเภท",
+        "lego_admin_reconcile.py": "operator recovery ที่มี explicit evidence และ audit trail",
+        "market_clock.py": "session/time/DNA ordinal source ตาม current contract",
+        "dna_engine.py": "existing deterministic DNA decode/build semantics"
+      },
+      "dependency_direction": [
+        "main -> services -> existing domain/persistence/adapter modules",
+        "domain math ไม่ import main, service, Firebase หรือ broker",
+        "service ไม่ import main",
+        "ไม่สร้าง universal service container; inject เฉพาะ dependency ที่จำเป็นต่อ behavior tests"
+      ],
+      "entrypoints": [
+        "lego_one_row",
+        "lego_order_worker",
+        "lego_archive_worker"
+      ],
+      "naming_policy": "ชื่อ service เป็น target; ถ้า HEAD แยกแล้วให้ audit/reuse ไม่สร้างซ้ำ"
+    },
+    "financial_contract": {
+      "terminology": {
+        "PRINCIPAL": "FIX_C = target asset value ไม่ใช่คำรับรอง principal protection",
+        "model_ledger": "17-column execution-confirmed model recurrence ไม่ใช่ cash balance หรือ broker-realized P&L",
+        "realized_ledger": "broker fill quantity/price/fee และ matched-leg accounting ตามสัญญาที่มีอยู่",
+        "reference": "R_quote(row) = FIX_C * ln(row.P_n / P0)",
+        "frozen": "ห้ามขยับ A/P_acted โดยไม่มี execution ที่เข้าเกณฑ์ model finalization; ΔA ของ unfinalized decision row = 0; E ต้องนิยามตาม branch"
+      },
+      "decision_math": [
+        "V = broker_holdings * P_n",
+        "GAP = FIX_C - V",
+        "DNA=0 -> PASS_DNA_ZERO",
+        "DNA=1 และ abs(GAP)<=DIFF -> PASS_THRESHOLD",
+        "abs(GAP)>DIFF ยังต้องผ่าน quantity rounding/cap; qty<=0 -> PASS_THRESHOLD ตามโค้ด",
+        "READY_BUY/READY_SELL เป็น intent ไม่ใช่ fill"
+      ],
+      "genesis": {
+        "rule": "P0 seed จาก genesis decision snapshot และคงเดิมระหว่าง active chain",
+        "p_acted_exception": "P_acted เริ่มจาก genesis/legacy-compatible seed ตาม current contract; หลัง seed จึงเปลี่ยนจาก qualifying confirmed execution เท่านั้น",
+        "required": "ทดสอบ genesis ที่ยังไม่ซื้อ, first fill ที่ slippage, legacy state seed และ semantics migration ตามโค้ด ห้ามลบ compatibility โดยถือว่าไม่มี fill แล้ว P_acted ต้องว่าง"
+      },
+      "current_expected_formulas": {
+        "unfinalized_row": {
+          "R": "FIX_C * ln(P_n / P0)",
+          "Delta_A": "0",
+          "A": "A_previous",
+          "P_acted": "previous_P_acted",
+          "E": "A_previous - FIX_C * ln(previous_P_acted / P0)"
+        },
+        "finalized_row": {
+          "Delta_A": "FIX_C * (final_cumulative_average_execution_price / previous_P_acted - 1)",
+          "A": "previous_A + Delta_A",
+          "P_acted": "final_cumulative_average_execution_price",
+          "R": "คง reference_R ของ committed decision row",
+          "E": "new_A - committed_row.reference_R"
+        },
+        "warning": "นี่คือ behavior ที่พบใน reference commit ต้อง characterize HEAD ก่อนรักษาหรือแก้ ห้ามประกาศ E=A-R_quote สำหรับทุกแถว และห้ามอ้างว่า unfinalized E เท่ากับ E ของ last finalized row เสมอเมื่อเกิด slippage",
+        "interpretation": "filled qty เป็น evidence/realized-accounting input แต่สูตร model ΔA ไม่ scale ตาม qty; ไม่แก้สูตรเพื่อให้ดูเป็น cashflow จริงใน refactor"
+      },
+      "partial_fill": {
+        "nonterminal": "realized ledger อาจอัปเดตจาก incremental cumulative fill ตาม implementation; model ledger รอ terminal",
+        "terminal_positive_fill": "FILLED หรือ terminal CANCELLED/EXPIRED/อื่นตาม normalized lifecycle ที่มี cumulative positive fill ต้องเข้าการตรวจ evidence และ finalize once",
+        "terminal_zero_fill": "ต้องมี explicit finite zero fill evidence; missing/NaN ไม่เท่ากับ zero",
+        "finalization_requirements": [
+          "validated broker order identity ตรง intent/account/runtime",
+          "terminal lifecycle ตาม current contract",
+          "finite cumulative qty > 0",
+          "finite actual average fill price > 0",
+          "post-execution holdings witness ตาม characterized predicate",
+          "runtime/semantics verification",
+          "idempotent persistent finalize"
+        ],
+        "holdings_limit": "reference implementation ตรวจทิศทางการเปลี่ยน holdings ไม่ใช่ exact quantity conservation; ต้องระบุข้อจำกัดและทดสอบ external/manual trade interference ไม่เรียกว่า full reconciliation โดยไม่มีหลักฐาน",
+        "cumulative_rules": [
+          "repeated cumulative qty ไม่เพิ่ม realized ซ้ำ",
+          "partial -> terminal ใช้ final cumulative values",
+          "cumulative regression/correction, fee-only correction และ delayed correction ต้องมี documented supported/recovery policy ไม่ silently overwrite finalization"
+        ],
+        "two_ledger_recovery": "ถ้า ledger หนึ่งสำเร็จอีก ledger ไม่สำเร็จ ให้ repair idempotently และคง chain fence จนทั้งสองพร้อมตาม predicate"
+      },
+      "protected_contracts": [
+        "17-column names/order/types",
+        "Firebase paths",
+        "chain identity/config hash",
+        "run_id/client_order_id relationship",
+        "outbox identity",
+        "cashflow_status/version semantics",
+        "P0/P_acted meaning",
+        "DNA/calendar clock",
+        "runtime identity fingerprint",
+        "claim generation/money fence",
+        "HTTP response/env interface",
+        "legacy read/repair compatibility"
+      ],
+      "contract_change_gate": [
+        "confirmed correctness defect พร้อม failing regression",
+        "current behavior และ affected readers ระบุครบ",
+        "isolated fix แยก structural refactor",
+        "migration/rollback และ mixed-version behavior ทดสอบ",
+        "explicit user approval เมื่อเปลี่ยน protected semantics/schema",
+        "หากไม่เข้าเงื่อนไขให้แก้เอกสารและ characterization เท่านั้น"
+      ]
+    },
+    "execution_safety": {
+      "semantics": "เป้าหมายคือ guarded at-most-once application place attempt ต่อ irreversible intent attempt และ idempotent internal effects; ไม่อ้าง universal exactly-once network delivery ระหว่าง broker กับ RTDB",
+      "money_critical_order": [
+        "runtime identity verified before broker access/financial progression",
+        "cashflow semantics verified before financial computation/write",
+        "recover committed pending intents before creating new money-moving intent",
+        "resolve market slot/DNA before actionable decision",
+        "fetch valid snapshot before holdings continuity; continuity before actionable commit",
+        "durable intent + valid claim owner/generation + chain fence before place",
+        "fresh execution safety/preview then durable pre-place marker before external place",
+        "broker execution evidence + terminal model condition + holdings witness before model finalize",
+        "both ledger completion/recovery-safe evidence before money fence release",
+        "terminal/recovery-safe state and concurrency-safe deletion eligibility before archive"
+      ],
+      "identity_scope": "พิสูจน์ scope chain fence กับ account/symbol; หลาย chain ที่ใช้ buying power หรือ symbol ร่วมกันต้องมี isolation/coordination policy หรือจำกัด deployment profile ให้ไม่เปิด concurrency ที่ยังไม่รองรับ",
+      "retry_policy": {
+        "safe_reads": "bounded retry/backoff/jitter ตาม timeout และ provider rate limits ที่ตรวจจาก official docs/SDK รุ่นใช้งาน",
+        "place": "ไม่มี application/SDK/proxy transparent retry ของ POST place ที่ทำให้ส่งซ้ำโดยไม่ควบคุม; audit vendor transport ด้วย",
+        "unknown": "คง durable ambiguity/fence; lookup/reconcile ด้วย stable identity; not-found ครั้งเดียวไม่ใช่หลักฐานว่าไม่เคยส่ง",
+        "pre_place_crash": "marker committed แล้ว process ตายก่อนส่งก็เป็น ambiguity; อาจต้อง operator recovery ไม่ reset attempted flag เพื่อส่งซ้ำ",
+        "reconcile_exhausted": "เปลี่ยนเป็น durable needs-attention พร้อม alert และ runbook; ห้ามยอมปล่อยเงินทางใหม่เพียงเพราะครบ retry budget"
+      },
+      "state_transition_registry": "document existing statuses -> allowed next states -> owner -> required evidence -> mutation boundary -> retry action; ไม่ rename persisted statuses ให้ตรงชื่อ conceptual",
+      "recovery_guard": "stale worker ต้องไม่ place หลัง owner/generation เปลี่ยน; lease expiry ต้องไม่ล้าง durable unresolved chain fence"
+    },
+    "archive_contract": {
+      "ineligible": [
+        "pending/actionable",
+        "inflight",
+        "unresolved broker outcome",
+        "audit_pending",
+        "needs_manual_check",
+        "cashflow abandoned/recovery-required",
+        "admin reconciliation pending",
+        "active dispatch fence referenced",
+        "ledger/mirror repair ที่ยังไม่ครบ"
+      ],
+      "proof_obligation": "พิสูจน์ terminal immutability/ownership หรือใช้ targeted conditional-delete/transaction ที่เหมาะกับ RTDB หลังพบ gap; copy-before-delete อย่างเดียวไม่พิสูจน์ concurrency safety",
+      "crash_tests": [
+        "copy สำเร็จ delete ไม่สำเร็จ",
+        "eligibility read แล้ว recovery update",
+        "fence เปลี่ยนระหว่าง scan กับ delete",
+        "archive vs audit repair",
+        "archive retry ไม่ทำข้อมูลใหม่หาย"
+      ],
+      "retention": "กำหนด retention สำหรับ live, archive, audit และ idempotency evidence แยกกัน ห้าม prune dedupe evidence ก่อน replay horizon ที่รองรับ",
+      "scale": "limit จำนวนที่ move ไม่เท่ากับ bounded scan; ต้องวัด read bytes และ candidates scanned ด้วย"
+    }
+  },
+  "commercial_readiness": {
+    "security": {
+      "required": [
+        "authenticated least-privilege invoker สำหรับ money/admin entrypoints",
+        "service account roles และ RTDB rules/admin permissions ตรวจตาม threat model",
+        "separate UAT/prod project/database/secrets/account fingerprint หรือ isolation equivalent ที่พิสูจน์ได้",
+        "secrets อยู่ใน secret store/environment ตาม platform; ไม่ลง source/log/evidence",
+        "redaction test ครอบ errors, request payloads, broker headers และ audit artifacts",
+        "pinned dependencies/vendored wheels, integrity/provenance และ vulnerability triage",
+        "admin recovery ต้อง authenticated, scoped, auditable และไม่ปลอม fill evidence"
+      ],
+      "scope_rule": "ตรวจ capability ที่มีอยู่ก่อนเพิ่ม ห้ามอ้างผ่านจากเพียงการมี config file"
+    },
+    "operations": {
+      "stop_modes": [
+        "หยุด new decision/new place โดยยังอนุญาต reconcile, finalize และ audit repair",
+        "full emergency shutdown ต้องระบุผลต่อ outstanding broker orders และ recovery"
+      ],
+      "required_runbooks": [
+        "UNKNOWN/PLACING_UNKNOWN",
+        "stale claim และ unresolved fence",
+        "delayed holdings",
+        "partial -> cancel/expire",
+        "runtime identity/semantics mismatch",
+        "broker outage/rate limit/auth expiry",
+        "RTDB unavailable/mirror failure",
+        "manual/external trade contamination",
+        "DNA exhaustion/calendar degraded",
+        "archive backlog",
+        "deploy rollback with unresolved orders",
+        "restore database without replaying money"
+      ],
+      "restore_rule": "ทดสอบ restore ใน isolated environment ก่อน และ reconcile broker state ภายนอกกับ dedupe/fence evidence ก่อนเปิด new place; restore snapshot เก่าไม่ใช่ rollback broker side effects",
+      "alerts": [
+        "unresolved intent age",
+        "reconcile budget exhausted",
+        "blocked chain age",
+        "audit/model-realized discrepancy",
+        "worker/scheduler failure",
+        "quote/clock stale",
+        "archive/backlog/read growth",
+        "auth/permission failure",
+        "DNA remaining slots"
+      ],
+      "alert_policy": "มี severity, owner, dedupe, threshold, routing และ response runbook; ตรวจรับด้วย alert test จริง ไม่ส่งข้อความภายนอกหากยังไม่ได้รับอนุญาต",
+      "audit_fields": [
+        "release revision",
+        "chain/run/client_order identity",
+        "worker generation",
+        "state transition",
+        "redacted evidence reference",
+        "retry count",
+        "broker timestamps",
+        "decision/dispatch/fill/finalization timestamps",
+        "recovery operator/action"
+      ],
+      "numeric_targets": "Phase 0/1 ต้องบันทึก unresolved-age threshold, reconcile deadline, RPO/RTO, retention และ operational owner ตาม deployment profile; ค่า null ทำให้ operations gate ไม่ผ่าน"
+    },
+    "performance": {
+      "baseline_profile": [
+        "จำนวน account/chain/symbol ที่รองรับ",
+        "scheduler frequency/concurrency",
+        "cold/warm start",
+        "PASS/READY/reconcile/partial workloads",
+        "retained live/archive record counts",
+        "broker quotas/latency",
+        "RTDB payload sizes"
+      ],
+      "metrics": [
+        "p50/p95/p99 decision latency",
+        "worker cycle p95",
+        "broker calls per PASS/ACT/reconcile",
+        "RTDB requests/bytes per cycle",
+        "candidates scanned vs records moved",
+        "backlog age",
+        "function memory/timeout/headroom",
+        "estimated monthly cost with workload assumptions"
+      ],
+      "provisional_targets": [
+        "p95 latency และ RTDB bytes ของ workload เดียวกันหลัง refactor ไม่เกิน baseline 110% เว้นแต่ correctness fix ต้องใช้ witness เพิ่มและมีเหตุผลอนุมัติ",
+        "unexpected additional broker calls = 0",
+        "schedule workload sustainable โดยไม่เกิด backlog growth ใน soak test",
+        "timeout/rate-limit budget ต้องมีค่าตัวเลขก่อน UAT gate"
+      ],
+      "calibration": "110% เป็น provisional regression budget ไม่ใช่คำรับรองความเร็วเชิงพาณิชย์ ต้องล็อก absolute budgets และ workload ceiling ก่อน optimization; ไม่ลดเกณฑ์หลังเห็นผลเพื่อให้ผ่าน",
+      "optimization_rule": "ไม่มี performance change จน correctness/characterization ผ่าน; ห้าม cache identity/holdings/quote/fence เกิน freshness contract"
+    },
+    "deployment": {
+      "required": [
+        "reproducible build จาก release SHA และ lock/vendor dependencies",
+        "actual Gen2 source/package entrypoint smoke",
+        "environment loader และ SDK compatibility",
+        "negative invocation/auth tests",
+        "request/response contract tests",
+        "isolated RTDB emulator/integration tests",
+        "mixed-version rollout/rollback compatibility",
+        "revision-specific config manifest ที่ไม่มี secret values"
+      ],
+      "uat": "ใช้ supported UAT value/host/account จาก actual adapter และ official broker docs; ห้ามเดาว่า literal WEBULL_ENV=UAT ใช้ได้แน่นอน",
+      "rollback": "rollback เฉพาะ code/config ที่ compatible กับ persisted semantics; ห้ามย้อน database หรือปลด attempted/fence เพื่อทำให้ code เก่ารันได้",
+      "production": "ต้องมี release package และ operator approval ที่ชัดเจนก่อน production deploy หรือคำสั่งเงินจริง; controlled rollout จำกัด exposure และมี tested stop mode"
+    }
+  },
+  "implementation_protocol": {
+    "authorization": {
+      "current_document": "เอกสารนี้เป็นแผน ไม่ใช่หลักฐานว่ามีการ deploy/test แล้ว",
+      "when_forwarded": "เริ่ม local read-only audit, characterization, reversible code/test/docs changes ตาม scope ได้โดยไม่ถามซ้ำในเรื่องที่อนุญาตแล้ว",
+      "external_actions": "เตรียม UAT deployment/order manifest ให้ review ได้ก่อนขอ approval เฉพาะเมื่อ session ยังไม่อนุญาตการ deploy/ส่งคำสั่ง; ระบุ account/env/symbol/side/qty/notional/release revision ชัด",
+      "never_infer": [
+        "production money movement จากคำว่า commercial",
+        "schema migration approval จากคำว่า refactor",
+        "permission ส่ง email/Slack/PR comments จากการให้ทำโค้ด"
+      ],
+      "blocked_policy": "เดินงานที่ไม่พึ่งสิทธิ์/credentials ต่อ บันทึก blocker และ exact required input; ไม่สร้างผล UAT จำลองเป็น real evidence"
+    },
+    "startup": [
+      "อ่าน AGENTS.md และ instructions ที่ใช้จริง",
+      "หา repo root จริง; workspace ก่อนหน้าเป็น outer folder และมี backend nested lego-firebase-main",
+      "ตรวจ Git remote/branch/HEAD/dirty tree และ deployment reference ถ้าเข้าถึงได้",
+      "ถ้าเป็น ZIP ที่ไม่มี .git ให้บันทึก hashes และสร้าง isolated checkout ตามสิทธิ์; ห้าม overwrite user changes",
+      "อ่าน checkpoint ถ้ามี แล้วตรวจ artifacts กับ revision ก่อน resume",
+      "อ่าน relevant source/tests/deployment/docs ก่อนลงมือ"
+    ],
+    "risk_classes": {
+      "LOW": "pure helper/docs ที่ไม่แตะ money orchestration และ persistent behavior",
+      "MEDIUM": "service extraction, import/init/wiring, retry flow, validation sharing, read removal, repair/adapter sequence",
+      "HIGH": "money math, identity, idempotency, fence, schema, clock, partial accounting และ cross-version migration",
+      "rule": "จัดระดับตาม blast radius ไม่ใช่จำนวนบรรทัด; HIGH ทำเฉพาะ confirmed correctness gap และ change gate"
+    },
+    "change_loop": [
+      "ระบุ exact gap + source/test/log evidence",
+      "เขียน characterization หรือ failing regression ตามความเสี่ยง",
+      "แก้ทีละ concern ไม่ปน rename/reformat/dependency upgrade",
+      "run focused checks แล้ว relevant suite/full release regression",
+      "review diff, behavior, imports และ unintended mutations",
+      "update evidence/checkpoint ก่อนเริ่ม phase ต่อไป"
+    ],
+    "correctness_interrupt": "หากพบ duplicate, accounting, stale ownership, identity bypass หรือ unsafe archive ให้หยุด structural refactor แก้ isolated correctness ก่อน แล้ว re-baseline",
+    "no_overengineering": [
+      "ไม่ลด safety code เพราะยาว",
+      "ไม่สร้าง interface ทุก module",
+      "ไม่เปลี่ยน env defaults ระหว่าง extraction",
+      "ไม่รวม broker reads ที่เป็น independent witness โดยไม่มี proof",
+      "ไม่เปลี่ยน test ให้ยอมรับ output ใหม่โดยไม่มี contract decision"
+    ],
+    "handoff": {
+      "files": [
+        "docs/commercial/CONTRACTS.md",
+        "docs/commercial/REALITY_AUDIT.md",
+        "docs/commercial/STATE_TRANSITIONS.md",
+        "docs/commercial/FAILURE_MATRIX.md",
+        "docs/commercial/ACCEPTANCE.json",
+        "docs/commercial/PERFORMANCE_PROFILE.json",
+        "docs/commercial/OPERATIONS.md",
+        "docs/commercial/RELEASE_MANIFEST.json",
+        "docs/commercial/CHECKPOINT.json"
+      ],
+      "checkpoint_fields": [
+        "current_phase",
+        "working_revision",
+        "dirty_changes",
+        "completed_actions",
+        "failed_checks",
+        "blocked_actions",
+        "last_test_command_and_result",
+        "evidence_paths",
+        "contract_decisions",
+        "next_exact_action",
+        "authorization_record"
+      ],
+      "resume": "อ่าน checkpoint, validate Git/evidence freshness, ทำ next_exact_action; ไม่เริ่ม audit ใหม่ทั้งหมดถ้า inputs เดิม",
+      "communication": "รายงานภาษาไทย กระชับ ระบุสิ่งที่พิสูจน์แล้ว/ยังไม่ทราบ; final ต้องมีผลจริงและ blocker ไม่ใช้เปอร์เซ็นต์คาดเดา"
+    }
+  },
+  "step_5_do_it": {
+    "action_plan": [
+      {
+        "id": "A0",
+        "action": "Reality audit และล็อก acceptance registry v1",
+        "owner": "GPT-5.6 Sol Medium",
+        "start": "เริ่มงาน",
+        "end": "เมื่อ mapping code/contracts/deployment scope/evidence gaps ครบ",
+        "depends_on": [],
+        "deliverables": [
+          "REALITY_AUDIT.md พร้อม labels ALREADY_IMPLEMENTED, SAME_INVARIANT_DIFFERENT_NAME, ACTUAL_GAP, COMPLEXITY_HOTSPOT, POSSIBLE_DUPLICATION, PROTECTED_DO_NOT_TOUCH, NEEDS_CHARACTERIZATION",
+          "source revision และ dependency/runtime inventory",
+          "ACCEPTANCE.json ทุก criterion เริ่ม NOT_RUN เว้นแต่มี valid evidence",
+          "deployment profile และ assumption register"
+        ],
+        "gate": "ห้ามถือว่าระบบพร้อมจาก audit เดิม"
+      },
+      {
+        "id": "A1",
+        "action": "Full baseline และ financial/lifecycle/ordering characterization",
+        "owner": "GPT-5.6 Sol Medium",
+        "start": "หลัง A0",
+        "end": "เมื่อ baseline reproducible และ contract disagreements ถูกระบุครบ",
+        "depends_on": [
+          "A0"
+        ],
+        "deliverables": [
+          "actual test counts passed/failed/skipped/collected พร้อม command/runtime",
+          "CONTRACTS.md รวม genesis/E/model-vs-realized/terminal partial",
+          "STATE_TRANSITIONS.md",
+          "test coverage mapping ต่อ invariant"
+        ],
+        "gate": "critical baseline failure ต้องแก้หรือระบุ blocker ก่อน extraction; skipped required test ไม่ใช่ PASS"
+      },
+      {
+        "id": "A2",
+        "action": "พิสูจน์ crash/concurrency และแก้ correctness แยกชุด",
+        "owner": "GPT-5.6 Sol Medium",
+        "start": "หลัง A1",
+        "end": "เมื่อ required failure cases ผ่านด้วย controlled evidence",
+        "depends_on": [
+          "A1"
+        ],
+        "deliverables": [
+          "FAILURE_MATRIX.md",
+          "RTDB emulator/integration interleaving tests",
+          "SDK transport retry audit",
+          "isolated bug fixes เฉพาะที่พิสูจน์"
+        ],
+        "gate": "critical/high correctness gap ที่ยังเปิดห้ามเข้าสู่ structural refactor"
+      },
+      {
+        "id": "A3",
+        "action": "ล็อก performance/operations budgets และ threat model",
+        "owner": "GPT-5.6 Sol Medium; operator ให้ข้อมูลขอบเขตที่จำเป็น",
+        "start": "หลัง A1",
+        "end": "ก่อน optimization และ live UAT",
+        "depends_on": [
+          "A1"
+        ],
+        "deliverables": [
+          "PERFORMANCE_PROFILE.json",
+          "security/identity/isolation evidence",
+          "numeric alert/RPO/RTO/retention budgets และ workload ceiling"
+        ],
+        "gate": "ค่า budget/owner ที่ยังไม่ทราบคง BLOCKED สำหรับ release criteria ที่เกี่ยวข้อง"
+      },
+      {
+        "id": "A4",
+        "action": "Extract decision_service, execution_service, archive_service ทีละชุด",
+        "owner": "GPT-5.6 Sol Medium",
+        "start": "หลัง A2",
+        "end": "เมื่อทุก service ผ่าน behavior/import/ordering tests",
+        "depends_on": [
+          "A2"
+        ],
+        "deliverables": [
+          "thin main wrappers",
+          "acyclic dependencies",
+          "focused diff ต่อ service",
+          "full regression หลัง integration"
+        ],
+        "gate": "financial/persistence/env/HTTP/broker behavior เท่าเดิม; ไม่บังคับ extract module ที่ HEAD ทำแล้ว"
+      },
+      {
+        "id": "A5",
+        "action": "Targeted complexity audit และ measured hot-path optimization",
+        "owner": "GPT-5.6 Sol Medium",
+        "start": "หลัง A3 และ A4",
+        "end": "เมื่อ benefits มีหลักฐานหรือสรุป retain current implementation",
+        "depends_on": [
+          "A3",
+          "A4"
+        ],
+        "deliverables": [
+          "admin/mirror/repair duplication review",
+          "proof ต่อ read/helper ที่ตัด",
+          "performance before/after"
+        ],
+        "gate": "ไม่พบ safe benefit ให้คงเดิมได้ ไม่ใช้จำนวนบรรทัดเป็น KPI"
+      },
+      {
+        "id": "A6",
+        "action": "Isolated Gen2 deployment และ security/runtime smoke",
+        "owner": "GPT-5.6 Sol Medium ภายใต้ deployment authorization",
+        "start": "หลัง A5",
+        "end": "เมื่อ deployed release candidate ผ่านทุก entrypoint",
+        "depends_on": [
+          "A5"
+        ],
+        "deliverables": [
+          "build/deploy manifest",
+          "imports/env/HTTP/auth results",
+          "redacted Cloud Logging evidence",
+          "real SDK dependency provenance"
+        ],
+        "gate": "ทุก entrypoint resolve และ invocation ทำงานใน isolated env; mock-only ไม่ผ่าน"
+      },
+      {
+        "id": "A7",
+        "action": "Real Webull UAT order/fill/reconcile และ idempotency proof",
+        "owner": "GPT-5.6 Sol Medium ภายใต้ explicit UAT order authorization",
+        "start": "หลัง A6",
+        "end": "เมื่อ actual end-to-end fill path และ retry proof ผ่าน",
+        "depends_on": [
+          "A6"
+        ],
+        "deliverables": [
+          "real authenticated snapshot",
+          "bounded actionable UAT order manifest",
+          "preview/place/order detail/fill/holdings evidence",
+          "model and realized ledger evidence",
+          "worker/reconcile replay result และ broker order-count evidence"
+        ],
+        "gate": "ต้องเห็น terminal positive cumulative fill กับ holdings witness และ once-only ledger; broker ไม่ให้ fill -> BLOCKED ไม่ใช้ mock แทน"
+      },
+      {
+        "id": "A8",
+        "action": "Operations, recovery, rollback/restore และ soak verification",
+        "owner": "GPT-5.6 Sol Medium + operator สำหรับ action ที่ต้องสิทธิ์",
+        "start": "หลัง A7",
+        "end": "เมื่อ drills และ workload budgets ผ่าน",
+        "depends_on": [
+          "A7"
+        ],
+        "deliverables": [
+          "tested stop-new-place/reconcile mode",
+          "alert routing verification",
+          "incident runbooks",
+          "isolated restore และ unresolved-order rollback drill",
+          "performance/soak/cost report"
+        ],
+        "gate": "ไม่มี lost unresolved intent, accidental place หรือ duplicate ledger หลัง recovery"
+      },
+      {
+        "id": "A9",
+        "action": "Final audit และ release package",
+        "owner": "GPT-5.6 Sol Medium",
+        "start": "หลัง A8",
+        "end": "เมื่อ acceptance ทุกข้อมี valid PASS evidence ของ candidate เดียวกัน",
+        "depends_on": [
+          "A8"
+        ],
+        "deliverables": [
+          "full final regression และ fresh critical evidence",
+          "README/deploy/runbooks code-aligned",
+          "RELEASE_MANIFEST.json + acceptance report",
+          "known limitations/operating envelope",
+          "operator-reviewed rollout plan"
+        ],
+        "gate": "COMMERCIAL_RELEASE_CANDIDATE_100_READY เมื่อครบทุก required criterion; ถ้าไม่ครบรายงานจริงและ next action"
+      },
+      {
+        "id": "A10",
+        "action": "Controlled production rollout เฉพาะได้รับ authorization",
+        "owner": "Operator และ GPT-5.6 Sol Medium ตามสิทธิ์",
+        "start": "หลัง A9 และ production approval",
+        "end": "เมื่อ authorized production verification ผ่าน",
+        "depends_on": [
+          "A9"
+        ],
+        "deliverables": [
+          "production revision/config identity verification",
+          "bounded rollout evidence",
+          "production monitoring/stop readiness",
+          "operational acceptance"
+        ],
+        "gate": "ห้ามกล่าวว่า deployed commercial product หากยังเป็นเพียง release candidate; production order ต้องมี approval แยกชัดเจน"
+      }
+    ],
+    "measurement": {
+      "kpis": [
+        {
+          "name": "Required acceptance pass rate",
+          "formula": "G_n = 100 * count(valid_PASS_required_criteria) / count(required_criteria_in_frozen_registry)",
+          "target": 100,
+          "frequency": "ทุก phase และทุก release candidate"
+        },
+        {
+          "name": "Duplicate external/internal effects",
+          "formula": "D_n = duplicate_broker_orders + duplicate_model_applications + duplicate_realized_applications ใน required fault/concurrency scenarios",
+          "target": 0,
+          "frequency": "ทุก money-path change และ final regression"
+        },
+        {
+          "name": "Performance budget violations",
+          "formula": "B_n = count(workload_metrics_exceeding_locked_budgets)",
+          "target": 0,
+          "frequency": "baseline, หลัง optimization, หลัง deploy และ soak"
+        }
+      ],
+      "evaluation_equations": [
+        {
+          "name": "Goal attainment",
+          "formula": "attainment = G_n / 100",
+          "interpret": "แสดงความครบหลักฐาน ไม่ใช่ probability ว่าไม่มี bug"
+        },
+        {
+          "name": "Baseline-adjusted progress",
+          "formula": "progress = (G_n - G_0) / (100 - G_0)",
+          "interpret": "ใช้เมื่อ G_0<100 และ registry version เดียวกัน; ถ้า G_0=100 ใช้ release readiness boolean"
+        },
+        {
+          "name": "Release readiness",
+          "formula": "READY = (N_required>0) AND all(required_criterion == valid_PASS) AND D_n==0 AND B_n==0 AND open_critical_high_in_scope==0",
+          "interpret": "คะแนนเฉลี่ยหรือคะแนนสูงในหัวข้ออื่นชดเชย critical gate ที่ไม่ผ่านไม่ได้"
+        },
+        {
+          "name": "Remaining gap",
+          "formula": "e_n = 100 - G_n",
+          "interpret": "FAIL/BLOCKED/NOT_RUN/stale evidence มีค่า pass=0; unknown baseline ไม่แทนด้วยศูนย์โดยเดา"
+        },
+        {
+          "name": "Registry change",
+          "formula": "ถ้า required criteria เปลี่ยน -> version registry, recompute G_0/G_n จาก raw evidence",
+          "interpret": "ห้ามเทียบ convergence ข้าม denominator โดยไม่ rebaseline"
+        }
+      ],
+      "loop": {
+        "control_equation": "e_n = 100 - G_n",
+        "convergence_rate": "r_n = abs(e_n)/abs(e_previous), ใช้เมื่อมี previous>0 และ registry version เดียวกัน",
+        "stop_condition": "e_n == 0 AND READY == true; สำหรับ production deployment ยังต้อง A10/authorization",
+        "epsilon": 0,
+        "gain_K": 1,
+        "correction": "u_next = K * e_n เป็นดัชนีจัดลำดับ effort ภายในสิทธิ์และ budget เดิม ไม่ใช่อำนาจเพิ่มเงิน เวลา หรือ API traffic อัตโนมัติ",
+        "n_max": 5,
+        "escalation_ladder": [
+          {
+            "if": "r_n < 0.99 และยังไม่ผ่าน",
+            "loop_back_to": "step_5",
+            "action": "แก้ remaining failures ตาม dependency และความเสี่ยง"
+          },
+          {
+            "if": "0.99 <= r_n <= 1.01",
+            "loop_back_to": "step_3",
+            "action": "ตรวจ root cause และ evidence assumptions ใหม่ ไม่ rerun แบบเดิมโดยไร้ข้อมูลเพิ่ม"
+          },
+          {
+            "if": "r_n > 1.01",
+            "loop_back_to": "step_2",
+            "action": "ประเมิน blast radius/new gaps และหยุด change ที่ทำให้ correctness แย่ลง"
+          },
+          {
+            "if": "ครบ 5 meaningful cycles แล้วยังไม่ผ่าน",
+            "loop_back_to": "step_1",
+            "action": "เสนอปรับ scope/horizon/resources โดยไม่ลด money-safety gate; ต้องมี user decision เมื่อเปลี่ยนเป้าหมาย"
+          },
+          {
+            "if": "blocked by credentials/approval/provider behavior",
+            "loop_back_to": "step_5",
+            "action": "บันทึก BLOCKED และ exact unblock input ทำงานอิสระต่อ; เวลาไหลผ่านไม่ใช่ approval"
+          }
+        ]
+      }
+    }
+  },
+  "acceptance_registry": {
+    "status_values": [
+      "NOT_RUN",
+      "PASS",
+      "FAIL",
+      "BLOCKED",
+      "STALE"
+    ],
+    "evidence_schema": {
+      "criterion_id": "stable ID",
+      "required": true,
+      "status": "NOT_RUN",
+      "release_sha": null,
+      "working_tree_hash": null,
+      "environment": null,
+      "command_or_procedure": null,
+      "expected": null,
+      "observed": null,
+      "test_counts": null,
+      "artifact_path": null,
+      "timestamp_utc": null,
+      "reviewer": null,
+      "blocking_reason": null
+    },
+    "pass_rule": "PASS เมื่อ observed ตรง expected และ evidence valid สำหรับ exact candidate/config/dependency version; การเปลี่ยน safety code ทำให้ affected prior evidence เป็น STALE",
+    "na_rule": "ไม่มี N/A สำหรับ mandatory safety/UAT gates; out-of-scope ต้องตัดสินก่อน execution พร้อม scope rationale และ registry version ห้ามตัด failed test ออกเพื่อทำคะแนน",
+    "groups": [
+      {
+        "id": "G01",
+        "name": "Financial contracts",
+        "required_criteria": [
+          "genesis/first-fill/slippage characterized",
+          "E branch-specific behavior preserved",
+          "No qualifying execution -> no A/P_acted advancement after seed",
+          "exact 17 columns and legacy readers",
+          "model vs realized ledger distinction",
+          "quantity rounding/SELL ceiling preserved"
+        ]
+      },
+      {
+        "id": "G02",
+        "name": "Execution and partial lifecycle",
+        "required_criteria": [
+          "preview/place acceptance never treated as fill",
+          "actual cumulative qty/price validated",
+          "partial nonterminal vs terminal model policy",
+          "partial then FILLED/CANCELLED/EXPIRED",
+          "zero vs missing invalid fill",
+          "post-fill holdings delay/direction/external interference policy",
+          "model and realized divergence repair"
+        ]
+      },
+      {
+        "id": "G03",
+        "name": "Idempotency and concurrency",
+        "required_criteria": [
+          "duplicate scheduler and worker",
+          "stale generation vs place",
+          "crash before/after pre-place marker",
+          "accepted broker response lost",
+          "no hidden transport retry",
+          "concurrent RTDB transaction retry",
+          "finalize committed row-mirror failed",
+          "old run replay after history pruning/archive",
+          "chain/account deployment isolation scope"
+        ]
+      },
+      {
+        "id": "G04",
+        "name": "Ordering and compatibility",
+        "required_criteria": [
+          "all money-critical happens-before",
+          "runtime/semantics mismatch fail closed",
+          "pending recovery before new money path",
+          "clock/DNA ordinal mismatch",
+          "env/HTTP/payload/error mapping unchanged",
+          "mixed-version behavior/rollback"
+        ]
+      },
+      {
+        "id": "G05",
+        "name": "Archive and retention",
+        "required_criteria": [
+          "no active/fenced/audit-pending/recovery record removed",
+          "concurrent eligibility mutation",
+          "copy/delete crash idempotency",
+          "retention vs dedupe/replay horizon",
+          "scan growth measured/bounded within supported workload"
+        ]
+      },
+      {
+        "id": "G06",
+        "name": "Code and regression",
+        "required_criteria": [
+          "full suite baseline and final recorded",
+          "all required tests run and pass",
+          "focused behavior characterization",
+          "real RTDB concurrency/integration evidence",
+          "acyclic imports/entrypoint smoke",
+          "no unrelated user-change overwrite"
+        ]
+      },
+      {
+        "id": "G07",
+        "name": "Security and supply chain",
+        "required_criteria": [
+          "authenticated least-privilege invoker/admin",
+          "runtime identity/isolation verified",
+          "RTDB access model verified",
+          "secret/log redaction verified",
+          "dependency pin/provenance/vulnerability triage",
+          "admin recovery trail and no invented execution evidence"
+        ]
+      },
+      {
+        "id": "G08",
+        "name": "Gen2 deployment",
+        "required_criteria": [
+          "reproducible exact candidate build",
+          "actual source deployed in isolated env",
+          "three entrypoints invoked",
+          "env and SDK compatibility",
+          "logging/response/auth negative tests"
+        ]
+      },
+      {
+        "id": "G09",
+        "name": "Real broker UAT",
+        "required_criteria": [
+          "real authenticated snapshot",
+          "reviewed bounded UAT order",
+          "real preview/place/status",
+          "terminal positive fill observed",
+          "post-fill holdings witness",
+          "both ledgers correct once",
+          "replay/reconcile broker duplicate-count proof"
+        ]
+      },
+      {
+        "id": "G10",
+        "name": "Operations and recovery",
+        "required_criteria": [
+          "stop-new-place with reconciliation continuing",
+          "unresolved-age/alert routing drill",
+          "manual recovery runbooks",
+          "restore with external broker reconciliation",
+          "rollback while unresolved",
+          "numeric RPO/RTO/retention/owner recorded",
+          "DNA/auth/calendar outage handling"
+        ]
+      },
+      {
+        "id": "G11",
+        "name": "Simple and fast",
+        "required_criteria": [
+          "service responsibilities clear",
+          "every removal justified by invariant",
+          "locked numeric budgets/workload ceiling",
+          "latency/calls/read-bytes regression within budget",
+          "backlog/soak sustained capacity",
+          "cost estimate reproducible"
+        ]
+      },
+      {
+        "id": "G12",
+        "name": "Release and documentation",
+        "required_criteria": [
+          "docs reflect exact code including E/partial/genesis",
+          "release/config/dependency/evidence manifest",
+          "all required criteria PASS without exclusions after failure",
+          "zero unresolved critical/high defects in scope",
+          "operating limits and production authorization boundary explicit",
+          "independent operator can follow deployment/recovery instructions"
+        ]
+      }
+    ],
+    "expansion_rule": "Phase A0 แปลง required_criteria แต่ละรายการเป็น criterion_id เช่น G01-C01 พร้อม expected/observed/evidence ห้ามนับ group ที่มีบางข้อผ่านเป็นทั้ง group ผ่าน",
+    "release_states": {
+      "PLAN_READY": "มีแผนเท่านั้น; current status ของเอกสารนี้",
+      "AUDIT_READY": "A0 complete",
+      "REFACTOR_READY": "A1/A2 safety baseline complete",
+      "UAT_DEPLOY_READY": "A3-A5 complete",
+      "LIVE_UAT_READY": "A6 complete",
+      "OPERATIONS_READY": "A7/A8 complete",
+      "COMMERCIAL_RELEASE_CANDIDATE_100_READY": "G01-G12 criteria ทั้งหมด PASS ของ candidate เดียวกัน",
+      "PRODUCTION_DEPLOYED_VERIFIED": "A10 authorized และ actual production verification ผ่าน",
+      "NOT_READY": "มี required criterion FAIL/BLOCKED/NOT_RUN/STALE"
+    },
+    "meaning_100": "100% ของเกณฑ์ที่ระบุและหลักฐานภายใน operating envelope ผ่าน ไม่ใช่ zero-bug guarantee, regulatory certification หรือ uptime 100%"
+  },
+  "required_failure_scenarios": [
+    "DNA=0",
+    "threshold equal/below/above and quantity rounds to zero",
+    "READY BUY/SELL",
+    "genesis with no fill",
+    "first fill slippage",
+    "PASS after slippage-sensitive finalized E",
+    "preview rejected",
+    "explicit zero-fill broker rejection",
+    "place accepted but not filled",
+    "place timeout/connection loss",
+    "lookup not found under eventual visibility",
+    "duplicate scheduler",
+    "simultaneous worker claims",
+    "stale lease generation resumes",
+    "worker dies immediately before/after durable pre-place",
+    "broker accepted process dies before persist",
+    "PARTIAL_FILLED/PARTIALLY_FILLED cumulative repeats",
+    "partial -> filled/cancelled/expired",
+    "missing/NaN/negative qty or price",
+    "cumulative qty regression and fee correction policy",
+    "post-fill holdings delayed/missing symbol/wrong direction",
+    "external/manual trade during pending order",
+    "market/clock degradation",
+    "DNA ordinal mismatch/exhaustion",
+    "runtime identity mismatch",
+    "cashflow semantics mismatch",
+    "RTDB transaction callback retry/contention",
+    "realized success/model failure and inverse repair boundary",
+    "finalization committed but row patch failed",
+    "audit mirror interrupted",
+    "archive vs active fence/recovery update",
+    "old intent replay after archival/pruning",
+    "kill switch while submitted",
+    "mixed revision rollout and rollback with unresolved intent",
+    "backup restore while broker state newer than database"
+  ],
+  "assumptions": [
+    "current readiness/test count/production state ไม่ทราบจน A0/A1 ตรวจจริง",
+    "Step 4 expected_effect=100 คือเป้าหมายปิดช่องว่างของ root cause นั้น ไม่ใช่ predicted commercial success; cost เป็น relative effort points และ priority เป็น heuristic ที่ต้องปรับจาก audit; dependency/safety outrank ranking",
+    "root-cause weights เป็น planning hypotheses ไม่ใช่ผลสถิติ",
+    "ไม่ขยายระบบเป็น multi-tenant SaaS โดยปริยาย",
+    "ไม่มีการเปลี่ยนสูตร E/model ledger จนพบ correctness defect และผ่าน protected-contract change gate",
+    "ไม่รับประกันว่า UAT รองรับ fill/correction scenarios ทุกแบบ; unsupported case ต้องระบุหลักฐานและ blocker ไม่ทำให้ real-fill mandatory gate กลายเป็น optional",
+    "production rollout และ live orders ต้องใช้ authorization ของ session จริง",
+    "ไม่กำหนดวันเสร็จ เงินลงทุน หรือ performance absolute targets โดยเดา; required numeric profile ต้องครบก่อน release",
+    "ห้ามตีความเอกสารนี้ว่า full tests/UAT/security audit ได้ผ่านแล้ว",
+    "หาก HEAD ต่างจาก reference ให้ใช้ source/tests ที่ตรวจจริงพร้อมบันทึกความต่าง; conceptual plan ไม่อยู่เหนือ persistent contract ที่ยังไม่ได้อนุมัติให้เปลี่ยน"
+  ]
+}

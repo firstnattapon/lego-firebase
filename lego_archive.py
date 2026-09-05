@@ -15,6 +15,7 @@ carries no usable timestamp — an undatable record is never old enough to move.
 from __future__ import annotations
 
 import os
+import uuid
 from datetime import datetime, timedelta, timezone
 
 from firebase_admin import db
@@ -62,11 +63,58 @@ def _movable(doc, terminal: set[str], cutoff: datetime) -> bool:
             and _finished_before(doc, cutoff))
 
 
-def _move(source_path: str, archive_path: str, key: str, doc: dict) -> None:
-    """Write the copy first: a crash between the two leaves a duplicate, not a
-    hole, and the next run re-moves it idempotently."""
-    db.reference(f"{archive_path}/{key}").set(doc)
-    db.reference(f"{source_path}/{key}").delete()
+class _ArchiveRace(RuntimeError):
+    """The live record changed while an archive attempt was in progress."""
+
+
+def _move_if_unchanged(source_path: str, archive_path: str, key: str,
+                       scanned: dict, terminal: set[str], cutoff: datetime) -> bool:
+    """Atomically delete only the exact record that was judged movable.
+
+    RTDB cannot condition a multi-location update on two independently changing
+    nodes.  A small durable claim closes the dangerous window without a root
+    transaction: claim the exact scanned value, copy that claimed value, then
+    transactionally delete only if no writer changed it.  A crash at either
+    boundary is replayable.  If recovery updates the source after the claim,
+    the compare fails and the live record is retained.
+    """
+    source = db.reference(f"{source_path}/{key}")
+    archive = db.reference(f"{archive_path}/{key}")
+    token = uuid.uuid4().hex
+
+    def claim(current):
+        if current != scanned or not _movable(current, terminal, cutoff):
+            raise _ArchiveRace("archive eligibility changed before claim")
+        claimed = dict(current)
+        claimed["_archive_claim"] = token
+        return claimed
+
+    try:
+        claimed = source.transaction(claim)
+    except _ArchiveRace:
+        return False
+
+    archive.set(claimed)
+
+    def delete_claimed(current):
+        if current != claimed or current.get("_archive_claim") != token:
+            raise _ArchiveRace("live record changed after archive copy")
+        # Returning None from an RTDB transaction is an atomic delete.
+        return None
+
+    try:
+        source.transaction(delete_claimed)
+    except _ArchiveRace:
+        # The archive copy is only a stale attempt; remove it iff it is still
+        # our copy.  Never remove a newer successful archive attempt.
+        def discard_our_copy(current):
+            if isinstance(current, dict) and current.get("_archive_claim") == token:
+                return None
+            return current
+
+        archive.transaction(discard_our_copy)
+        return False
+    return True
 
 
 def archive_terminal_intents(cutoff: datetime, limit: int) -> int:
@@ -88,8 +136,9 @@ def archive_terminal_intents(cutoff: datetime, limit: int) -> int:
             if str(run_id) == inflight_run_id:
                 continue
             if _movable(doc, TERMINAL, cutoff):
-                _move(f"{OUTBOX_PATH}/{ck}", f"{OUTBOX_ARCHIVE_PATH}/{ck}", run_id, doc)
-                moved += 1
+                moved += int(_move_if_unchanged(
+                    f"{OUTBOX_PATH}/{ck}", f"{OUTBOX_ARCHIVE_PATH}/{ck}",
+                    run_id, doc, TERMINAL, cutoff))
     return moved
 
 
@@ -99,8 +148,9 @@ def archive_terminal_audits(cutoff: datetime, limit: int) -> int:
         if moved >= limit:
             return moved
         if _movable(doc, AUDIT_TERMINAL, cutoff):
-            _move(AUDIT_PATH, AUDIT_ARCHIVE_PATH, event_id, doc)
-            moved += 1
+            moved += int(_move_if_unchanged(
+                AUDIT_PATH, AUDIT_ARCHIVE_PATH, event_id, doc,
+                AUDIT_TERMINAL, cutoff))
     return moved
 
 

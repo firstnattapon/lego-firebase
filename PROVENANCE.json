@@ -1,51 +1,40 @@
 {
-  "schema": "lego_release_provenance_v1",
-  "generated_at": "2026-08-02T18:25:20+07:00",
-  "status": "local_release_candidate_not_live_certified",
-  "readiness": {
-    "score": 80,
-    "target": 100,
-    "remaining": 20,
-    "remaining_gates": [
-      "controlled live Webull UAT Preview to Place to terminal reconciliation",
-      "separate PROD deployment read-only IAM OIDC Secret RTDB market-data smoke"
-    ]
+  "schema": "lego_release_provenance_v2",
+  "generated_at": "2026-09-05T05:01:01Z",
+  "status": "NOT_READY",
+  "repository": "https://github.com/firstnattapon/lego-firebase",
+  "base_commit": "c3e5394974aa4a1b4ac972b2e6e436a4643071ca",
+  "release_sha": null,
+  "candidate_working_tree_hash": "eda031662952858ac16bfbc727c63057a59e43d8fa57ab27071b08a24cb42499",
+  "acceptance": {
+    "required": 76,
+    "pass": 44,
+    "fail": 0,
+    "blocked": 32,
+    "not_run": 0,
+    "stale": 0,
+    "pass_rate_percent": 57.8947
   },
-  "sources": [
-    {
-      "name": "lego-firebase",
-      "url": "https://github.com/firstnattapon/lego-firebase",
-      "upstream_commit": "9959c5b175e93441fb9e1112eb035f17873e4d36",
-      "release_file_count_before_manifest_and_provenance": 46
-    },
-    {
-      "name": "lego-firebase-streamlit",
-      "url": "https://github.com/firstnattapon/lego-firebase-streamlit",
-      "upstream_commit": "f64e11392475410fdc309cef3bef347b84f14cab",
-      "release_file_count_before_manifest_and_provenance": 13
-    }
-  ],
   "verification": {
-    "python": "3.12",
-    "backend_full_suite": "618 passed, 1 emulator-only skipped",
-    "firebase_rules_emulator": "56 passed, 0 failed, Realtime Database Emulator 4.11.2",
-    "admin_reconciliation_suite": "61 passed, 0 failed",
-    "streamlit_full_suite": "53 passed, 0 failed",
-    "compileall": "passed for both sources",
-    "pip_check": "no broken requirements for both clean environments",
-    "pip_audit": "no known vulnerabilities for both clean environments as checked 2026-08-02",
-    "secret_pattern_scan": "no real credential, token, or private key found; formal CI secret scan remains a deploy gate",
-    "independent_review": "no remaining P0 or P1 finding after final patch review"
-  },
-  "preserved_contracts": {
-    "streamlit_ui": "2 tabs, 6 number inputs, 1 text input, 17-column prefix",
-    "cashflow_semantics": "execution_confirmed_v1",
-    "production_order_scope": "AUTO_SUBMIT=false read-only smoke; source intentionally blocks placing outside UAT"
+    "backend": "644 passed, 1 emulator-only skipped",
+    "backend_clean_venv": "exact requirements installed; 644 passed, 1 emulator-only skipped",
+    "database_rules_emulator": "56 passed",
+    "streamlit": "53 passed",
+    "compile_import_entrypoints": "PASS",
+    "pip_check": "PASS",
+    "pip_audit": "0 known vulnerabilities"
   },
   "live_actions_performed": {
     "webull_order_preview": false,
     "webull_order_place": false,
     "cloud_deploy": false,
     "firebase_live_write": false
-  }
+  },
+  "remaining_authorization_gates": [
+    "A6 isolated Gen2",
+    "A7 real Webull UAT",
+    "A8 deployed operations",
+    "A9 final 100% audit",
+    "A10 production authorization"
+  ]
 }

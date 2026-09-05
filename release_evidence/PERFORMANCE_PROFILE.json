@@ -1,0 +1,26 @@
+{
+  "schema": "lego_performance_profile_v1",
+  "candidate_scope": "local Windows Python 3.12 characterization; not production SLO evidence",
+  "workload_ceiling": null,
+  "approved_owner": null,
+  "budgets": {
+    "decision_latency_ms_p95": null,
+    "execution_cycle_latency_ms_p95": null,
+    "archive_scan_read_bytes_max": null,
+    "broker_calls_per_intent_max": null,
+    "rtdb_read_bytes_per_cycle_max": null,
+    "backlog_age_seconds_max": null,
+    "monthly_cost_max": null
+  },
+  "observations": {
+    "backend_baseline": {"passed": 643, "skipped": 1, "seconds": 15.90},
+    "backend_final": {"passed": 644, "skipped": 1, "seconds": 10.25},
+    "backend_clean_venv": {"passed": 644, "skipped": 1, "seconds": 8.81},
+    "streamlit_final": {"passed": 53, "skipped": 0, "seconds": 5.99},
+    "database_rules_emulator": {"passed": 56, "seconds": 0.73, "emulator": "4.11.2"},
+    "main_lines_before": 1538,
+    "main_lines_after": 272
+  },
+  "interpretation": "Test time and line count are observations only. They cannot substitute for deployed latency, bytes, calls, capacity, or cost budgets.",
+  "status": "BLOCKED_OPERATOR_BUDGETS_AND_DEPLOYED_MEASUREMENT"
+}

@@ -328,6 +328,45 @@ def test_archive_respects_its_batch_limit():
     assert len(FAKE_DB.reference(f"{OUTBOX_PATH}/ck1").get()) == 3
 
 
+def test_archive_does_not_delete_a_concurrent_recovery_update(monkeypatch):
+    """Eligibility becoming false after copy must retain the live witness."""
+    now = datetime(2026, 9, 1, 12, 0, tzinfo=UTC)
+    old = (now - timedelta(days=60)).strftime("%Y-%m-%dT%H:%M:%SZ")
+    source_path = f"{OUTBOX_PATH}/ck1/race"
+    FAKE_DB.reference(source_path).set(_outbox_doc("FILLED", old))
+
+    real_reference = FAKE_DB.reference
+    source_transactions = 0
+
+    def reference_with_race(path=""):
+        ref = real_reference(path)
+        if path != source_path:
+            return ref
+        real_transaction = ref.transaction
+
+        def transaction(fn):
+            nonlocal source_transactions
+            source_transactions += 1
+            if source_transactions == 2:
+                current = ref.get()
+                current.update({"status": "NEEDS_MANUAL_CHECK",
+                                "needs_manual_check": True,
+                                "recovery_note": "operator evidence arrived"})
+                ref.set(current)
+            return real_transaction(fn)
+
+        ref.transaction = transaction
+        return ref
+
+    monkeypatch.setattr("lego_archive.db.reference", reference_with_race)
+    moved = archive_terminal_records(now, days=30, limit=500)
+
+    assert moved["intents_archived"] == 0
+    assert FAKE_DB.reference(source_path).get()["recovery_note"] == \
+        "operator evidence arrived"
+    assert FAKE_DB.reference(f"{OUTBOX_ARCHIVE_PATH}/ck1/race").get() is None
+
+
 def test_archive_worker_reports_what_it_moved(monkeypatch):
     now = datetime(2026, 9, 1, 12, 0, tzinfo=UTC)
     old = (now - timedelta(days=60)).strftime("%Y-%m-%dT%H:%M:%SZ")

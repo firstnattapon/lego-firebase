@@ -8,14 +8,17 @@ Stack: **Scheduler (เวลา) → Cloud Function (engine) → RTDB (data) �
 
 | module | หน้าที่ |
 |---|---|
-| `main.py` | Cloud Function 3 ตัว: `lego_one_row` (เดิน DNA + ตัดสินใจ), `lego_order_worker` (ส่ง/ตาม order + finalize ΔAₙ/Aₙ/Eₙ), `lego_archive_worker` (ย้าย record ที่จบแล้วออกจาก path ที่ loop สแกน) |
+| `main.py` | thin Cloud Functions boundary ของ 3 entrypoints และ compatibility façade |
+| `decision_service.py` | decision orchestration: snapshot → model row → atomic row + recoverable intent |
+| `execution_service.py` | execution orchestration: claim/fence → preview/place/reconcile → ledgers |
+| `archive_service.py` | bounded archive orchestration และ HTTP result mapping |
 | `market_clock.py` | นาฬิกาตลาด: slot, market ordinal, ปฏิทิน NYSE, calendar fingerprint |
 | `lego_one_row.py` | สมการ 17 คอลัมน์: DNA step/signal, decision, Rₙ และ `finalize_recurrence` (ΔAₙ/Aₙ/Eₙ จาก fill จริง) |
 | `dna_engine.py` | ถอด DNA code เป็น gate array 0/1 |
 | `lego_state.py` | Step 18 persistence: transaction, idempotency, guard ทุกตัว, realized ledger |
 | `lego_outbox.py` | order outbox (1 decision = 1 intent) แยกจาก DNA pointer |
 | `lego_orders.py` | submit gate, normalize ผล broker, จับคู่ fill เป็น realized |
-| `lego_archive.py` | ย้าย intent/audit ที่ terminal แล้วไป `*_archive` (ไม่ลบ) ให้ path ที่ scan โตตามงานที่ยังค้างเท่านั้น |
+| `lego_archive.py` | ย้าย intent/audit ที่ terminal แล้วไป `*_archive` ด้วย claim + compare-and-delete transaction; concurrent recovery update จะคง live record ไว้ |
 | `webull_io.py` | adapter ของ Webull OpenAPI (snapshot, position, preview/place/detail) |
 | `find_origin.py` | เครื่องมือหา `LEGO_DNA_ORIGIN_UTC` ก่อนเปิด clock mode `market` |
 | `lego_cashflow_audit.py` | ตรวจแถวที่ commit ไปแล้วเทียบกฎ `execution_confirmed_v1` — **อ่านอย่างเดียว ไม่แก้ RTDB** |
@@ -210,6 +213,21 @@ gcloud scheduler jobs create http lego-archive-tick \
   ```
 
 ## 6. Smoke test (UAT)
+
+ตรวจ broker แบบไม่แตะ Firebase และไม่มีความสามารถส่ง/แก้/ยกเลิก order:
+
+```bash
+# connectivity/account/positions/open-orders/snapshot เท่านั้น
+AUTO_SUBMIT=false WEBULL_ENV=UAT python lego_broker_smoke.py
+
+# เพิ่ม Preview หนึ่งครั้ง (ยังไม่ส่ง order; ใช้ได้เฉพาะ UAT)
+AUTO_SUBMIT=false WEBULL_ENV=UAT python lego_broker_smoke.py \
+  --preview-side BUY --preview-quantity 1
+```
+
+คำสั่งคืน JSON redacted และ exit `0` เมื่อทุก check ผ่าน, `2` เมื่อ fail closed.
+ถ้า `WEBULL_ENV=PROD` จะทำได้เฉพาะ read-only connectivity; Preview ถูกบล็อก.
+จากนั้นจึงทดสอบ deployment/RTDB:
 
 ```bash
 gcloud scheduler jobs run lego-tick --location=$REGION --project=$PROJECT

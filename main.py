@@ -1,14 +1,4 @@
-"""Cloud Functions for time-aligned LEGO DNA and independent order execution.
-
-lego_one_row: market clock -> snapshot -> model row -> durable outbox candidate.
-    Decides. Never books a cashflow: READY_BUY/READY_SELL is an intent, so the
-    row it commits carries ΔAₙ/Aₙ/Eₙ forward unchanged.
-lego_order_worker: dispatch/reconcile outbox intents without blocking DNA time.
-    Executes and finalizes. Once the broker confirms a fill and the position has
-    actually moved, it books ΔAₙ/Aₙ/Eₙ from the filled price onto that row.
-lego_archive_worker: move finished order records out of the live paths.
-"""
-from __future__ import annotations
+"""Thin Cloud Functions HTTP boundary and backward-compatible test facade."""
 
 import logging
 import math
@@ -98,1441 +88,185 @@ UNSENT_CHAIN_TERMINAL = {
 }
 
 
-class FillNotConfirmed(RuntimeError):
-    """The broker reports a fill the account position has not shown yet.
-
-    Not an error about the order — the order is fine. It says only that the two
-    witnesses required before the model ledger may move (a cumulative filled
-    quantity, and a position read back after execution) do not yet agree, so
-    this tick must wait rather than book a cashflow on the broker's word alone.
-    """
-
-
-class RealizedMathError(RuntimeError):
-    """The broker confirmed a fill, but our incremental realized math refused it.
-
-    A different question from 'does this order exist?': the order does exist and
-    is filled. Only the ledger update failed, and asking the broker again cannot
-    change that, so it must not spend the reconcile budget.
-    """
-
-
-def _init_firebase():
-    if not firebase_admin._apps:
-        firebase_admin.initialize_app(
-            credentials.ApplicationDefault(),
-            {"databaseURL": os.environ["FIREBASE_DB_URL"]},
-        )
-
-
-def _iso(dt: datetime) -> str:
-    return dt.astimezone(UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
-
-
-def _error_text(exc: Exception, *, with_type: bool = True) -> str:
-    text = redact_sensitive_text(exc)
-    return f"{type(exc).__name__}: {text}" if with_type else text
-
-
-def _poll_order_status(trade_client, client_order_id: str, place_res: dict) -> dict:
-    detail = None
-    for i in range(ORDER_POLL_ATTEMPTS):
-        if i:
-            time.sleep(ORDER_POLL_DELAY_S)
-        detail = fetch_order_detail(trade_client, client_order_id)
-        summary = summarize_order_result(place_res, detail)
-        if normalize_status(summary.get("status")) in TERMINAL_STATUSES:
-            return summary
-    return summarize_order_result(place_res, detail)
-
-
-def _record_warning(kind: str, message: str, extra: dict | None = None) -> None:
-    """Make a silent skip alertable without growing without bound.
-
-    One node per kind, updated in place with a counter, instead of a push per
-    slot: a degraded clock repeats every slot forever, so pushing a record each
-    time would recreate the unbounded path this system is already trimming.
-    Never raises — a warning that breaks the run it is warning about is worse
-    than no warning.
-
-    Also emitted to the log, because RTDB was the only place it went. A blocked
-    order left three traces and an operator could reach none of them: the
-    response body, which Cloud Scheduler discards; a single counter node nobody
-    watches; and nothing at all in Cloud Logging, where the run showed HTTP 200
-    in 0.3s. Diagnosing this took a CSV export of the row table. One log line per
-    warning ends that — `kind` is greppable and `extra` carries blocked_by.
-    """
-    logger.warning("lego warning kind=%s %s %s", kind, message,
-                   redact_sensitive_text(extra) if extra else "")
-    try:
-        ref = db.reference(f"{WARNINGS_PATH}/{kind}")
-        now = _iso(datetime.now(UTC))
-
-        def txn(current):
-            doc = dict(current or {})
-            doc["count"] = int(doc.get("count", 0) or 0) + 1
-            doc.setdefault("first_at", now)
-            doc.update({"last_at": now, "message": message[:500], **(extra or {})})
-            return doc
-
-        ref.transaction(txn)
-    except Exception:
-        pass
-
-
-def _apply_realized_if_available(intent: dict, summary: dict) -> dict:
-    # summarize_order_result decides this from the filled quantity, not from the
-    # status alone, so a fill that ends CANCELLED or EXPIRED is still accounted.
-    if not summary.get("realized"):
-        return summary
-    qty = summary.get("filled_quantity")
-    price = summary.get("filled_price")
-    if qty is None or price is None:
-        raise RealizedMathError(
-            "fill confirmed but quantity/price unavailable — needs manual check")
-    try:
-        realized = apply_realized_fill(
-            intent["chain_key"], intent["run_id"], intent["side"],
-            cumulative_qty=float(qty), price=float(price),
-            cumulative_fee=float(summary.get("filled_fee", 0.0) or 0.0),
-        )
-    except ValueError as exc:
-        # Raised by apply_realized_fill/apply_fill when the incremental fill
-        # numbers cannot be made sense of. Kept distinct from every other failure
-        # here, all of which mean 'we could not reach or read the broker'.
-        raise RealizedMathError(str(exc)) from exc
-    out = dict(summary)
-    out.update(realized)
-    return out
-
-
-def _persist(chain_key_: str, run_id: str, fields: dict) -> dict:
-    """Keep the outbox authoritative and make an interrupted audit repairable."""
-    update_intent(chain_key_, run_id, {**fields, "audit_pending": True})
-    _mirror_order_audit(chain_key_, run_id, fields)
-    return {"run_id": run_id, **fields}
-
-
-def _mirror_order_audit(chain_key_: str, run_id: str, fields: dict) -> None:
-    """Best-effort audit mirror; the outbox marker makes failure recoverable."""
-    try:
-        update_order_audit(run_id, fields)
-    except Exception as exc:
-        _record_warning(
-            "order_audit_repair",
-            "outbox อัปเดตแล้วแต่ audit ยังไม่สำเร็จ — worker จะซ่อมซ้ำ",
-            {"run_id": run_id, "error_type": type(exc).__name__},
-        )
-    else:
-        # If this clear fails the marker safely remains and the repair pass writes
-        # the same audit payload again.
-        try:
-            update_intent(chain_key_, run_id, {"audit_pending": False})
-        except Exception as exc:
-            _record_warning(
-                "order_audit_repair",
-                "audit เขียนแล้วแต่ล้าง repair marker ไม่สำเร็จ — "
-                "รอบถัดไปเขียนซ้ำได้อย่างปลอดภัย",
-                {"run_id": run_id, "error_type": type(exc).__name__},
-            )
-
-
-_AUDIT_INTERNAL_FIELDS = {
-    "audit_pending", "claim_owner", "claim_until", "claim_generation",
-    "place_fence",
-}
-
-
-def _repair_pending_audits(chain_key_: str) -> int:
-    repaired = 0
-    for intent in list_audit_pending(chain_key_):
-        run_id = str(intent["run_id"])
-        fields = {
-            key: value for key, value in intent.items()
-            if key not in _AUDIT_INTERNAL_FIELDS
-        }
-        try:
-            update_order_audit(run_id, fields)
-            update_intent(chain_key_, run_id, {"audit_pending": False})
-            repaired += 1
-        except Exception as exc:
-            _record_warning(
-                "order_audit_repair",
-                "audit repair ยังไม่สำเร็จ — เก็บ marker ไว้ลองรอบถัดไป",
-                {"run_id": run_id, "error_type": type(exc).__name__},
-            )
-    return repaired
-
-
-def _announce_identity_adoption(adopted: bool, runtime_identity: str) -> None:
-    """Say once that a pre-guard chain was bound to this account/environment."""
-    if not adopted:
-        return
-    _record_warning(
-        "runtime_identity_adopted",
-        "chain เดิมไม่มี runtime identity — ผูกกับ account/environment ปัจจุบัน "
-        "อัตโนมัติ ตรวจว่า WEBULL_ACCOUNT_ID และ WEBULL_ENV ถูกต้อง",
-        {"identity_prefix": runtime_identity[:8]},
-    )
-
-
-def _recover_pending_order_intents(cfg, runtime_identity: str,
-                                   state=UNREAD_STATE) -> int:
-    """Materialize state-transaction markers into the idempotent private outbox."""
-    recovered = 0
-    for run_id, payload in pending_order_intents(
-            cfg, runtime_identity=runtime_identity, state=state).items():
-        try:
-            # The state transaction is the commit proof. Repair its final row
-            # patch before exposing the intent to a worker that correctly
-            # refuses any source row still marked committed=False.
-            repair_pending_intent_row(
-                cfg, run_id, runtime_identity=runtime_identity, state=state)
-            put_intent(chain_key(cfg), run_id, payload)
-            mark_order_intent_materialized(
-                cfg, run_id, runtime_identity=runtime_identity)
-            recovered += 1
-        except RuntimeIdentityError:
-            raise
-        except Exception as exc:
-            _record_warning(
-                "outbox_recovery",
-                "committed row ยัง materialize เข้า outbox ไม่สำเร็จ — "
-                "marker ยังอยู่และจะลองใหม่",
-                {"run_id": run_id, "error_type": type(exc).__name__},
-            )
-    return recovered
-
-
-def _persist_summary(intent: dict, summary: dict) -> None:
-    _persist(intent["chain_key"], intent["run_id"],
-             {**summary, "status": normalize_status(summary.get("status"))})
-
-
-def _persist_error(chain_key_: str, run_id: str, status: str, exc: Exception,
-                   extra: dict | None = None) -> dict:
-    err = _error_text(exc)
-    _persist(chain_key_, run_id,
-             {"status": status, "last_error": err[:500], **(extra or {})})
-    return {"run_id": run_id, "status": status, "error": err}
-
-
-def _reconcile_max_attempts() -> int:
-    return max(1, int(os.environ.get("LEGO_RECONCILE_MAX_ATTEMPTS", "20")))
-
-
-def _min_dna_remaining() -> int:
-    """How much DNA must be left before a new order may be opened.
-
-    Never raises: an unreadable value is a deploy typo, and refusing to answer
-    would abort the row instead of the order, which inverts the priority the
-    whole pipeline is built on.
-    """
-    try:
-        return int(os.environ.get("LEGO_AUTO_SUBMIT_MIN_DNA_REMAINING",
-                                  str(DEFAULT_MIN_DNA_REMAINING)))
-    except (TypeError, ValueError):
-        return DEFAULT_MIN_DNA_REMAINING
-
-
-def _persist_reconcile_failure(intent: dict, exc: Exception) -> dict:
-    """Bound the reconcile loop so one unresolvable order cannot jam the outbox.
-
-    PLACING_UNKNOWN is deliberately non-terminal: an order we failed to confirm
-    may still exist at the broker, so the worker must ask again. But nothing
-    counted the asking. An order the broker never accepted answers 'UNKNOWN'
-    forever, and because list_actionable serves oldest-first up to
-    LEGO_ORDER_WORKER_LIMIT, three such intents starve every later decision —
-    the DNA keeps committing rows while no order is ever sent again.
-
-    Past the bound the outbox stops asking and says so. The open question is not
-    dropped: the order audit keeps run_id, last_error and needs_manual_check,
-    and the dashboard already renders that table.
-    """
-    ck, run_id = intent["chain_key"], intent["run_id"]
-    attempts = int(intent.get("reconcile_attempts", 0) or 0) + 1
-    # last_error is overwritten every tick, and by the time a human reads it the
-    # useful message ("insufficient buying power") has been buried under the
-    # generic one. Keep the first failure, which is the one that explains why.
-    extra = {"reconcile_attempts": attempts}
-    if not intent.get("first_error"):
-        extra["first_error"] = _error_text(exc)[:500]
-    if attempts < _reconcile_max_attempts():
-        return _persist_error(ck, run_id, "PLACING_UNKNOWN", exc, extra)
-    return _persist_error(ck, run_id, "RECONCILE_ABANDONED", exc, {
-        **extra,
-        "needs_manual_check": True,
-        "terminal_reason": (f"broker ไม่ยืนยันสถานะครบ {attempts} ครั้ง — "
-                            "ต้องเช็คที่ broker เองว่า order นี้มีจริงหรือไม่"),
-    })
-
-
-def _persist_realized_math_error(intent: dict, summary: dict, exc: Exception) -> dict:
-    """End an intent whose order filled but whose realized math did not.
-
-    This used to share the reconcile path, which reads 'we do not know whether
-    this order exists'. Here we do know: the broker answered, and the answer says
-    filled. Retrying cannot fix arithmetic, so it ends immediately instead of
-    spending attempts, and the broker's own numbers are kept on the audit so the
-    person reconciling can see the fill was real and only the ledger is behind.
-    """
-    fields = {
-        "status": "REALIZED_MATH_ERROR",
-        "needs_manual_check": True,
-        "realized": False,
-        "broker_status": normalize_status(summary.get("status")),
-        "last_error": _error_text(exc)[:500],
-        "terminal_reason": ("broker ยืนยัน fill แล้ว แต่คำนวณ realized ไม่ได้ — "
-                            "ห้ามส่ง order ซ้ำ ต้องกระทบยอด realized ledger เอง"),
-    }
-    for key in ("filled_quantity", "filled_price", "filled_fee", "reject_reason"):
-        if key in summary:
-            fields[key] = summary[key]
-    _persist(intent["chain_key"], intent["run_id"], fields)
-    _record_warning("realized_math_error",
-                    "order fill ยืนยันแล้วแต่คำนวณ realized ไม่ได้ — ต้องกระทบยอดเอง",
-                    {"run_id": intent["run_id"], "chain_key": intent["chain_key"]})
-    return {"run_id": intent["run_id"], **fields}
-
-
-def _holdings_drift_tolerance() -> float:
-    """Below this a holdings difference is noise, not a position that moved."""
-    try:
-        return abs(float(os.environ.get("LEGO_HOLDINGS_DRIFT_TOLERANCE",
-                                        "0.000001")))
-    except (TypeError, ValueError):
-        return 0.000001
-
-
-def _fill_confirm_max_attempts() -> int:
-    try:
-        return max(1, int(os.environ.get("LEGO_FILL_CONFIRM_MAX_ATTEMPTS",
-                                         str(DEFAULT_FILL_CONFIRM_MAX_ATTEMPTS))))
-    except (TypeError, ValueError):
-        return DEFAULT_FILL_CONFIRM_MAX_ATTEMPTS
-
-
-def _positive_float(value) -> float | None:
-    try:
-        number = float(value)
-    except (TypeError, ValueError):
-        return None
-    return number if number > 0 and number == number and number != float("inf") else None
-
-
-def _nonnegative_float(value) -> float | None:
-    try:
-        number = float(value)
-    except (TypeError, ValueError):
-        return None
-    return number if math.isfinite(number) and number >= 0 else None
-
-
-def _chain_fence_can_clear(intent: dict | None) -> bool:
-    """Whether an outbox terminal is safe for a later order on this chain."""
-    if not isinstance(intent, dict):
-        return False
-    status = normalize_status(intent.get("status"))
-    if status not in OUTBOX_TERMINAL or status in MANUAL_CHAIN_TERMINAL:
-        return False
-    if (intent.get("needs_manual_check") or intent.get("cashflow_abandoned")
-            or intent.get("admin_reconciliation_pending")):
-        return False
-    if status in UNSENT_CHAIN_TERMINAL:
-        return (intent.get("place_attempted") is not True
-                and not intent.get("broker_id")
-                and not intent.get("order_id"))
-
-    # Every broker terminal needs an explicit finite cumulative quantity.  A
-    # missing/NaN/negative value is not evidence of zero fill.  Positive partial
-    # fills (including CANCELLED/EXPIRED) must be durable in *both* ledgers before
-    # a later recurrence may use the chain; FILLED with zero is contradictory.
-    quantity = _nonnegative_float(intent.get("filled_quantity"))
-    if quantity is None:
-        return False
-    if quantity > 0:
-        return (_positive_float(intent.get("filled_price")) is not None
-                and intent.get("cashflow_finalized") is True
-                and intent.get("realized") is True)
-    if status == "FILLED":
-        return False
-    return (intent.get("cashflow_finalized") is not True
-            and intent.get("realized") is not True)
-
-
-def _holdings_moved(side: str, before: float, after: float, tolerance: float) -> bool:
-    """Did the position move the way this side of the trade requires?
-
-    Direction, not just difference: a BUY whose position went *down* between the
-    decision and the fill is somebody else's trade landing in the same account,
-    and booking our ΔAₙ against it would be inventing a cashflow.
-    """
-    if side == "BUY":
-        return after > before + tolerance
-    if side == "SELL":
-        return after < before - tolerance
-    return False
-
-
-def _finalize_model_ledger(trade_client, cfg, intent: dict, summary: dict) -> dict:
-    """Book ΔAₙ/Aₙ/Eₙ for this row, once the broker proves the shares moved.
-
-    Both inputs come from the broker and neither from what we asked for: the
-    cumulative filled quantity and price of this client_order_id, and the
-    position read back after execution. The ordered quantity is never used to
-    guess the resulting holdings, and the decision price is never used in place
-    of the filled price.
-    """
-    quantity = _positive_float(summary.get("filled_quantity"))
-    price = _positive_float(summary.get("filled_price"))
-    if quantity is None or price is None:
-        raise RealizedMathError(
-            "fill confirmed but quantity/price unavailable — needs manual check")
-    try:
-        holdings_after = fetch_holdings(trade_client, cfg)
-    except Exception as exc:
-        # Could not read the position — a network blip, or a positions response
-        # this adapter refuses to interpret. Neither says anything about the
-        # fill, so it defers on the bounded budget instead of ending the intent
-        # the way an arithmetic failure does.
-        raise FillNotConfirmed(
-            f"อ่าน holdings หลัง fill ไม่สำเร็จ: {_error_text(exc)}") from exc
-    before = float(intent.get("decision_holdings", 0.0) or 0.0)
-    # Same rule as the pre-decision guard, applied to the same reading: a
-    # rebalance SELL targets value fix_c and always leaves shares behind, so a
-    # position that reads exactly zero is a positions response that lost the
-    # symbol, not a confirmation. Booking it would move P_acted onto that fill
-    # *and* write prev_holdings = 0, which disarms the guard for every slot
-    # after it — the compounding this system already refuses on the way in.
-    if (os.environ.get("LEGO_ALLOW_ZERO_HOLDINGS", "false").lower() != "true"
-            and position_vanished(before, holdings_after)):
-        raise FillNotConfirmed(
-            f"chain เคยถือ {before} หุ้น แต่ post-execution holdings อ่านได้ 0 — "
-            "อาจเป็น positions response ที่ไม่ครบ จึงยังไม่ finalize cashflow")
-    if not _holdings_moved(str(intent.get("side", "")).upper(), before,
-                           holdings_after, _holdings_drift_tolerance()):
-        raise FillNotConfirmed(
-            f"broker แจ้ง filled {quantity} แต่ holdings หลังส่งยังเป็น {holdings_after} "
-            f"(ตอนตัดสินใจ {before}) — ยังไม่ยืนยันว่าจำนวนถือครองเปลี่ยน")
-    return finalize_execution_fill(
-        cfg, str(intent["run_id"]),
-        ExecutionFill(filled_price=price, filled_quantity=quantity,
-                      holdings_after=holdings_after),
-        runtime_identity=intent.get("runtime_identity_fingerprint"))
-
-
-def _defer_fill_confirmation(intent: dict, summary: dict, exc: Exception) -> dict:
-    """Come back for a fill whose position has not landed yet — but not forever.
-
-    The intent stays actionable under its own non-terminal status so the next
-    tick asks the broker again. Past the bound it stops asking and carries the
-    broker's own status out of the queue with needs_manual_check, for the same
-    reason RECONCILE_ABANDONED exists: an intent that can never resolve must not
-    keep a dispatch slot from every decision behind it.
-    """
-    attempts = int(intent.get("fill_confirm_attempts", 0) or 0) + 1
-    broker_status = normalize_status(summary.get("status"))
-    fields = {
-        **summary,
-        "broker_status": broker_status,
-        "cashflow_finalized": False,
-        "fill_confirm_attempts": attempts,
-        "last_error": _error_text(exc)[:500],
-    }
-    if attempts < _fill_confirm_max_attempts():
-        fields["status"] = AWAITING_FILL_CONFIRMATION
-        _persist(intent["chain_key"], intent["run_id"], fields)
-        return {"run_id": intent["run_id"], **fields}
-    fields.update({
-        "status": broker_status,
-        "cashflow_abandoned": True,
-        "needs_manual_check": True,
-        "terminal_reason": (f"broker แจ้ง fill แต่ holdings ไม่ยืนยันครบ {attempts} ครั้ง "
-                            "— ΔAₙ/Aₙ/Eₙ ของแถวนี้ยังไม่ finalize ต้องกระทบยอดเอง"),
-    })
-    _persist(intent["chain_key"], intent["run_id"], fields)
-    _record_warning(
-        "cashflow_unconfirmed",
-        "fill ยืนยันจาก broker แล้วแต่ holdings ไม่ขยับ — model ledger ยังไม่ finalize",
-        {"run_id": intent["run_id"], "chain_key": intent["chain_key"]})
-    return {"run_id": intent["run_id"], **fields}
-
-
-def _persist_cashflow_error(intent: dict, summary: dict, exc: Exception) -> dict:
-    """End an intent whose fill is real but whose model ledger refused it.
-
-    Same shape as _persist_realized_math_error and for the same reason: the
-    broker has answered, so re-sending would duplicate a filled order. Retrying
-    cannot fix arithmetic or a missing chain state, so it ends here and the
-    ledger gap stays visible instead of being retried forever.
-    """
-    fields = {
-        **summary,
-        "status": "CASHFLOW_FINALIZE_ERROR",
-        "broker_status": normalize_status(summary.get("status")),
-        "cashflow_finalized": False,
-        "cashflow_abandoned": True,
-        "needs_manual_check": True,
-        "last_error": _error_text(exc)[:500],
-        "terminal_reason": ("fill จริงแต่ finalize ΔAₙ/Aₙ/Eₙ ไม่ได้ — "
-                            "ห้ามส่ง order ซ้ำ ต้องกระทบยอด model ledger เอง"),
-    }
-    _persist(intent["chain_key"], intent["run_id"], fields)
-    _record_warning("cashflow_finalize_error",
-                    "fill ยืนยันแล้วแต่ finalize model ledger ไม่ได้ — ต้องกระทบยอดเอง",
-                    {"run_id": intent["run_id"], "chain_key": intent["chain_key"]})
-    return {"run_id": intent["run_id"], **fields}
-
-
-def _finish_with_realized(trade_client, cfg, intent: dict, summary: dict) -> dict:
-    """The broker has answered; the only failure left belongs to us.
-
-    Two ledgers move here and they are independent: the realized ledger from
-    matched broker legs, and the 17-column model ledger this function finalizes
-    from the same confirmed fill. A decision never reaches either one.
-    """
-    try:
-        summary = _apply_realized_if_available(intent, summary)
-    except RealizedMathError as exc:
-        return _persist_realized_math_error(intent, summary, exc)
-    # Acted is a cumulative filled quantity above zero and nothing else — not the
-    # status, which is only a label on top of it. So a DAY order that fills 30 of
-    # 70 and is cancelled at the close still finalizes those 30, while a REJECTED
-    # or CANCELLED order that moved no shares leaves ΔAₙ = 0 and Aₙ exactly where
-    # the last confirmed fill left it. (_apply_realized_if_available has already
-    # refused a claimed fill with no readable quantity or price.)
-    filled = _positive_float(summary.get("filled_quantity"))
-    # Broker fill quantities and average prices are cumulative. A partial
-    # snapshot can still change, while finalize_execution_fill is deliberately
-    # absorbing by run_id. Wait for a terminal status so the one model-ledger
-    # booking uses the final cumulative values. CANCELLED/EXPIRED with a positive
-    # cumulative fill still acted and therefore follows this terminal branch.
-    broker_terminal = normalize_status(summary.get("status")) in TERMINAL_STATUSES
-    if (filled is not None and broker_terminal
-            and not intent.get("cashflow_abandoned")):
-        try:
-            finalized = _finalize_model_ledger(trade_client, cfg, intent, summary)
-        except FillNotConfirmed as exc:
-            return _defer_fill_confirmation(intent, summary, exc)
-        except RealizedMathError as exc:
-            return _persist_realized_math_error(intent, summary, exc)
-        except (ExecutionFinalizeError, ValueError, TypeError) as exc:
-            return _persist_cashflow_error(intent, summary, exc)
-        summary = {
-            **summary,
-            "cashflow_finalized": True,
-            "cashflow_waiting_for_terminal": False,
-            "cashflow_applied_now": finalized["applied"],
-            "delta_actual": finalized["delta_actual"],
-            "actual_cumulative": finalized["actual_cumulative"],
-            "excess": finalized["excess"],
-            "post_execution_holdings": finalized["holdings_after"],
-        }
-    elif filled is not None and not broker_terminal:
-        summary = {
-            **summary,
-            "cashflow_finalized": False,
-            "cashflow_waiting_for_terminal": True,
-        }
-    _persist_summary(intent, summary)
-    return {"run_id": intent["run_id"], **summary}
-
-
-def _pending_row_shape(intent: dict) -> dict:
-    """What the outbox intent says it wants to send."""
-    return {
-        "สถานะ": intent["row_status"],
-        "สินทรัพย์": intent["symbol"],
-        "_meta": {
-            "side": intent["side"],
-            "quantity": float(intent["quantity"]),
-            "step": int(intent["step"]),
-        },
-    }
-
-
-def _committed_row_shape(doc: dict) -> dict:
-    """What the engine actually committed — the gate's source of truth."""
-    return {
-        "สถานะ": doc.get("สถานะ"),
-        "สินทรัพย์": doc.get("สินทรัพย์"),
-        "_meta": {
-            "side": doc.get("ฝั่ง"),
-            "quantity": float(doc.get("จำนวนสั่ง (หุ้น)") or 0.0),
-            "step": int(doc.get("DNA step") or 0),
-        },
-    }
-
-
-def _stop(chain_key_: str, run_id: str, status: str, extra: dict | None = None,
-          **reported) -> dict:
-    """Close an intent in the outbox without touching the audit trail."""
-    update_intent(chain_key_, run_id, {"status": status, **(extra or {})})
-    return {"run_id": run_id, "status": status, **reported}
-
-
-def _nonnegative_finite_env(name: str, default: float) -> float:
-    """Read a safety limit without letting NaN/inf disable its comparison."""
-    raw = os.environ.get(name, str(default))
-    try:
-        value = float(raw)
-    except (TypeError, ValueError) as exc:
-        raise ValueError(f"{name} ต้องเป็นตัวเลข finite และ >= 0") from exc
-    if not (math.isfinite(value) and value >= 0):
-        raise ValueError(f"{name} ต้องเป็นตัวเลข finite และ >= 0")
-    return value
-
-
-def _parse_utc(value, field: str) -> datetime:
-    """Parse an outbox timestamp as an aware UTC datetime, or fail closed."""
-    try:
-        parsed = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
-    except (TypeError, ValueError) as exc:
-        raise ValueError(f"{field} ต้องเป็น ISO-8601 timestamp") from exc
-    if parsed.tzinfo is None:
-        raise ValueError(f"{field} ต้องมี timezone")
-    return parsed.astimezone(UTC)
-
-
-def _dispatch_quote_safety(cfg, intent: dict, fresh: dict, *,
-                           now_utc: datetime | None = None,
-                           max_price_drift_bps: float | None = None,
-                           max_quote_age_seconds: float | None = None) -> dict:
-    """Revalidate a committed intent against the quote immediately before send.
-
-    A MARKET order may fill away from either quote, so tiny moves are expected.
-    The guard nevertheless refuses a direction change, a stale intent that would
-    now rebalance past the target, or a quote beyond the configured drift/age
-    budget.  It never rewrites the committed row or silently changes quantity.
-    """
-    now_utc = now_utc or datetime.now(UTC)
-    if now_utc.tzinfo is None:
-        raise ValueError("now_utc ต้องมี timezone")
-    max_price_drift_bps = (
-        _nonnegative_finite_env(
-            "LEGO_MAX_DISPATCH_PRICE_DRIFT_BPS",
-            DEFAULT_MAX_DISPATCH_PRICE_DRIFT_BPS)
-        if max_price_drift_bps is None else float(max_price_drift_bps)
-    )
-    max_quote_age_seconds = (
-        _nonnegative_finite_env(
-            "LEGO_MAX_DISPATCH_QUOTE_AGE_SECONDS",
-            DEFAULT_MAX_DISPATCH_QUOTE_AGE_SECONDS)
-        if max_quote_age_seconds is None else float(max_quote_age_seconds)
-    )
-    if not (math.isfinite(max_price_drift_bps)
-            and max_price_drift_bps >= 0):
-        raise ValueError("max_price_drift_bps ต้อง finite และ >= 0")
-    if not (math.isfinite(max_quote_age_seconds)
-            and max_quote_age_seconds >= 0):
-        raise ValueError("max_quote_age_seconds ต้อง finite และ >= 0")
-
-    try:
-        decision_price = float(intent["decision_price"])
-        decision_holdings = float(intent["decision_holdings"])
-        requested_quantity = float(intent["quantity"])
-        fresh_price = float(fresh["price"])
-        fresh_holdings = float(fresh["holdings"])
-        signal = int(intent["signal"])
-    except (KeyError, TypeError, ValueError) as exc:
-        raise ValueError("intent/snapshot ขาด dispatch provenance ที่ตรวจสอบได้") from exc
-    finite_values = (decision_price, decision_holdings, requested_quantity,
-                     fresh_price, fresh_holdings)
-    if not all(math.isfinite(value) for value in finite_values):
-        raise ValueError("dispatch provenance ต้องเป็นตัวเลข finite")
-    if (decision_price <= 0 or fresh_price <= 0 or decision_holdings < 0
-            or fresh_holdings < 0 or requested_quantity <= 0
-            or signal not in (0, 1)):
-        raise ValueError("dispatch provenance อยู่นอกช่วงที่อนุญาต")
-
-    decision_time = _parse_utc(
-        intent.get("decision_time") or intent.get("created_at"),
-        "decision_time/created_at")
-    quote_time = _parse_utc(fresh.get("quote_time"), "quote_time")
-    now_utc = now_utc.astimezone(UTC)
-    decision_delta_seconds = (now_utc - decision_time).total_seconds()
-    quote_delta_seconds = (now_utc - quote_time).total_seconds()
-    decision_age_seconds = max(0.0, decision_delta_seconds)
-    quote_age_seconds = max(0.0, quote_delta_seconds)
-    price_drift_bps = abs(fresh_price / decision_price - 1.0) * 10_000.0
-    original = build_decision(cfg, decision_price, decision_holdings, signal)
-    current = build_decision(cfg, fresh_price, fresh_holdings, signal)
-    intent_side = str(intent.get("side") or "").strip().upper()
-    quantum = 10.0 ** (-cfg.decimal_precision)
-    quantity_tolerance = max(1e-12, quantum / 2.0)
-
-    reasons: list[str] = []
-    if (not original.acted or original.side != intent_side
-            or abs(original.quantity - requested_quantity) > quantity_tolerance):
-        reasons.append("intent_decision_mismatch")
-    if not current.acted or current.side != intent_side:
-        reasons.append("side_changed_or_pass")
-    # An older, smaller quantity merely under-rebalances.  A larger one crosses
-    # the current constant-value target, so it is not the committed strategy any
-    # more and must wait for a new slot instead of being resized silently.
-    if current.acted and requested_quantity > current.quantity + quantity_tolerance:
-        reasons.append("quantity_would_overshoot")
-    if price_drift_bps > max_price_drift_bps:
-        reasons.append("price_drift_limit")
-    if decision_delta_seconds < -MAX_DISPATCH_FUTURE_SKEW_SECONDS:
-        reasons.append("decision_time_in_future")
-    if quote_delta_seconds < -MAX_DISPATCH_FUTURE_SKEW_SECONDS:
-        reasons.append("quote_time_in_future")
-    if decision_age_seconds > max_quote_age_seconds:
-        reasons.append("decision_age_limit")
-    if quote_age_seconds > max_quote_age_seconds:
-        reasons.append("quote_age_limit")
-
-    return {
-        "ok": not reasons,
-        "reasons": reasons,
-        "decision_price": decision_price,
-        "dispatch_price": fresh_price,
-        "price_drift_bps": price_drift_bps,
-        "max_price_drift_bps": max_price_drift_bps,
-        "decision_time": decision_time.isoformat().replace("+00:00", "Z"),
-        "quote_time": quote_time.isoformat().replace("+00:00", "Z"),
-        "decision_age_seconds": decision_age_seconds,
-        "quote_age_seconds": quote_age_seconds,
-        "max_quote_age_seconds": max_quote_age_seconds,
-        "intent_side": intent_side,
-        "dispatch_side": current.side if current.acted else "PASS",
-        "intent_quantity": requested_quantity,
-        "dispatch_safe_quantity": current.quantity if current.acted else 0.0,
-    }
-
-
-def _reject_unsafe_dispatch_quote(chain_key_: str, run_id: str,
-                                  quote_safety: dict, *, phase: str,
-                                  extra: dict | None = None) -> dict:
-    """Persist one quote-guard failure with phase-labelled evidence."""
-    evidence = {
-        key: value for key, value in quote_safety.items() if key != "ok"
-    }
-    evidence["dispatch_check_phase"] = phase
-    evidence.update(extra or {})
-    if "intent_decision_mismatch" in evidence["reasons"]:
-        # The durable intent itself no longer agrees with the decision it claims
-        # to represent. This is invalid provenance, not a normal market move.
-        return _persist_error(
-            chain_key_, run_id, "NOT_PLACED",
-            ValueError(
-                "confirmation phrase/outbox intent ไม่ตรงกับ committed decision"),
-            {"terminal_reason": "intent decision provenance mismatch",
-             **evidence})
-    return _stop(
-        chain_key_, run_id, "SUPPRESSED_STATE_CHANGED",
-        {"terminal_reason": "fresh quote invalidated committed intent",
-         **evidence},
-        state_change_reasons=evidence["reasons"],
-        price_drift_bps=evidence["price_drift_bps"])
-
-
-def _dispatch_or_reconcile_one(trade_client, data_client, cfg, intent: dict,
-                               dispatch_claim: dict | None = None) -> dict:
-    run_id = intent["run_id"]
-    ck = intent["chain_key"]
-    status = normalize_status(intent.get("status"))
-
-    committed_row = read_committed_row(run_id)
-    if committed_row is None:
-        return _stop(ck, run_id, "NOT_PLACED",
-                     {"terminal_reason": "source row was not committed"})
-
-    if status in RECONCILE_STATUSES:
-        try:
-            summary = summarize_order_result({}, fetch_order_detail(trade_client, run_id))
-            if normalize_status(summary.get("status")) == "UNKNOWN":
-                raise RuntimeError("broker order detail still UNKNOWN")
-        except Exception as exc:
-            # Everything inside this try is 'can we reach and read the broker?'.
-            # The realized and model ledgers are applied outside it so their
-            # failures are not reported as an unresolved order.
-            return _persist_reconcile_failure(intent, exc)
-        return _finish_with_realized(trade_client, cfg, intent, summary)
-
-    if status != "PENDING_DISPATCH":
-        return {"run_id": run_id, "status": status}
-
-    expiry = datetime.fromisoformat(str(intent["expires_at"]).replace("Z", "+00:00"))
-    if datetime.now(UTC) >= expiry:
-        return _stop(ck, run_id, "EXPIRED_UNSENT")
-
-    try:
-        open_orders = fetch_open_orders(trade_client, cfg.symbol)
-    except IncompleteOpenOrdersError as exc:
-        return _persist_error(
-            ck, run_id, "PENDING_DISPATCH", exc,
-            {"pagination_complete": False},
-        )
-    if open_orders:
-        return _stop(ck, run_id, "SUPPRESSED_ACTIVE_ORDER",
-                     {"terminal_reason": f"{len(open_orders)} active broker order(s)"})
-
-    fresh = fetch_snapshot(trade_client, data_client, cfg)
-    try:
-        tolerance = _nonnegative_finite_env(
-            "LEGO_HOLDINGS_DRIFT_TOLERANCE", 0.000001)
-        max_price_drift_bps = _nonnegative_finite_env(
-            "LEGO_MAX_DISPATCH_PRICE_DRIFT_BPS",
-            DEFAULT_MAX_DISPATCH_PRICE_DRIFT_BPS)
-        max_quote_age_seconds = _nonnegative_finite_env(
-            "LEGO_MAX_DISPATCH_QUOTE_AGE_SECONDS",
-            DEFAULT_MAX_DISPATCH_QUOTE_AGE_SECONDS)
-    except ValueError as exc:
-        # A deploy setting can be corrected, so keep the intent retryable.  In
-        # particular, NaN must not turn ``drift > tolerance`` into False.
-        return _persist_error(
-            ck, run_id, "PENDING_DISPATCH", exc,
-            {"configuration_error": True})
-    try:
-        decision_holdings = float(intent["decision_holdings"])
-        fresh_holdings = float(fresh["holdings"])
-        if not (math.isfinite(decision_holdings)
-                and math.isfinite(fresh_holdings)
-                and decision_holdings >= 0 and fresh_holdings >= 0):
-            raise ValueError("holdings ต้อง finite และ >= 0")
-    except (KeyError, TypeError, ValueError) as exc:
-        return _persist_error(
-            ck, run_id, "NOT_PLACED",
-            ValueError("holdings provenance ตรวจสอบไม่ได้"),
-            {"terminal_reason": "invalid holdings provenance"})
-    drift = abs(fresh_holdings - decision_holdings)
-    if drift > tolerance:
-        return _stop(ck, run_id, "SUPPRESSED_STATE_CHANGED",
-                     {"holdings_drift": drift, "dispatch_holdings": fresh["holdings"]},
-                     holdings_drift=drift)
-
-    try:
-        quote_safety = _dispatch_quote_safety(
-            cfg, intent, fresh,
-            max_price_drift_bps=max_price_drift_bps,
-            max_quote_age_seconds=max_quote_age_seconds)
-    except ValueError as exc:
-        # Unlike a deploy setting, incomplete/tampered intent provenance cannot
-        # heal on retry and must not occupy the queue forever.
-        return _persist_error(
-            ck, run_id, "NOT_PLACED", exc,
-            {"terminal_reason": "invalid dispatch provenance"})
-    if not quote_safety["ok"]:
-        return _reject_unsafe_dispatch_quote(
-            ck, run_id, quote_safety, phase="pre_preview")
-
-    env = environment_label()
-    if env != UAT:
-        return _stop(ck, run_id, "NOT_PLACED", {"terminal_reason": f"environment={env}"})
-
-    # Audit-only on purpose: the outbox already holds every one of these fields
-    # from put_intent, and begin_place_attempt below is the authoritative outbox
-    # write for this step. Mirroring them here too would spend three extra RTDB
-    # transactions on the hot money path to restate what is already there.
-    write_order_audit(run_id, {
-        "run_id": run_id, "chain_key": ck, "side": intent["side"],
-        "quantity": float(intent["quantity"]), "symbol": cfg.symbol,
-        "environment": env, "status": "PENDING_DISPATCH", "realized": False,
-        "placed_at": intent["created_at"],
-    })
-    try:
-        # Building the payload is part of the gate: a quantity that cannot be
-        # expressed at this precision must end the intent, not abort the whole
-        # worker run and leave the other intents of this tick unprocessed.
-        order = build_order_payload(cfg, intent["side"], float(intent["quantity"]), run_id)
-        preview_ok = preview_market_order(trade_client, order)
-        # Two independent witnesses: the gate judges the committed row, the
-        # phrase comes from the intent about to be sent. They are only equal
-        # while the outbox still agrees with what the engine decided.
-        evaluate_submit_gate(env, _committed_row_shape(committed_row), preview_ok,
-                             order_confirmation_phrase(_pending_row_shape(intent)),
-                             committed=True)
-    except Exception as exc:
-        return _persist_error(ck, run_id, "NOT_PLACED", exc)
-
-    # Preview is a network call and can take long enough for both price and
-    # position to change. Fetch independent evidence again after it returns;
-    # this is the snapshot that guards the durable chain fence and broker call.
-    try:
-        final_fresh = fetch_snapshot(trade_client, data_client, cfg)
-    except Exception as exc:
-        return _persist_error(
-            ck, run_id, "PENDING_DISPATCH", exc,
-            {"dispatch_check_phase": "post_preview_refetch"})
-    try:
-        final_holdings = float(final_fresh["holdings"])
-        if not (math.isfinite(final_holdings) and final_holdings >= 0):
-            raise ValueError("holdings ต้อง finite และ >= 0")
-    except (KeyError, TypeError, ValueError) as exc:
-        return _persist_error(
-            ck, run_id, "NOT_PLACED",
-            ValueError("holdings provenance ตรวจสอบไม่ได้"),
-            {"terminal_reason": "invalid holdings provenance",
-             "dispatch_check_phase": "post_preview"})
-    final_holdings_drift = abs(final_holdings - decision_holdings)
-    if final_holdings_drift > tolerance:
-        return _stop(
-            ck, run_id, "SUPPRESSED_STATE_CHANGED",
-            {"holdings_drift": final_holdings_drift,
-             "dispatch_holdings": final_fresh["holdings"],
-             "dispatch_check_phase": "post_preview",
-             "terminal_reason": "fresh holdings invalidated committed intent"},
-            holdings_drift=final_holdings_drift)
-    try:
-        final_quote_safety = _dispatch_quote_safety(
-            cfg, intent, final_fresh,
-            max_price_drift_bps=max_price_drift_bps,
-            max_quote_age_seconds=max_quote_age_seconds)
-    except ValueError as exc:
-        return _persist_error(
-            ck, run_id, "NOT_PLACED", exc,
-            {"terminal_reason": "invalid dispatch provenance",
-             "dispatch_check_phase": "post_preview"})
-    if not final_quote_safety["ok"]:
-        return _reject_unsafe_dispatch_quote(
-            ck, run_id, final_quote_safety, phase="post_preview")
-
-    # The per-intent claim below prevents a duplicate client_order_id.  This
-    # second, chain-wide fence prevents two workers that claimed different
-    # run_ids from both crossing the money boundary after observing the same
-    # empty open-order snapshot.
-    if not dispatch_claim:
-        return _persist_error(
-            ck, run_id, "PENDING_DISPATCH",
-            RuntimeError("ไม่มี chain dispatch lease — ห้าม place order"))
-    fenced = fence_chain_dispatch(
-        ck, run_id, str(dispatch_claim.get("owner") or ""),
-        str(dispatch_claim.get("claim_token") or ""))
-    if fenced is None:
-        # Another generation owns the chain now.  Leave the intent actionable;
-        # that owner will process it, and a stale worker must not make this
-        # recoverable hand-off terminal.
-        return {"run_id": run_id, "status": "PENDING_DISPATCH",
-                "dispatch_fence_lost": True}
-    # The outer worker may clear this durable run fence only after it reads a
-    # safe terminal status back from the authoritative outbox document.
-    dispatch_claim.update(fenced)
-
-    # fence_chain_dispatch is another remote transaction. Recompute age from
-    # the broker's source timestamp after it returns so a delayed fence cannot
-    # carry an expired quote across the irreversible boundary.
-    try:
-        deadline_safety = _dispatch_quote_safety(
-            cfg, intent, final_fresh,
-            max_price_drift_bps=max_price_drift_bps,
-            max_quote_age_seconds=max_quote_age_seconds)
-    except ValueError as exc:
-        return _persist_error(
-            ck, run_id, "NOT_PLACED", exc,
-            {"terminal_reason": "dispatch evidence expired before place",
-             "dispatch_check_phase": "pre_place_deadline"})
-    if not deadline_safety["ok"]:
-        return _reject_unsafe_dispatch_quote(
-            ck, run_id, deadline_safety, phase="pre_place_deadline")
-
-    place_fields = {"status": "PLACING_UNKNOWN", "place_attempted": True}
-    started = begin_place_attempt(
-        ck, run_id, str(intent.get("claim_owner") or ""),
-        int(intent.get("claim_generation", 0) or 0))
-    if started is None:
-        # The lease expired and another generation won before this worker reached
-        # the irreversible call.  Do not place; that winner owns reconciliation.
-        return {"run_id": run_id, "status": normalize_status(intent.get("status"))}
-    _mirror_order_audit(ck, run_id, place_fields)
-    try:
-        place_res = place_market_order(trade_client, order)
-        summary = _poll_order_status(trade_client, run_id, place_res)
-    except Exception as exc:
-        # Same open question as a failed reconcile — "does this order exist?" —
-        # so it draws on the same bounded budget.
-        return _persist_reconcile_failure(intent, exc)
-    return _finish_with_realized(trade_client, cfg, intent, summary)
-
-
-def _outbox_intent(cfg, row: dict, snapshot: dict, slot, decision_time: datetime) -> dict:
-    margin = int(os.environ.get("LEGO_ORDER_EXPIRY_MARGIN_SECONDS", "15"))
-    expires_at = max(slot.slot_start_utc, slot.slot_end_utc - timedelta(seconds=margin))
-    return {
-        "status": "PENDING_DISPATCH",
-        "row_status": row["สถานะ"], "side": row["_meta"]["side"],
-        "quantity": row["_meta"]["quantity"], "symbol": cfg.symbol,
-        "step": row["DNA step"], "signal": row["DNA signal"],
-        "decision_price": snapshot["price"],
-        "decision_holdings": snapshot["holdings"],
-        "decision_time": _iso(decision_time),
-        "created_at": snapshot["captured_at"],
-        "slot_id": slot.slot_id,
-        "slot_start_utc": _iso(slot.slot_start_utc),
-        "slot_end_utc": _iso(slot.slot_end_utc),
-        "expires_at": _iso(expires_at),
-    }
-
-
-def _run_order_worker(cfg, limit: int = 3,
-                      runtime_identity: str | None = None) -> dict:
-    runtime_identity = runtime_identity or runtime_identity_fingerprint()
-    ck = chain_key(cfg)
-    # Both guards below read the same document, so read it once and hand it down.
-    state = read_chain_state(cfg)
-    state_verified = chain_runtime_identity_is_verified(
-        cfg, runtime_identity, state=state)
-    _announce_identity_adoption(
-        verify_runtime_identity(state, runtime_identity), runtime_identity)
-    _recover_pending_order_intents(cfg, runtime_identity, state=state)
-    _repair_pending_audits(ck)
-    expired = expire_unsent_before(ck, datetime.now(UTC))
-    results = []
-    worker_id = uuid.uuid4().hex
-    candidates = list_actionable(ck, limit=limit)
-    if candidates and not state_verified:
-        raise RuntimeIdentityError(
-            "พบ outbox แต่ไม่พบ chain state สำหรับยืนยัน account/environment")
-    if not candidates:
-        # Nothing to dispatch, and saying so is the point: an idle tick and a
-        # broken tick both answered HTTP 200 in 0.3s with an empty body, which is
-        # what hid an outbox that never received a single intent. Building the
-        # clients here would also have cost four auth calls — two config plus two
-        # create_token, against a 10-per-30s cap shared with lego_one_row — to
-        # authenticate for work that does not exist.
-        logger.info("lego_order_worker actionable=0 expired_unsent=%d "
-                    "chain_key=%s — no order intent to dispatch", expired, ck)
-        return {"processed": 0, "actionable": 0, "expired_unsent": expired,
-                "results": []}
-    dispatch_claim = claim_chain_dispatch(ck, worker_id)
-    if dispatch_claim is None:
-        logger.info("lego_order_worker chain dispatch lease busy chain_key=%s", ck)
-        return {"processed": 0, "actionable": len(candidates),
-                "expired_unsent": expired, "dispatch_locked": True,
-                "results": []}
-    try:
-        # The owner lease may expire, but the run that may already have crossed
-        # place_order does not. A successor is allowed to reconcile only that
-        # run until the outbox proves a safe terminal result.
-        inflight_run_id = str(dispatch_claim.get("inflight_run_id") or "")
-        if inflight_run_id:
-            inflight = read_intent(ck, inflight_run_id)
-            if inflight is None:
-                return {
-                    "processed": 0,
-                    "actionable": len(candidates),
-                    "expired_unsent": expired,
-                    "dispatch_blocked": True,
-                    "dispatch_inflight_run_id": inflight_run_id,
-                    "dispatch_block_reason": "inflight outbox intent is missing",
-                    "results": [],
-                }
-            inflight_status = normalize_status(inflight.get("status"))
-            if _chain_fence_can_clear(inflight):
-                if not clear_chain_dispatch_inflight(
-                        ck, inflight_run_id, worker_id,
-                        str(dispatch_claim.get("claim_token") or "")):
-                    return {
-                        "processed": 0,
-                        "actionable": len(candidates),
-                        "expired_unsent": expired,
-                        "dispatch_locked": True,
-                        "results": [],
-                    }
-                for key in ("inflight_run_id", "place_fence",
-                            "fenced_run_id", "fenced_at"):
-                    dispatch_claim.pop(key, None)
-            elif inflight_status in OUTBOX_TERMINAL:
-                # Queue-terminal can still mean broker ambiguity or a broken
-                # strategy ledger. Keep the fence until a human reconciles it.
-                return {
-                    "processed": 0,
-                    "actionable": len(candidates),
-                    "expired_unsent": expired,
-                    "dispatch_blocked": True,
-                    "dispatch_inflight_run_id": inflight_run_id,
-                    "dispatch_block_reason": "execution or ledger needs manual reconciliation",
-                    "results": [],
-                }
-            else:
-                if inflight_status == "PENDING_DISPATCH":
-                    # Crash between the durable chain fence and the per-intent
-                    # PLACING_UNKNOWN write: make the ambiguity explicit before
-                    # an expired prior worker can resume its place path.
-                    inflight = update_intent(ck, inflight_run_id, {
-                        "status": "PLACING_UNKNOWN",
-                        "place_attempted": True,
-                        "recovered_chain_fence": True,
-                    })
-                candidates = [inflight]
-
-        trade_client, data_client = build_clients()
-        for intent in candidates:
-            claimed = claim_intent(ck, intent["run_id"], worker_id)
-            if claimed is None:
-                continue
-            try:
-                intent_identity = claimed.get("runtime_identity_fingerprint")
-                if (intent_identity is not None
-                        and str(intent_identity) != runtime_identity):
-                    raise RuntimeIdentityError(
-                        "outbox runtime identity ไม่ตรงกับ worker "
-                        "(account/environment คนละชุด)")
-                result = _dispatch_or_reconcile_one(
-                    trade_client, data_client, cfg, claimed, dispatch_claim)
-                results.append(result)
-            finally:
-                release_intent_claim(ck, intent["run_id"], worker_id)
-
-            current_inflight = str(dispatch_claim.get("inflight_run_id") or "")
-            if not current_inflight:
-                continue
-            authoritative = read_intent(ck, current_inflight)
-            if (authoritative is not None
-                    and _chain_fence_can_clear(authoritative)
-                    and clear_chain_dispatch_inflight(
-                        ck, current_inflight, worker_id,
-                        str(dispatch_claim.get("claim_token") or ""))):
-                for key in ("inflight_run_id", "place_fence",
-                            "fenced_run_id", "fenced_at"):
-                    dispatch_claim.pop(key, None)
-                continue
-            # Broker-unknown and manual ledger terminals preserve the run fence.
-            # Later intents wait until both execution and accounting are safe.
-            break
-    finally:
-        release_chain_dispatch(
-            ck, worker_id, str(dispatch_claim.get("claim_token") or ""))
-    logger.info("lego_order_worker actionable=%d processed=%d expired_unsent=%d "
-                "statuses=%s", len(candidates), len(results), expired,
-                [r.get("status") for r in results])
-    return {"processed": len(results), "actionable": len(candidates),
-            "expired_unsent": expired, "results": results}
+
+import sys
+
+import decision_service
+import execution_service
+import archive_service
+
+FillNotConfirmed = execution_service.FillNotConfirmed
+RealizedMathError = execution_service.RealizedMathError
+
+def _facade():
+    return sys.modules[__name__]
+
+
+def _execution_call(name, *args, **kwargs):
+    execution_service.configure(_facade())
+    return getattr(execution_service, name)(*args, **kwargs)
+
+
+def _init_firebase(*args, **kwargs):
+    return _execution_call('_init_firebase', *args, **kwargs)
+
+
+def _iso(*args, **kwargs):
+    return _execution_call('_iso', *args, **kwargs)
+
+
+def _error_text(*args, **kwargs):
+    return _execution_call('_error_text', *args, **kwargs)
+
+
+def _poll_order_status(*args, **kwargs):
+    return _execution_call('_poll_order_status', *args, **kwargs)
+
+
+def _record_warning(*args, **kwargs):
+    return _execution_call('_record_warning', *args, **kwargs)
+
+
+def _apply_realized_if_available(*args, **kwargs):
+    return _execution_call('_apply_realized_if_available', *args, **kwargs)
+
+
+def _persist(*args, **kwargs):
+    return _execution_call('_persist', *args, **kwargs)
+
+
+def _mirror_order_audit(*args, **kwargs):
+    return _execution_call('_mirror_order_audit', *args, **kwargs)
+
+
+def _repair_pending_audits(*args, **kwargs):
+    return _execution_call('_repair_pending_audits', *args, **kwargs)
+
+
+def _announce_identity_adoption(*args, **kwargs):
+    return _execution_call('_announce_identity_adoption', *args, **kwargs)
+
+
+def _recover_pending_order_intents(*args, **kwargs):
+    return _execution_call('_recover_pending_order_intents', *args, **kwargs)
+
+
+def _persist_summary(*args, **kwargs):
+    return _execution_call('_persist_summary', *args, **kwargs)
+
+
+def _persist_error(*args, **kwargs):
+    return _execution_call('_persist_error', *args, **kwargs)
+
+
+def _reconcile_max_attempts(*args, **kwargs):
+    return _execution_call('_reconcile_max_attempts', *args, **kwargs)
+
+
+def _min_dna_remaining(*args, **kwargs):
+    return _execution_call('_min_dna_remaining', *args, **kwargs)
+
+
+def _persist_reconcile_failure(*args, **kwargs):
+    return _execution_call('_persist_reconcile_failure', *args, **kwargs)
+
+
+def _persist_realized_math_error(*args, **kwargs):
+    return _execution_call('_persist_realized_math_error', *args, **kwargs)
+
+
+def _holdings_drift_tolerance(*args, **kwargs):
+    return _execution_call('_holdings_drift_tolerance', *args, **kwargs)
+
+
+def _fill_confirm_max_attempts(*args, **kwargs):
+    return _execution_call('_fill_confirm_max_attempts', *args, **kwargs)
+
+
+def _positive_float(*args, **kwargs):
+    return _execution_call('_positive_float', *args, **kwargs)
+
+
+def _nonnegative_float(*args, **kwargs):
+    return _execution_call('_nonnegative_float', *args, **kwargs)
+
+
+def _chain_fence_can_clear(*args, **kwargs):
+    return _execution_call('_chain_fence_can_clear', *args, **kwargs)
+
+
+def _holdings_moved(*args, **kwargs):
+    return _execution_call('_holdings_moved', *args, **kwargs)
+
+
+def _finalize_model_ledger(*args, **kwargs):
+    return _execution_call('_finalize_model_ledger', *args, **kwargs)
+
+
+def _defer_fill_confirmation(*args, **kwargs):
+    return _execution_call('_defer_fill_confirmation', *args, **kwargs)
+
+
+def _persist_cashflow_error(*args, **kwargs):
+    return _execution_call('_persist_cashflow_error', *args, **kwargs)
+
+
+def _finish_with_realized(*args, **kwargs):
+    return _execution_call('_finish_with_realized', *args, **kwargs)
+
+
+def _pending_row_shape(*args, **kwargs):
+    return _execution_call('_pending_row_shape', *args, **kwargs)
+
+
+def _committed_row_shape(*args, **kwargs):
+    return _execution_call('_committed_row_shape', *args, **kwargs)
+
+
+def _stop(*args, **kwargs):
+    return _execution_call('_stop', *args, **kwargs)
+
+
+def _nonnegative_finite_env(*args, **kwargs):
+    return _execution_call('_nonnegative_finite_env', *args, **kwargs)
+
+
+def _parse_utc(*args, **kwargs):
+    return _execution_call('_parse_utc', *args, **kwargs)
+
+
+def _dispatch_quote_safety(*args, **kwargs):
+    return _execution_call('_dispatch_quote_safety', *args, **kwargs)
+
+
+def _reject_unsafe_dispatch_quote(*args, **kwargs):
+    return _execution_call('_reject_unsafe_dispatch_quote', *args, **kwargs)
+
+
+def _dispatch_or_reconcile_one(*args, **kwargs):
+    return _execution_call('_dispatch_or_reconcile_one', *args, **kwargs)
+
+
+def _run_order_worker(*args, **kwargs):
+    return _execution_call('_run_order_worker', *args, **kwargs)
+
+
+def _outbox_intent(*args, **kwargs):
+    decision_service.configure(_facade())
+    return decision_service._outbox_intent(*args, **kwargs)
 
 
 @functions_framework.http
 def lego_one_row(request):
-    """Commit the current model slot first. Order failures never block DNA time."""
-    _init_firebase()
-    decision_time = datetime.now(UTC)
-
-    try:
-        # Mandatory: the slot grid must match the timeframe the DNA was trained
-        # on, and the clock mode decides which step the row gets. A missing or
-        # unsupported value is a deploy error, not a runtime one, so all three are
-        # resolved up front instead of surfacing later as an engine failure —
-        # the market category included, since a typo there reaches the broker as
-        # a query parameter and comes back as an unhelpful snapshot error.
-        cfg = load_config()
-        slot_seconds()
-        mode = clock_mode()
-        market_category()
-        env = environment_label()
-        runtime_identity = runtime_identity_fingerprint()
-    except (KeyError, MarketClockError, ValueError) as exc:
-        return {"status": "CONFIG_ERROR", "committed": False,
-                "pipeline_status": "CONFIG_ERROR",
-                "error": _error_text(exc, with_type=False)}, 500
-
-    try:
-        # Recovery and the anchor read both need this chain's state, so it is
-        # fetched once here and passed to both instead of once each.
-        state = read_chain_state(cfg)
-        _announce_identity_adoption(
-            verify_runtime_identity(state, runtime_identity), runtime_identity)
-        _recover_pending_order_intents(cfg, runtime_identity, state=state)
-    except RuntimeIdentityError as exc:
-        return {"status": "CONFIG_ERROR", "committed": False,
-                "pipeline_status": "CONFIG_ERROR",
-                "error": _error_text(exc, with_type=False)}, 500
-
-    # One calendar for every path: the same session rules the ordinal uses, so a
-    # holiday or early close also blocks a degraded (clock-less) commit.
-    if not is_regular_session(decision_time):
-        return {"status": "PASS_MARKET_CLOSED", "committed": False,
-                "pipeline_status": "MARKET_CLOSED"}, 200
-
-    try:
-        # Before the broker is touched: if this revision's accounting is behind
-        # the chain's, nothing it computes afterwards is worth writing. read_anchor
-        # is the other half — it restarts Aₙ at zero across a semantics boundary,
-        # and this is what stops that reset from happening silently.
-        semantics_migrated_from = verify_cashflow_semantics(state)
-        if semantics_migrated_from:
-            _record_warning(
-                "cashflow_semantics_migration",
-                f"chain เคยใช้ cashflow semantics '{semantics_migrated_from}' "
-                f"แต่ runtime นี้เป็น '{CASHFLOW_SEMANTICS}' — baseline Aₙ ถูกรีเซ็ต "
-                "เป็น 0 และเดินต่อ (แถวเก่าเทียบกับแถวใหม่ตรง ๆ ไม่ได้)",
-                {"from": semantics_migrated_from, "to": CASHFLOW_SEMANTICS,
-                 "chain_key": chain_key(cfg)})
-        anchor = read_anchor(cfg, runtime_identity=runtime_identity, state=state)
-        legacy_step = dna_step_for(anchor)
-        slot = None
-        clock_error = None
-        try:
-            slot = resolve_market_slot(decision_time)
-            if slot is None:
-                return {"status": "PASS_MARKET_CLOSED", "committed": False,
-                        "pipeline_status": "MARKET_CLOSED"}, 200
-            effective_step, alignment_error = resolve_dna_step(legacy_step, slot)
-        except MarketClockError as exc:
-            if mode == "market":
-                raise
-            effective_step, alignment_error = legacy_step, None
-            clock_error = str(exc)
-
-        trade_client, data_client = build_clients()
-        # The token dies of old age silently: nothing in the SDK renews it, and
-        # recovery needs a human to approve 2FA within 300 seconds. build_clients
-        # refreshes it while it is still valid; this reports what is left so the
-        # cases it cannot fix by itself — an ephemeral token dir, a token already
-        # gone — are visible days before they stop the chain.
-        health = token_health()
-        token_warning = None if health["ok"] else "; ".join(health["reasons"])
-        if token_warning:
-            _record_warning("webull_token", token_warning, {
-                k: v for k, v in health.items()
-                if k in ("token_dir", "ephemeral_token_dir", "status",
-                         "expires_at", "days_left") and v is not None})
-        snapshot = fetch_snapshot(trade_client, data_client, cfg)
-        # Reaching this line is live proof that the token can sign a trade
-        # request: fetch_snapshot goes through account_v2.get_account_position on
-        # the very same authenticated ApiClient that place_order will use, and any
-        # auth failure would have left this block by exception instead. Recorded
-        # here, next to the call that earns it, so a later reordering cannot leave
-        # the claim standing without the evidence behind it.
-        token_proved_live = True
-        # Before the row exists: a snapshot that lost the position would make
-        # gap = fix_c, the largest order possible, and committing it would also
-        # write prev_holdings = 0 and disarm this check for every commit after.
-        if os.environ.get("LEGO_ALLOW_ZERO_HOLDINGS", "false").lower() != "true":
-            check_holdings_continuity(anchor, float(snapshot["holdings"]))
-        if slot:
-            slot_id = slot.slot_id
-        else:
-            # Degraded clock still gets a one-commit-per-slot key so a scheduler
-            # retry cannot consume the same slot twice.
-            slot_id = fallback_slot_id(snapshot["captured_at"])
-            mode = f"{mode}:degraded"
-        row = compute_row(cfg, snapshot, anchor, dna_step=effective_step)
-
-        auto = os.environ.get("AUTO_SUBMIT", "false").lower() == "true"
-        # Warn while extending the DNA is still possible; also one of the
-        # preflight inputs, so it is resolved once and read twice.
-        remaining = dna_steps_remaining(cfg.dna_code, row["DNA step"])
-        outbox_error = None
-        outbox_skipped = None
-        outbox_blocked = None
-        preflight = None
-        pending_intent = None
-
-        # Evaluate a candidate before the state transaction so the exact payload
-        # can be stored in that same transaction.  row_durable=True here means
-        # "activate only if commit succeeds"; no broker/outbox write happens yet.
-        if auto and row["สถานะ"] in (READY_BUY, READY_SELL):
-            preflight = auto_submit_preflight(
-                auto_submit=auto, environment=env, row=row, row_durable=True,
-                slot=slot, token=health, dna_remaining=remaining,
-                min_dna_remaining=_min_dna_remaining(),
-                token_proved_live=token_proved_live)
-            if preflight["ok"]:
-                pending_intent = _outbox_intent(
-                    cfg, row, snapshot, slot, decision_time)
-                pending_intent["runtime_identity_fingerprint"] = runtime_identity
-
-        # A rejected commit leaves no outbox candidate.  A successful state
-        # transaction carries a deterministic recovery marker, closing the crash
-        # window between advancing DNA and materializing the private outbox.
-        result = commit_final_row(
-            cfg, snapshot, anchor, row, slot_id=slot_id, clock_mode=mode,
-            market_ordinal=None if slot is None else slot.market_ordinal,
-            runtime_identity=runtime_identity,
-            pending_intent=pending_intent)
-
-        if preflight is None:
-            pass                                    # nothing to submit this slot
-        elif preflight["ok"]:
-            try:
-                put_intent(chain_key(cfg), result["run_id"], pending_intent)
-                mark_order_intent_materialized(
-                    cfg, result["run_id"], runtime_identity=runtime_identity)
-            except Exception as exc:
-                outbox_error = _error_text(exc)
-                _record_warning(
-                    "outbox_recovery",
-                    "committed row ยัง materialize เข้า outbox ไม่สำเร็จ — "
-                    "marker ยังอยู่และจะลองใหม่",
-                    {"run_id": result["run_id"],
-                     "error_type": type(exc).__name__},
-                )
-        else:
-            # Blocked, and said out loud on both channels. Deciding this silently
-            # was the worst of both worlds: the row still read READY_BUY with
-            # committed=true and no error field, so a dashboard showed a working
-            # bot that had never sent a single order.
-            message = preflight["message"]
-            if preflight["field"] == "outbox_skipped":
-                outbox_skipped = message
-            else:
-                outbox_blocked = message
-            extra = {"run_id": result["run_id"], "row_status": row["สถานะ"],
-                     "clock_mode": mode, "blocked_by": preflight["blocked_by"]}
-            if preflight["hint"]:
-                extra["hint"] = preflight["hint"]
-            _record_warning(preflight["warning_kind"], message, extra)
-
-        out = {
-            "status": row["สถานะ"], "committed": result["committed"],
-            "idempotent": result.get("idempotent", False),
-            "run_id": result["run_id"], "version": result.get("version"),
-            "step": row["DNA step"], "signal": row["DNA signal"],
-            "model_acted": row["_meta"]["acted"],
-            "pipeline_status": "ROW_COMMITTED",
-            # The running accounting, on every successful row. Comparing the
-            # deployed revision against main used to need Cloud Run access; this
-            # is the same answer from the response Cloud Scheduler already calls.
-            "cashflow_semantics": CASHFLOW_SEMANTICS,
-            "clock_mode": mode,
-            "legacy_step": legacy_step,
-            "market_step": None if slot is None else slot.market_ordinal,
-            "alignment_error": alignment_error,
-            "market_slot_id": None if slot is None else slot.slot_id,
-        }
-        if semantics_migrated_from:
-            out["cashflow_semantics_migrated_from"] = semantics_migrated_from
-        if clock_error:
-            out["clock_warning"] = clock_error
-        if token_warning:
-            out["token_warning"] = token_warning
-        if outbox_error:
-            out["outbox_error"] = outbox_error
-        if outbox_skipped:
-            out["outbox_skipped"] = outbox_skipped
-        if outbox_blocked:
-            out["outbox_blocked"] = outbox_blocked
-            out["outbox_blocked_checks"] = preflight["blocked_by"]
-        # Silent until the last few slots so a healthy chain keeps the response
-        # it has always had.
-        if remaining <= int(os.environ.get("LEGO_DNA_LOW_WATERMARK", "10")):
-            out["dna_steps_remaining"] = remaining
-
-        # One line per slot in Cloud Logging. The response body says all of this
-        # already, but nothing reads it: the caller is Cloud Scheduler, which
-        # keeps the status code and throws the body away. Without this a chain
-        # deciding READY_SELL every slot and sending nothing looks exactly like a
-        # chain trading normally — 200, no error, no output.
-        logger.info(
-            "lego_one_row slot=%s step=%s status=%s committed=%s "
-            "order_intent=%s blocked_by=%s",
-            out.get("market_slot_id"), row["DNA step"], row["สถานะ"],
-            result["committed"],
-            "created" if (preflight and preflight["ok"] and not outbox_error)
-            else "none",
-            (preflight or {}).get("blocked_by") or [])
-
-        # Off by default: dispatching inline adds broker latency to the DNA
-        # invocation, which raises the odds of a scheduler timeout+retry.
-        if os.environ.get("LEGO_INLINE_ORDER_WORKER", "false").lower() == "true":
-            try:
-                out["order_worker"] = _run_order_worker(cfg, limit=1)
-            except Exception as exc:
-                out["order_worker"] = {
-                    "processed": 0, "error": _error_text(exc)}
-        return out, 200
-
-    except RuntimeIdentityError as exc:
-        return {"status": "CONFIG_ERROR", "committed": False,
-                "pipeline_status": "CONFIG_ERROR",
-                "error": _error_text(exc, with_type=False)}, 500
-    except SlotAlreadyConsumed as exc:
-        return {"status": "PASS_SLOT_CONSUMED", "committed": False,
-                "pipeline_status": "SLOT_CONSUMED", "note": str(exc)}, 200
-    except StaleAnchorError as exc:
-        return {"status": "STALE_ANCHOR", "committed": False,
-                "pipeline_status": "STALE_ANCHOR", "note": str(exc)}, 409
-    except CalendarDriftError as exc:
-        return {"status": "CALENDAR_DRIFT", "committed": False,
-                "pipeline_status": "CALENDAR_DRIFT", "note": str(exc)}, 409
-    except OrdinalRegression as exc:
-        return {"status": "ORDINAL_REGRESSION", "committed": False,
-                "pipeline_status": "ORDINAL_REGRESSION", "note": str(exc)}, 409
-    except DNADriftError as exc:
-        return {"status": "DNA_DRIFT", "committed": False,
-                "pipeline_status": "DNA_DRIFT", "note": str(exc)}, 409
-    except CashflowSemanticsDowngrade as exc:
-        # 409 for the same reason as the drift guards: the request is fine, the
-        # chain is fine, and this deployment is the thing that must not proceed.
-        return {"status": "CASHFLOW_SEMANTICS_DOWNGRADE", "committed": False,
-                "pipeline_status": "CASHFLOW_SEMANTICS_DOWNGRADE",
-                "note": str(exc), "runtime_cashflow_semantics": CASHFLOW_SEMANTICS,
-                "hint": "ตรวจว่า Cloud Run revision ไหนยังรับ traffic อยู่ "
-                        "และ scheduler ยิงไปที่ URL ของ revision ใด"}, 409
-    except HoldingsAnomaly as exc:
-        return {"status": "HOLDINGS_ANOMALY", "committed": False,
-                "pipeline_status": "HOLDINGS_ANOMALY", "note": str(exc)}, 409
-    except DNAExhausted as exc:
-        # The DNA finishing is an expected end state, not a fault: bypass:100 on
-        # a 30m grid lasts about eight trading days. Without this clause it fell
-        # through to the generic handler and answered 500 on every slot forever,
-        # pushing an error record each time and firing any 5xx alert with nothing
-        # actionable in it. 200 with its own status says what happened and what
-        # to do, and the scheduler stops treating it as an outage.
-        return {"status": "PASS_DNA_EXHAUSTED", "committed": False,
-                "pipeline_status": "DNA_EXHAUSTED", "note": str(exc),
-                "hint": "ต่ออายุด้วย LEGO_DNA_CODE ที่ยาวขึ้น (chain ใหม่) "
-                        "หรือหยุด scheduler ของ chain นี้"}, 200
-    except Exception as exc:
-        try:
-            db.reference(ERRORS_PATH).push({
-                "error": _error_text(exc, with_type=False),
-                "type": type(exc).__name__,
-                "trace": redact_sensitive_text(traceback.format_exc())[:2000],
-            })
-        except Exception:
-            pass
-        code = 503 if is_transient_exception(exc) else 500
-        return {"status": "ERROR", "committed": False,
-                "pipeline_status": "SNAPSHOT_OR_ENGINE_ERROR",
-                "error": _error_text(exc, with_type=False),
-                "type": type(exc).__name__}, code
+    decision_service.configure(_facade())
+    return decision_service.run_decision(request)
 
 
 @functions_framework.http
 def lego_order_worker(request):
-    """Independent worker; schedule separately when inline mode is disabled."""
-    _init_firebase()
-    try:
-        cfg = load_config()
-        environment_label()
-        runtime_identity = runtime_identity_fingerprint()
-        limit = int(os.environ.get("LEGO_ORDER_WORKER_LIMIT", "3"))
-        _nonnegative_finite_env("LEGO_HOLDINGS_DRIFT_TOLERANCE", 0.000001)
-        _nonnegative_finite_env(
-            "LEGO_MAX_DISPATCH_PRICE_DRIFT_BPS",
-            DEFAULT_MAX_DISPATCH_PRICE_DRIFT_BPS)
-        _nonnegative_finite_env(
-            "LEGO_MAX_DISPATCH_QUOTE_AGE_SECONDS",
-            DEFAULT_MAX_DISPATCH_QUOTE_AGE_SECONDS)
-    except (KeyError, ValueError) as exc:
-        return {
-            "pipeline_status": "CONFIG_ERROR",
-            "error": _error_text(exc, with_type=False),
-        }, 500
-    try:
-        return {
-            "pipeline_status": "ORDER_WORKER_OK",
-            **_run_order_worker(
-                cfg, limit, runtime_identity=runtime_identity),
-        }, 200
-    except RuntimeIdentityError as exc:
-        return {
-            "pipeline_status": "CONFIG_ERROR",
-            "error": _error_text(exc, with_type=False),
-        }, 500
-    except Exception as exc:
-        return {"pipeline_status": "ORDER_WORKER_ERROR",
-                "error": _error_text(exc)}, 503
+    return execution_service.run_http(request, _facade())
 
 
 @functions_framework.http
 def lego_archive_worker(request):
-    """Daily housekeeping; touches no live intent and never runs on the DNA path."""
-    _init_firebase()
-    try:
-        return {"pipeline_status": "ARCHIVE_OK",
-                **archive_terminal_records(datetime.now(UTC))}, 200
-    except Exception as exc:
-        return {"pipeline_status": "ARCHIVE_ERROR",
-                "error": _error_text(exc)}, 503
+    return archive_service.run_archive(_facade())

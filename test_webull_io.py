@@ -557,6 +557,8 @@ def test_build_clients_targets_uat_by_default(monkeypatch):
     assert built["credentials"] == ("key", "secret", "th")
     assert built["endpoint"] == ("th", webull_io.UAT_ENDPOINT)
     assert built["token_dir"] == "/tmp/webull_token"
+    assert webull_io.clients_endpoint(trade, data) == webull_io.UAT_ENDPOINT
+    assert webull_io.clients_endpoint(object(), data) is None
 
 
 def test_build_clients_targets_production_when_asked(monkeypatch):
@@ -566,9 +568,10 @@ def test_build_clients_targets_production_when_asked(monkeypatch):
     monkeypatch.setenv("WEBULL_ENV", "PROD")
     monkeypatch.setenv("WEBULL_TOKEN_DIR", "/tmp/other")
 
-    webull_io.build_clients()
+    trade, data = webull_io.build_clients()
     assert built["endpoint"] == ("th", webull_io.PROD_ENDPOINT)
     assert built["token_dir"] == "/tmp/other"
+    assert webull_io.clients_endpoint(trade, data) == webull_io.PROD_ENDPOINT
 
 
 def test_a_stream_logger_is_installed_before_the_clients_are_built(monkeypatch):
@@ -712,7 +715,7 @@ def test_broker_sdk_stays_pinned():
     assert sdk == [
         "./vendor/webull_openapi_python_sdk-2.0.15-1lego-py3-none-any.whl"
     ], "the reviewed, locally vendored Webull 2.0.15 wheel must stay exact"
-    assert "cryptography==48.0.1" in lines
+    assert "cryptography==50.0.0" in lines
 
 
 # ---- the /tmp deadlock: durability warning vs. "can it sign a request now" ---
