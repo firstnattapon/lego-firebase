@@ -13,7 +13,7 @@ import lego_outbox
 import lego_state
 import main
 import webull_io
-from conftest import FAKE_DB, FakeReference
+from conftest import FAKE_DB, FakeReference, fake_trade_client
 from lego_one_row import compute_row
 from lego_outbox import (OUTBOX_PATH, begin_place_attempt, claim_intent,
                          put_intent, release_intent_claim, update_intent)
@@ -975,6 +975,33 @@ def test_incomplete_pagination_keeps_intent_pending_and_never_places(monkeypatch
     stored = FAKE_DB.reference(f"{OUTBOX_PATH}/{ck}/{run_id}").get()
     assert stored["status"] == "PENDING_DISPATCH"
     assert stored["pagination_complete"] is False
+
+
+def test_documented_open_order_wrapper_suppresses_place_in_worker(monkeypatch):
+    cfg = main.load_config()
+    run_id = "c" * 32
+    ck, intent = _committed_pending_buy(cfg, run_id)
+    trade = fake_trade_client(open_orders=[{
+        "client_order_id": "wrapper-1",
+        "combo_type": "NORMAL",
+        "orders": [{
+            "client_order_id": "active-aapl-1",
+            "symbol": "AAPL",
+            "status": "SUBMITTED",
+        }],
+    }])
+    monkeypatch.setattr(
+        main, "fetch_open_orders",
+        lambda client, symbol: webull_io.fetch_open_orders(client, symbol))
+    monkeypatch.setattr(
+        main, "place_market_order",
+        lambda *_args: pytest.fail("matching documented open order must block Place"))
+
+    result = main._dispatch_or_reconcile_one(trade, object(), cfg, intent)
+
+    assert result["status"] == "SUPPRESSED_ACTIVE_ORDER"
+    stored = FAKE_DB.reference(f"{OUTBOX_PATH}/{ck}/{run_id}").get()
+    assert "1 active broker order" in stored["terminal_reason"]
 
 
 def test_missing_fill_fields_become_terminal_manual_check():

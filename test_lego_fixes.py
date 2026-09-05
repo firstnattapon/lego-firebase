@@ -405,6 +405,50 @@ def test_summary_extracts_execution_price_and_fee():
     assert s["filled_fee"] == pytest.approx(0.35)
 
 
+def test_summary_sums_documented_actual_commission_and_fees():
+    """Contract fixture: Webull order-detail.md, downloaded 2026-09-05."""
+    s = summarize_order_result({}, {"orders": [{
+        "order_status": "FILLED",
+        "filled_quantity": "1",
+        "average_filled_price": "109.37",
+        "commission": {
+            "actual_commission": "1.00",
+            "receivable_commission": "99.00",
+        },
+        "fees": [
+            {"type": "GST", "actual_value": "0.25", "receivable_value": "9"},
+            {"type": "SEC", "actual_value": "0.75", "receivable_value": "9"},
+        ],
+    }]})
+    assert s["filled_fee"] == pytest.approx(2.0)
+    assert s["fee_actual_complete"] is True
+
+
+@pytest.mark.parametrize(("detail", "expected"), [
+    ({"commission": {"actual_commission": "0"}}, 0.0),
+    ({"fees": [{"actual_value": "0.10"}, {"actual_value": "0.20"}]}, 0.30),
+    ({"commission": {"actual_commission": "0.40"}, "filled_fee": "50"}, 0.40),
+])
+def test_summary_actual_fee_contract_precedence(detail, expected):
+    s = summarize_order_result({}, {"order_status": "FILLED", **detail})
+    assert s["filled_fee"] == pytest.approx(expected)
+    assert s["fee_actual_complete"] is True
+
+
+@pytest.mark.parametrize("detail", [
+    {"commission": {"receivable_commission": "1.0"}},
+    {"fees": [{"receivable_value": "1.0"}]},
+    {"commission": {"actual_commission": "-1"}},
+    {"fees": [{"actual_value": "NaN"}]},
+    {"fees": [{"actual_value": "Infinity"}]},
+    {"fees": [{"actual_value": "bad"}]},
+])
+def test_summary_does_not_substitute_or_accept_invalid_actual_fees(detail):
+    s = summarize_order_result({}, {"order_status": "FILLED", **detail})
+    assert "filled_fee" not in s
+    assert s["fee_actual_complete"] is False
+
+
 def test_summary_never_uses_quote_as_execution_price():
     s = summarize_order_result({}, {
         "order_status": "FILLED", "filled_quantity": "1.5",

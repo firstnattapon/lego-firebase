@@ -734,12 +734,31 @@ def _page_cursor(items: list) -> str | None:
             continue
         if entry.get("client_order_id"):
             return str(entry["client_order_id"])
-        legs = entry.get("items")
-        if isinstance(legs, list):
+        for child_key in ("orders", "items"):
+            legs = entry.get(child_key)
+            if not isinstance(legs, list):
+                continue
             for leg in reversed(legs):
                 if isinstance(leg, dict) and leg.get("client_order_id"):
                     return str(leg["client_order_id"])
     return None
+
+
+def _open_order_candidates(entry: dict) -> list:
+    """Return the order legs inside one broker page entry.
+
+    Current Webull responses are combo wrappers with ``orders``. ``items`` and
+    flat entries are retained for SDK/backward compatibility. Once a wrapper
+    key is present its value must be a list; treating malformed wrappers as an
+    empty page would disable the duplicate-order guard.
+    """
+    for key in ("orders", "items"):
+        if key in entry:
+            children = entry.get(key)
+            if not isinstance(children, list):
+                raise ValueError("open-orders wrapper ต้องมี list — fail closed")
+            return children
+    return [entry]
 
 
 def _open_order_page_size() -> int:
@@ -770,9 +789,7 @@ def fetch_open_orders(trade_client, symbol: str) -> list[dict]:
         for o in items:
             if not isinstance(o, dict):
                 continue
-            inner = o.get("items")
-            cands = inner if isinstance(inner, list) else [o]
-            for c in cands:
+            for c in _open_order_candidates(o):
                 if isinstance(c, dict) and str(c.get("symbol", "")).upper() == symbol.upper():
                     out.append(c)
         if len(items) < page_size:

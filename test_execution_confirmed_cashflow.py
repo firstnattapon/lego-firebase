@@ -28,7 +28,7 @@ from lego_one_row import (COLUMN_ORDER, ACTUAL_COLUMN, DELTA_COLUMN,
                           compute_row)
 from lego_outbox import OUTBOX_PATH, list_actionable
 from lego_state import (CASHFLOW_FINALIZED, CASHFLOW_NO_ACTION,
-                        CASHFLOW_PENDING, EXECUTION_STATE_KEY, STATE_PATH,
+                        CASHFLOW_PENDING, EXECUTION_STATE_KEY, REALIZED_PATH, STATE_PATH,
                         ExecutionFinalizeError, RuntimeIdentityMismatch,
                         chain_key, commit_final_row, execution_finalization,
                         finalize_execution_fill, read_anchor)
@@ -380,6 +380,43 @@ def test_partial_fill_waits_then_finalizes_once_on_terminal_cumulative_values(
     assert _cashflow()["actual_cumulative"] == pytest.approx(expected)
     assert _cashflow()["finalized_seq"] == 1
     assert _intent(run_id)["status"] == "FILLED"
+
+
+def test_terminal_fill_waits_for_actual_fees_then_books_them_once(monkeypatch):
+    """A terminal status may arrive before Webull populates actual fee fields."""
+    _run(monkeypatch, SLOT_0, 320.0, holdings=0.0)
+    body, _ = _run(monkeypatch, SLOT_1, 330.0, holdings=8.0)
+    run_id = body["run_id"]
+    quantity = _row(run_id)["จำนวนสั่ง (หุ้น)"]
+    details = iter([
+        {
+            "order_status": "FILLED", "filled_quantity": quantity,
+            "avg_filled_price": 331.2,
+            "commission": {"receivable_commission": "0.20"},
+        },
+        {
+            "order_status": "FILLED", "filled_quantity": quantity,
+            "avg_filled_price": 331.2,
+            "commission": {"actual_commission": "0.20"},
+            "fees": [{"type": "SEC", "actual_value": "0.10"}],
+        },
+    ])
+    _stub_broker(
+        monkeypatch, holdings_after=8.0 + quantity,
+        detail=lambda _tc, _run_id: next(details))
+
+    pending = [r for r in _work() if r["run_id"] == run_id][0]
+    assert pending["status"] == main.AWAITING_EXECUTION_FEES
+    assert pending["cashflow_finalized"] is False
+    assert _cashflow()["finalized_seq"] == 0
+
+    final = [r for r in _work() if r["run_id"] == run_id][0]
+    assert final["status"] == "FILLED"
+    assert final["filled_fee"] == pytest.approx(0.30)
+    assert final["cashflow_finalized"] is True
+    applied = FAKE_DB.reference(f"{REALIZED_PATH}/{chain_key(_cfg())}").get()
+    assert applied["applied_fills"][run_id]["fee"] == pytest.approx(0.30)
+    assert list_actionable(chain_key(_cfg())) == []
 
 
 @pytest.mark.parametrize("terminal_status", ["CANCELLED", "EXPIRED"])

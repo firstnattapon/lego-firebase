@@ -63,7 +63,9 @@ ERRORS_PATH = "webull_lego_errors"
 # of lego_outbox.TERMINAL on purpose — the intent has to come back — and bounded
 # below so an account whose position feed never moves cannot hold the queue.
 AWAITING_FILL_CONFIRMATION = "AWAITING_FILL_CONFIRMATION"
+AWAITING_EXECUTION_FEES = "AWAITING_EXECUTION_FEES"
 DEFAULT_FILL_CONFIRM_MAX_ATTEMPTS = 5
+DEFAULT_FEE_CONFIRM_MAX_ATTEMPTS = 5
 DEFAULT_MAX_DISPATCH_PRICE_DRIFT_BPS = 100.0
 DEFAULT_MAX_DISPATCH_QUOTE_AGE_SECONDS = 360.0
 # A broker timestamp a fraction ahead of the worker can be ordinary clock skew.
@@ -72,6 +74,7 @@ MAX_DISPATCH_FUTURE_SKEW_SECONDS = 5.0
 RECONCILE_STATUSES = {
     "PLACING_UNKNOWN", "PLACING", "SUBMITTED", "UNKNOWN",
     "PARTIAL_FILLED", "PARTIALLY_FILLED", AWAITING_FILL_CONFIRMATION,
+    AWAITING_EXECUTION_FEES,
 }
 # These statuses leave either the broker result or a strategy ledger requiring
 # manual repair. They are queue-terminal to prevent retry churn, but never safe

@@ -160,6 +160,50 @@ def test_open_orders_filters_by_symbol_and_flattens_groups():
     assert [o["id"] for o in fetch_open_orders(client, "FFWM")] == [2, 3]
 
 
+def test_open_orders_reads_documented_wrapper_shape():
+    """Contract fixture: Webull order-open.md, downloaded 2026-09-05.
+
+    The documented response is a list of combo wrappers; the tradable symbol
+    lives in wrapper.orders, not on the wrapper itself.
+    """
+    payload = [{
+        "client_order_id": "wrapper-1",
+        "combo_type": "NORMAL",
+        "orders": [{
+            "client_order_id": "leg-1",
+            "symbol": "AAPL",
+            "status": "SUBMITTED",
+        }],
+    }]
+    client = fake_trade_client(open_orders=payload)
+    assert fetch_open_orders(client, "aapl") == payload[0]["orders"]
+
+
+def test_documented_open_order_wrapper_uses_top_level_paging_cursor(monkeypatch):
+    monkeypatch.setenv("LEGO_OPEN_ORDER_PAGE_SIZE", "1")
+    pages = [
+        [{"client_order_id": "wrapper-1", "combo_type": "NORMAL",
+          "orders": [{"client_order_id": "leg-1", "symbol": "TSLA"}]}],
+        [{"client_order_id": "wrapper-2", "combo_type": "NORMAL",
+          "orders": [{"client_order_id": "leg-2", "symbol": "AAPL"}]}],
+        [],
+    ]
+    client = fake_trade_client(open_orders=lambda *a, **k: pages.pop(0))
+    assert [o["client_order_id"] for o in fetch_open_orders(client, "AAPL")] == ["leg-2"]
+    calls = client.order_v3.get_order_open.calls
+    assert calls[1][1]["last_client_order_id"] == "wrapper-1"
+    assert calls[2][1]["last_client_order_id"] == "wrapper-2"
+
+
+@pytest.mark.parametrize("payload", [
+    [{"client_order_id": "wrapper-1", "orders": "not-a-list"}],
+    [{"client_order_id": "wrapper-1", "orders": {"symbol": "AAPL"}}],
+])
+def test_documented_open_order_malformed_wrapper_fails_closed(payload):
+    with pytest.raises(ValueError, match="fail closed"):
+        fetch_open_orders(fake_trade_client(open_orders=payload), "AAPL")
+
+
 @pytest.mark.parametrize("payload", [{"unexpected": []}, "text", {"orders": "nope"}])
 def test_open_orders_unknown_shape_fails_closed(payload):
     with pytest.raises(ValueError, match="fail closed"):
