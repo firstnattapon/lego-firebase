@@ -63,7 +63,9 @@ ERRORS_PATH = "webull_lego_errors"
 # of lego_outbox.TERMINAL on purpose — the intent has to come back — and bounded
 # below so an account whose position feed never moves cannot hold the queue.
 AWAITING_FILL_CONFIRMATION = "AWAITING_FILL_CONFIRMATION"
+AWAITING_EXECUTION_FEES = "AWAITING_EXECUTION_FEES"
 DEFAULT_FILL_CONFIRM_MAX_ATTEMPTS = 5
+DEFAULT_FEE_CONFIRM_MAX_ATTEMPTS = 5
 DEFAULT_MAX_DISPATCH_PRICE_DRIFT_BPS = 100.0
 DEFAULT_MAX_DISPATCH_QUOTE_AGE_SECONDS = 360.0
 # A broker timestamp a fraction ahead of the worker can be ordinary clock skew.
@@ -72,6 +74,7 @@ MAX_DISPATCH_FUTURE_SKEW_SECONDS = 5.0
 RECONCILE_STATUSES = {
     "PLACING_UNKNOWN", "PLACING", "SUBMITTED", "UNKNOWN",
     "PARTIAL_FILLED", "PARTIALLY_FILLED", AWAITING_FILL_CONFIRMATION,
+    AWAITING_EXECUTION_FEES,
 }
 # These statuses leave either the broker result or a strategy ledger requiring
 # manual repair. They are queue-terminal to prevent retry churn, but never safe
@@ -386,7 +389,8 @@ def _persist_realized_math_error(intent: dict, summary: dict, exc: Exception) ->
         "terminal_reason": ("broker ยืนยัน fill แล้ว แต่คำนวณ realized ไม่ได้ — "
                             "ห้ามส่ง order ซ้ำ ต้องกระทบยอด realized ledger เอง"),
     }
-    for key in ("filled_quantity", "filled_price", "filled_fee", "reject_reason"):
+    for key in ("filled_quantity", "filled_price", "filled_fee", "reject_reason",
+                "fee_actual_complete", "fee_source", "fee_confirm_attempts"):
         if key in summary:
             fields[key] = summary[key]
     _persist(intent["chain_key"], intent["run_id"], fields)
@@ -411,6 +415,15 @@ def _fill_confirm_max_attempts() -> int:
                                          str(DEFAULT_FILL_CONFIRM_MAX_ATTEMPTS))))
     except (TypeError, ValueError):
         return DEFAULT_FILL_CONFIRM_MAX_ATTEMPTS
+
+
+def _fee_confirm_max_attempts() -> int:
+    try:
+        return max(1, int(os.environ.get(
+            "LEGO_FEE_CONFIRM_MAX_ATTEMPTS",
+            str(DEFAULT_FEE_CONFIRM_MAX_ATTEMPTS))))
+    except (TypeError, ValueError):
+        return DEFAULT_FEE_CONFIRM_MAX_ATTEMPTS
 
 
 def _positive_float(value) -> float | None:
@@ -559,6 +572,32 @@ def _defer_fill_confirmation(intent: dict, summary: dict, exc: Exception) -> dic
     return {"run_id": intent["run_id"], **fields}
 
 
+def _defer_execution_fees(intent: dict, summary: dict) -> dict:
+    """Keep a terminal fill actionable while Webull's actual fees settle."""
+    attempts = int(intent.get("fee_confirm_attempts", 0) or 0) + 1
+    broker_status = normalize_status(summary.get("status"))
+    fields = {
+        **summary,
+        "status": AWAITING_EXECUTION_FEES,
+        "broker_status": broker_status,
+        "cashflow_finalized": False,
+        "fee_confirm_attempts": attempts,
+        "last_error": "terminal fill ยังไม่มี actual commission/fees ที่สมบูรณ์",
+    }
+    if attempts < _fee_confirm_max_attempts():
+        _persist(intent["chain_key"], intent["run_id"], fields)
+        return {"run_id": intent["run_id"], **fields}
+    terminal_summary = {
+        **summary,
+        "status": broker_status,
+        "fee_confirm_attempts": attempts,
+    }
+    return _persist_realized_math_error(
+        intent, terminal_summary,
+        RealizedMathError(
+            f"terminal fill ยังไม่มี actual commission/fees ครบหลังตรวจ {attempts} ครั้ง"))
+
+
 def _persist_cashflow_error(intent: dict, summary: dict, exc: Exception) -> dict:
     """End an intent whose fill is real but whose model ledger refused it.
 
@@ -592,6 +631,17 @@ def _finish_with_realized(trade_client, cfg, intent: dict, summary: dict) -> dic
     matched broker legs, and the 17-column model ledger this function finalizes
     from the same confirmed fill. A decision never reaches either one.
     """
+    filled = _positive_float(summary.get("filled_quantity"))
+    broker_terminal = normalize_status(summary.get("status")) in TERMINAL_STATUSES
+    # Older UAT/detail payloads can omit the fee section entirely. Preserve
+    # their established lifecycle but keep fee_actual_complete=False visible so
+    # nobody can certify the resulting net P&L as fee-complete. If the broker
+    # did send a fee structure, however, missing/invalid actual values are a
+    # settlement state and must be polled instead of silently becoming zero.
+    if (filled is not None and broker_terminal
+            and summary.get("fee_actual_complete") is not True
+            and summary.get("fee_source") != "not_reported"):
+        return _defer_execution_fees(intent, summary)
     try:
         summary = _apply_realized_if_available(intent, summary)
     except RealizedMathError as exc:
@@ -602,13 +652,11 @@ def _finish_with_realized(trade_client, cfg, intent: dict, summary: dict) -> dic
     # or CANCELLED order that moved no shares leaves ΔAₙ = 0 and Aₙ exactly where
     # the last confirmed fill left it. (_apply_realized_if_available has already
     # refused a claimed fill with no readable quantity or price.)
-    filled = _positive_float(summary.get("filled_quantity"))
     # Broker fill quantities and average prices are cumulative. A partial
     # snapshot can still change, while finalize_execution_fill is deliberately
     # absorbing by run_id. Wait for a terminal status so the one model-ledger
     # booking uses the final cumulative values. CANCELLED/EXPIRED with a positive
     # cumulative fill still acted and therefore follows this terminal branch.
-    broker_terminal = normalize_status(summary.get("status")) in TERMINAL_STATUSES
     if (filled is not None and broker_terminal
             and not intent.get("cashflow_abandoned")):
         try:

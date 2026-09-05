@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import math
 from copy import deepcopy
+from decimal import Decimal, InvalidOperation
 
 from lego_one_row import READY_BUY, READY_SELL
 
@@ -112,6 +113,74 @@ def _coalesce_float(fields: dict, names: tuple[str, ...],
     return None
 
 
+def _nonnegative_decimal(value) -> Decimal | None:
+    if value is None or value == "":
+        return None
+    try:
+        number = Decimal(str(value))
+    except (InvalidOperation, TypeError, ValueError):
+        return None
+    if not number.is_finite() or number < 0:
+        return None
+    return number
+
+
+def _extract_actual_fee(fields: dict) -> tuple[float | None, bool, str]:
+    """Extract cumulative fees without mixing actual and receivable amounts.
+
+    Webull's current contract reports commission.actual_commission plus every
+    fees[].actual_value. That nested contract wins over scalar aliases so an
+    aggregate legacy field cannot be counted a second time. Decimal is used for
+    the sum and converted only at the existing float ledger boundary.
+    """
+    commission = fields.get("commission")
+    has_nested = isinstance(commission, dict) or "fees" in fields
+    if has_nested:
+        total = Decimal("0")
+        actual_values = 0
+        complete = True
+
+        if isinstance(commission, dict):
+            if "actual_commission" not in commission:
+                complete = False
+            else:
+                value = _nonnegative_decimal(commission.get("actual_commission"))
+                if value is None:
+                    complete = False
+                else:
+                    total += value
+                    actual_values += 1
+
+        if "fees" in fields:
+            fees = fields.get("fees")
+            if not isinstance(fees, list):
+                complete = False
+            else:
+                for fee in fees:
+                    if not isinstance(fee, dict) or "actual_value" not in fee:
+                        complete = False
+                        continue
+                    value = _nonnegative_decimal(fee.get("actual_value"))
+                    if value is None:
+                        complete = False
+                    else:
+                        total += value
+                        actual_values += 1
+
+        if complete and actual_values:
+            return float(total), True, "webull_actual_breakdown"
+        return None, False, "webull_actual_breakdown_invalid_or_pending"
+
+    for name in FEE_FIELDS:
+        if name not in fields:
+            continue
+        value = _nonnegative_decimal(fields.get(name))
+        if value is not None:
+            return float(value), True, f"legacy_scalar:{name}"
+        return None, False, f"legacy_scalar_invalid:{name}"
+    return None, False, "not_reported"
+
+
 def summarize_order_result(place_response: dict, detail: dict | None = None) -> dict:
     fields = _order_fields(detail) if detail else {}
     status = normalize_status(
@@ -138,7 +207,9 @@ def summarize_order_result(place_response: dict, detail: dict | None = None) -> 
     price = _coalesce_float(fields, EXECUTION_PRICE_FIELDS, minimum_exclusive=0.0)
     if price is not None:
         out["filled_price"] = price
-    fee = _coalesce_float(fields, FEE_FIELDS)
+    fee, fee_complete, fee_source = _extract_actual_fee(fields)
+    out["fee_actual_complete"] = fee_complete
+    out["fee_source"] = fee_source
     if fee is not None:
         out["filled_fee"] = fee
     reason = (fields.get("reason") or fields.get("message")
